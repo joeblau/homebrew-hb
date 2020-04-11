@@ -1,5 +1,5 @@
 class Simrecord < Formula
-    @@release = "1.0.0"
+    @@release = "1.1.0"
 
     desc "iPhone Simulator Recorder"
     homepage "https://joeblau.com/simrecord"
