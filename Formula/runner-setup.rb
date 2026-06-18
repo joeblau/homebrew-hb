@@ -4,8 +4,8 @@
 class RunnerSetup < Formula
   desc "Provision multiple GitHub Actions self-hosted runners on macOS"
   homepage "https://github.com/joeblau/homebrew-hb"
-  url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/v1.0.0.tar.gz"
-  sha256 "1170ef75aaa4e95d87e2cc64fd517af921a7e982ea675415ebb4222c1fcadf58"
+  url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/v1.0.1.tar.gz"
+  sha256 "6a86aac7758c8e85ee5cc1ab784f5a37572e96fbc59779be66ecce4d62eeacb6"
   license "MIT"
 
   depends_on :macos
