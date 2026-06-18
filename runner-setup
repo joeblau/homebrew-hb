@@ -421,7 +421,15 @@ configure_runner() {
   xattr -rc "${dir}" 2>/dev/null || true
 
   # --- Configure unattended. MUST run as the invoking user (not root). -----
+  # On success config.sh registers the runner with GitHub and writes .runner +
+  # .credentials into ${dir}. We MUST NOT proceed to install a LaunchDaemon when
+  # registration failed, or we'd bootstrap a daemon that crash-loops against an
+  # unregistered runner (and a misleading "OK" would be reported). Capture the
+  # exit code explicitly — a subshell under `set -e` can otherwise mask it, and
+  # some runner versions print the HTTP error but still exit 0 — then REQUIRE the
+  # .runner artifact as ground truth that registration actually completed.
   step "Running config.sh (unattended) as ${REAL_USER}"
+  local config_rc=0
   (
     cd "${dir}"
     as_user ./config.sh \
@@ -431,7 +439,18 @@ configure_runner() {
       --name "${name}" \
       --labels "macos,macmini,self-hosted" \
       --replace
-  )
+  ) || config_rc=$?
+  if [[ "${config_rc}" -ne 0 || ! -f "${dir}/.runner" ]]; then
+    local marker; marker="$( [[ -f "${dir}/.runner" ]] && echo present || echo missing )"
+    err "Registration FAILED for ${name} (config.sh rc=${config_rc}, .runner ${marker})."
+    err "GitHub rejected the runner registration. The usual causes are:"
+    err "  - The registration token expired — they are valid only ~1 hour. Get a"
+    err "    fresh token (Settings > Actions > Runners > New runner) and re-run."
+    err "  - The org '${ORG}' is misspelled or is not an organization."
+    err "Refusing to install a LaunchDaemon for an unregistered runner."
+    record_status "${name}" "FAILED (registration)"
+    return 1
+  fi
 
   # --- Avoid the double-load hazard (spec constraint #3). ------------------
   # We DO NOT run `svc.sh install`. svc.sh exists only to create + (via
