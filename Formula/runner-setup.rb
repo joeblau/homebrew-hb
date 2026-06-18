@@ -5,9 +5,7 @@ class RunnerSetup < Formula
   desc "Provision multiple GitHub Actions self-hosted runners on macOS"
   homepage "https://github.com/joeblau/homebrew-hb"
   url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/v1.0.0.tar.gz"
-  # Replace the placeholder below with the real digest AFTER pushing tag v1.0.0:
-  #   curl -fsSL https://github.com/joeblau/homebrew-hb/archive/refs/tags/v1.0.0.tar.gz | shasum -a 256
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  sha256 "1170ef75aaa4e95d87e2cc64fd517af921a7e982ea675415ebb4222c1fcadf58"
   license "MIT"
 
   depends_on :macos
