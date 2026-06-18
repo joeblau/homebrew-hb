@@ -33,8 +33,20 @@ LATEST_API="https://api.github.com/repos/actions/runner/releases/latest"
 DEFAULT_RUNNERS=2
 
 ORG=""
+REPO=""
+URL=""
 TOKEN=""
 RUNNERS="${DEFAULT_RUNNERS}"
+LABELS="macos,macmini,self-hosted"
+
+# Derived from the chosen registration scope (--org / --repo / --url).
+RUNNER_URL=""
+SCOPE_SLUG=""
+
+# Set to 1 once the per-runner provisioning loop actually starts, so the EXIT
+# trap only shows the "partially configured / re-run to resume" hint after work
+# has begun — not on a plain usage/precondition error.
+PROVISIONING_STARTED=0
 
 # Populated during detection / setup
 REAL_USER=""
@@ -66,22 +78,38 @@ usage() {
 ${PROG_NAME} — provision GitHub Actions self-hosted runners on macOS
 
 USAGE:
-  ${PROG_NAME} --org ORG_NAME --token REGISTRATION_TOKEN [--runners N]
+  ${PROG_NAME} (--org ORG | --repo OWNER/REPO | --url URL) --token TOKEN [options]
+
+SCOPE (choose exactly ONE — it must match where you generated the token):
+  --org ORG_NAME        Organization runner (https://github.com/ORG_NAME).
+                        Token from: Org Settings > Actions > Runners > New runner.
+  --repo OWNER/REPO     Repository runner (https://github.com/OWNER/REPO).
+                        Token from: Repo Settings > Actions > Runners > New runner.
+  --url URL             Full runner URL exactly as GitHub prints it in the
+                        config.sh command (also works for GitHub Enterprise).
 
 REQUIRED:
-  --org ORG_NAME        GitHub organization (https://github.com/ORG_NAME)
-  --token TOKEN         Runner registration token, from the org's
-                        Settings > Actions > Runners > New runner page.
-                        May also be supplied via the RUNNER_TOKEN env var
-                        (preferred — see SECURITY below).
+  --token TOKEN         Runner registration token for the scope above. The org
+                        and repo pages issue DIFFERENT tokens; a repo token used
+                        with --org (or vice versa) returns 404. May also be
+                        supplied via the RUNNER_TOKEN env var (preferred — see
+                        SECURITY below).
 
 OPTIONS:
   --runners N           Number of runners to create (default: ${DEFAULT_RUNNERS})
+  --labels CSV          Comma-separated runner labels (default: ${LABELS})
   -h, --help            Show this help and exit
 
 EXAMPLES:
   ${PROG_NAME} --org acme --token AYZ... --runners 3
-  RUNNER_TOKEN=AYZ... ${PROG_NAME} --org acme
+  ${PROG_NAME} --repo acme/monorepo --token AYZ... --runners 2
+  RUNNER_TOKEN=AYZ... ${PROG_NAME} --url https://github.com/acme/monorepo
+
+MULTIPLE REPOSITORIES:
+  A single runner can serve many repos ONLY when registered at the org level
+  (--org): register it once, then grant it repo access under
+  Org Settings > Actions > Runner groups. A --repo runner is bound to that ONE
+  repository; to cover several repos without an org, register a runner per repo.
 
 SECURITY NOTE:
   A token passed via --token is visible in 'ps' to other local users while
@@ -103,7 +131,7 @@ cleanup() {
   if [[ -n "${WORK_TMPDIR}" && -d "${WORK_TMPDIR}" ]]; then
     rm -rf "${WORK_TMPDIR}" 2>/dev/null || true
   fi
-  if [[ "${code}" -ne 0 ]]; then
+  if [[ "${code}" -ne 0 && "${PROVISIONING_STARTED}" -eq 1 ]]; then
     err "Aborted (exit ${code}). Some runners may be partially configured."
     err "Re-run the same command to resume; already-configured runners are skipped."
   fi
@@ -122,6 +150,14 @@ parse_args() {
         [[ $# -ge 2 ]] || { err "--org requires a value"; usage; exit 2; }
         ORG="$2"; shift 2 ;;
       --org=*)     ORG="${1#*=}"; shift ;;
+      --repo)
+        [[ $# -ge 2 ]] || { err "--repo requires a value"; usage; exit 2; }
+        REPO="$2"; shift 2 ;;
+      --repo=*)    REPO="${1#*=}"; shift ;;
+      --url)
+        [[ $# -ge 2 ]] || { err "--url requires a value"; usage; exit 2; }
+        URL="$2"; shift 2 ;;
+      --url=*)     URL="${1#*=}"; shift ;;
       --token)
         [[ $# -ge 2 ]] || { err "--token requires a value"; usage; exit 2; }
         TOKEN="$2"; shift 2 ;;
@@ -130,6 +166,10 @@ parse_args() {
         [[ $# -ge 2 ]] || { err "--runners requires a value"; usage; exit 2; }
         RUNNERS="$2"; shift 2 ;;
       --runners=*) RUNNERS="${1#*=}"; shift ;;
+      --labels)
+        [[ $# -ge 2 ]] || { err "--labels requires a value"; usage; exit 2; }
+        LABELS="$2"; shift 2 ;;
+      --labels=*)  LABELS="${1#*=}"; shift ;;
       -h|--help)   usage; exit 0 ;;
       *)
         err "Unknown argument: $1"
@@ -143,11 +183,20 @@ parse_args() {
     TOKEN="${RUNNER_TOKEN}"
   fi
 
-  local missing=()
-  [[ -n "${ORG}" ]]   || missing+=("--org")
-  [[ -n "${TOKEN}" ]] || missing+=("--token (or RUNNER_TOKEN env)")
-  if [[ ${#missing[@]} -gt 0 ]]; then
-    err "Missing required argument(s): ${missing[*]}"
+  # Exactly one registration scope must be chosen (org vs repo vs full url).
+  local scope_count=0
+  [[ -z "${ORG}" ]]  || scope_count=$((scope_count + 1))
+  [[ -z "${REPO}" ]] || scope_count=$((scope_count + 1))
+  [[ -z "${URL}" ]]  || scope_count=$((scope_count + 1))
+  if [[ "${scope_count}" -ne 1 ]]; then
+    err "Choose exactly one of --org, --repo, or --url (got ${scope_count})."
+    err "The token must come from the SAME page as the scope you pick."
+    usage
+    exit 2
+  fi
+
+  if [[ -z "${TOKEN}" ]]; then
+    err "Missing required argument: --token (or RUNNER_TOKEN env)"
     usage
     exit 2
   fi
@@ -155,6 +204,28 @@ parse_args() {
   if ! [[ "${RUNNERS}" =~ ^[0-9]+$ ]] || [[ "${RUNNERS}" -lt 1 ]]; then
     err "--runners must be a positive integer (got: '${RUNNERS}')"
     exit 2
+  fi
+
+  # Resolve the registration URL and a scope slug. The slug is only used to spot
+  # a leftover gui LaunchAgent named actions.runner.<slug>.<runner-name>.
+  if [[ -n "${ORG}" ]]; then
+    RUNNER_URL="https://github.com/${ORG}"
+    SCOPE_SLUG="${ORG}"
+  elif [[ -n "${REPO}" ]]; then
+    if ! [[ "${REPO}" =~ ^[^/]+/[^/]+$ ]]; then
+      err "--repo must be in OWNER/REPO form (got: '${REPO}')"
+      exit 2
+    fi
+    RUNNER_URL="https://github.com/${REPO}"
+    SCOPE_SLUG="${REPO//\//-}"
+  else
+    # Strip ALL trailing slashes, then derive the slug from the normalized URL.
+    RUNNER_URL="${URL}"
+    while [[ "${RUNNER_URL}" == */ ]]; do RUNNER_URL="${RUNNER_URL%/}"; done
+    local path="${RUNNER_URL#*://}"; path="${path#*/}"   # strip scheme://host/
+    SCOPE_SLUG="${path//\//-}"
+    SCOPE_SLUG="${SCOPE_SLUG#-}"; SCOPE_SLUG="${SCOPE_SLUG%-}"
+    [[ -n "${SCOPE_SLUG}" ]] || SCOPE_SLUG="runner"
   fi
 }
 
@@ -184,8 +255,10 @@ detect_user() {
   fi
   REAL_GROUP="$(id -gn "${REAL_USER}")"
   REAL_UID="$(id -u "${REAL_USER}")"
+  # `|| true`: dscl exits non-zero for a non-local (e.g. MDM/AD) user record,
+  # and with `pipefail` that would abort the whole script before the fallback.
   REAL_HOME="$(dscl . -read "/Users/${REAL_USER}" NFSHomeDirectory 2>/dev/null \
-    | awk '{print $2}')"
+    | awk '{print $2}' || true)"
   [[ -n "${REAL_HOME}" ]] || REAL_HOME="/Users/${REAL_USER}"
   step "Runner owner: ${REAL_USER}:${REAL_GROUP} (uid ${REAL_UID}, home ${REAL_HOME})"
 }
@@ -370,6 +443,10 @@ bootout_system() {
 }
 
 configure_runner() {
+  # NOTE: this is called as `if ! configure_runner ...`, so `set -e` is INACTIVE
+  # for the whole body (bash disables errexit inside a negated/if condition).
+  # Every consequential step must check its own exit status and `return 1` on
+  # failure — do not rely on set -e here.
   local idx="$1"
   local name="runner-${idx}"
   local dir="${RUNNER_ROOT}/${name}"
@@ -379,12 +456,21 @@ configure_runner() {
 
   log "Configuring ${name}  (${dir})"
 
-  # --- Idempotency: already fully provisioned and loaded? ------------------
+  # --- Idempotency: already provisioned, loaded, AND same scope? -----------
+  # .runner is JSON containing "gitHubUrl"; only skip when it matches the
+  # requested scope, so re-running with a different --org/--repo/--url re-points
+  # the runner instead of silently keeping the old registration.
   if [[ -f "${dir}/.runner" && -f "${plist_dest}" ]] \
       && sudo launchctl print "system/${label}" >/dev/null 2>&1; then
-    step "${name} already configured and loaded — skipping."
-    record_status "${name}" "skipped (already loaded)"
-    return 0
+    local existing_url
+    existing_url="$(sed -n 's/.*"gitHubUrl"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+      "${dir}/.runner" 2>/dev/null | head -n1 || true)"
+    if [[ "${existing_url}" == "${RUNNER_URL}" ]]; then
+      step "${name} already configured for ${RUNNER_URL} and loaded — skipping."
+      record_status "${name}" "skipped (already loaded)"
+      return 0
+    fi
+    step "${name} loaded but registered to '${existing_url:-unknown}'; re-pointing to ${RUNNER_URL}."
   fi
 
   # --- Tear down any prior system daemon for a clean, idempotent re-run. ----
@@ -434,10 +520,10 @@ configure_runner() {
     cd "${dir}"
     as_user ./config.sh \
       --unattended \
-      --url "https://github.com/${ORG}" \
+      --url "${RUNNER_URL}" \
       --token "${TOKEN}" \
       --name "${name}" \
-      --labels "macos,macmini,self-hosted" \
+      --labels "${LABELS}" \
       --replace
   ) || config_rc=$?
   if [[ "${config_rc}" -ne 0 || ! -f "${dir}/.runner" ]]; then
@@ -446,7 +532,9 @@ configure_runner() {
     err "GitHub rejected the runner registration. The usual causes are:"
     err "  - The registration token expired — they are valid only ~1 hour. Get a"
     err "    fresh token (Settings > Actions > Runners > New runner) and re-run."
-    err "  - The org '${ORG}' is misspelled or is not an organization."
+    err "  - Scope/token mismatch: the token must come from the SAME page as the"
+    err "    target URL (${RUNNER_URL}). A repo token used with --org (or an org"
+    err "    token used with --repo) returns 404."
     err "Refusing to install a LaunchDaemon for an unregistered runner."
     record_status "${name}" "FAILED (registration)"
     return 1
@@ -461,7 +549,7 @@ configure_runner() {
   # under the same runner name, fighting for jobs). The agent label/plist name
   # is deterministic, so we defensively boot out and remove any pre-existing
   # agent from a prior interactive run, then verify it is truly gone.
-  local agent_label="actions.runner.${ORG}.${name}"
+  local agent_label="actions.runner.${SCOPE_SLUG}.${name}"
   local agent_plist="${REAL_HOME}/Library/LaunchAgents/${agent_label}.plist"
   step "Ensuring no leftover gui LaunchAgent (${agent_label})"
   # Run the gui-domain bootout inside the user's real Aqua session. A bare
@@ -481,7 +569,11 @@ configure_runner() {
   # --- Author a FRESH system LaunchDaemon plist so we fully control every
   #     key: Label, UserName (so it does NOT run as root), absolute paths. ---
   step "Writing LaunchDaemon ${plist_dest}"
-  as_user mkdir -p "${log_dir}"
+  if ! as_user mkdir -p "${log_dir}"; then
+    err "Could not create log directory ${log_dir} for ${name}."
+    record_status "${name}" "FAILED (log dir)"
+    return 1
+  fi
 
   # Service entrypoint MUST be runsvc.sh — the runner's service wrapper. It
   # translates TERM->INT so `launchctl bootout`/`kickstart` stop the runner
@@ -557,12 +649,17 @@ EOF
   # Install with the strict ownership/perms LaunchDaemons require: root:wheel 644.
   # launchd refuses to load a daemon plist that is group/other-writable or not
   # owned by root.
-  sudo cp "${tmp_plist}" "${plist_dest}"
-  sudo chown root:wheel "${plist_dest}"
-  sudo chmod 644 "${plist_dest}"
+  if ! { sudo cp "${tmp_plist}" "${plist_dest}" \
+      && sudo chown root:wheel "${plist_dest}" \
+      && sudo chmod 644 "${plist_dest}"; }; then
+    err "Could not install LaunchDaemon plist ${plist_dest} for ${name}."
+    record_status "${name}" "FAILED (plist install)"
+    return 1
+  fi
 
   # Pre-create log files owned by the runner user so they are writable.
-  as_user touch "${log_dir}/runner-stdout.log" "${log_dir}/runner-stderr.log"
+  as_user touch "${log_dir}/runner-stdout.log" "${log_dir}/runner-stderr.log" \
+    || warn "Could not pre-create log files in ${log_dir}; launchd will create them."
 
   # --- Bootstrap into the system domain, enable, kickstart. ----------------
   step "Bootstrapping system/${label}"
@@ -623,6 +720,7 @@ main() {
   prepare_root_dir
 
   log "Provisioning ${RUNNERS} runner(s) under ${RUNNER_ROOT}"
+  PROVISIONING_STARTED=1
   local overall_rc=0
   local i
   for ((i = 1; i <= RUNNERS; i++)); do

@@ -1,0 +1,373 @@
+#!/usr/bin/env bash
+#
+# runner-cleanup — tear down GitHub Actions self-hosted runners that
+# runner-setup provisioned on macOS.
+#
+# Usage:
+#   runner-cleanup [--all | --runner N] [--token REMOVE_TOKEN] [--yes]
+#
+# For each runner it:
+#   1. boots out and removes the system LaunchDaemon (com.github.runner-N),
+#   2. boots out and removes any leftover gui LaunchAgent (actions.runner.*),
+#   3. OPTIONALLY deregisters the runner from GitHub (only when a *removal*
+#      token is supplied — registration tokens will NOT work for removal),
+#   4. deletes the runner directory under /opt/github-runners.
+#
+# Like runner-setup, it runs config.sh as the INVOKING (non-root) user and uses
+# sudo ONLY for the privileged /opt and /Library/LaunchDaemons operations. It is
+# idempotent: a missing daemon, plist, or directory is fine.
+
+set -euo pipefail
+
+# ----------------------------------------------------------------------------
+# Constants / globals
+# ----------------------------------------------------------------------------
+PROG_NAME="$(basename "$0")"
+RUNNER_ROOT="/opt/github-runners"
+LAUNCH_DAEMON_DIR="/Library/LaunchDaemons"
+
+TOKEN=""
+TARGET_RUNNER=""      # empty => all runners
+ASSUME_YES=0
+
+REAL_USER=""
+REAL_GROUP=""
+REAL_UID=""
+REAL_HOME=""
+
+# Names (e.g. "runner-1") selected for removal, and a parallel status table.
+declare -a TARGET_NAMES=()
+declare -a STATUS_NAME=()
+declare -a STATUS_RESULT=()
+
+# ----------------------------------------------------------------------------
+# Output helpers — progress to stderr; the token is NEVER interpolated.
+# ----------------------------------------------------------------------------
+log()  { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
+step() { printf '\033[1;32m  ->\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[1;33mWARN:\033[0m %s\n' "$*" >&2; }
+err()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; }
+
+usage() {
+  cat >&2 <<EOF
+${PROG_NAME} — remove GitHub Actions self-hosted runners on macOS
+
+USAGE:
+  ${PROG_NAME} [--all | --runner N] [--token REMOVE_TOKEN] [--yes]
+
+OPTIONS:
+  --all              Remove every runner under ${RUNNER_ROOT} (default).
+  --runner N         Remove only runner-N.
+  --token TOKEN      GitHub *removal* token, so each runner is deregistered from
+                     GitHub before local teardown. Get it from the Runners
+                     settings page: an existing runner > Remove shows a
+                     'config.sh remove --token ...' command. May also be given
+                     via the RUNNER_REMOVE_TOKEN env var (preferred). WITHOUT a
+                     token, local teardown still happens but the runner lingers
+                     as 'offline' in GitHub until you remove it there.
+  -y, --yes          Do not prompt for confirmation.
+  -h, --help         Show this help and exit.
+
+EXAMPLES:
+  ${PROG_NAME} --all
+  ${PROG_NAME} --runner 2 --token AXR...
+  RUNNER_REMOVE_TOKEN=AXR... ${PROG_NAME} --all --yes
+
+SECURITY NOTE:
+  A token passed via --token is visible in 'ps' to other local users while this
+  runs. Prefer RUNNER_REMOVE_TOKEN on shared machines. Removal tokens are
+  short-lived; rotate any token that may have been exposed.
+EOF
+}
+
+# ----------------------------------------------------------------------------
+# Argument parsing
+# ----------------------------------------------------------------------------
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --all)        TARGET_RUNNER=""; shift ;;
+      --runner)
+        [[ $# -ge 2 ]] || { err "--runner requires a value"; usage; exit 2; }
+        TARGET_RUNNER="$2"; shift 2 ;;
+      --runner=*)   TARGET_RUNNER="${1#*=}"; shift ;;
+      --token)
+        [[ $# -ge 2 ]] || { err "--token requires a value"; usage; exit 2; }
+        TOKEN="$2"; shift 2 ;;
+      --token=*)    TOKEN="${1#*=}"; shift ;;
+      -y|--yes)     ASSUME_YES=1; shift ;;
+      -h|--help)    usage; exit 0 ;;
+      *) err "Unknown argument: $1"; usage; exit 2 ;;
+    esac
+  done
+
+  if [[ -z "${TOKEN}" && -n "${RUNNER_REMOVE_TOKEN:-}" ]]; then
+    TOKEN="${RUNNER_REMOVE_TOKEN}"
+  fi
+
+  if [[ -n "${TARGET_RUNNER}" ]] && ! [[ "${TARGET_RUNNER}" =~ ^[0-9]+$ ]]; then
+    err "--runner must be a positive integer (got: '${TARGET_RUNNER}')"
+    exit 2
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# Environment detection (mirrors runner-setup)
+# ----------------------------------------------------------------------------
+detect_platform() {
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    err "This tool only supports macOS."
+    exit 1
+  fi
+}
+
+require_cmds() {
+  local missing=() c
+  for c in uname id sudo launchctl rm basename; do
+    command -v "${c}" >/dev/null 2>&1 || missing+=("${c}")
+  done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    err "Required command(s) not found: ${missing[*]}"
+    exit 1
+  fi
+}
+
+detect_user() {
+  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+    REAL_USER="${SUDO_USER}"
+  else
+    REAL_USER="$(whoami)"
+  fi
+  if [[ "${REAL_USER}" == "root" ]]; then
+    err "Run this as a normal user; it uses sudo only internally for /opt and"
+    err "${LAUNCH_DAEMON_DIR}."
+    exit 1
+  fi
+  REAL_GROUP="$(id -gn "${REAL_USER}")"
+  REAL_UID="$(id -u "${REAL_USER}")"
+  # `|| true`: dscl exits non-zero for a non-local (e.g. MDM/AD) user record,
+  # and with `pipefail` that would abort the whole script before the fallback.
+  REAL_HOME="$(dscl . -read "/Users/${REAL_USER}" NFSHomeDirectory 2>/dev/null \
+    | awk '{print $2}' || true)"
+  [[ -n "${REAL_HOME}" ]] || REAL_HOME="/Users/${REAL_USER}"
+}
+
+# Run a command as the real (non-root) user, forcing HOME/USER/LOGNAME so
+# config.sh resolves "${HOME}/..." correctly even under `sudo runner-cleanup`.
+as_user() {
+  if [[ "$(id -un)" == "${REAL_USER}" ]]; then
+    HOME="${REAL_HOME}" USER="${REAL_USER}" LOGNAME="${REAL_USER}" "$@"
+  else
+    sudo -H -u "${REAL_USER}" env \
+      HOME="${REAL_HOME}" \
+      USER="${REAL_USER}" \
+      LOGNAME="${REAL_USER}" \
+      "$@"
+  fi
+}
+
+ensure_sudo() {
+  log "Requesting administrator privileges (needed for ${LAUNCH_DAEMON_DIR} and ${RUNNER_ROOT})"
+  if ! sudo -v; then
+    err "Could not obtain sudo privileges."
+    exit 1
+  fi
+}
+
+record_status() {
+  STATUS_NAME+=("$1")
+  STATUS_RESULT+=("$2")
+}
+
+# Boot out a system service and WAIT for it to disappear (bootout is async).
+bootout_system() {
+  local label="$1"
+  local _i
+  sudo launchctl bootout "system/${label}" 2>/dev/null || true
+  for _i in 1 2 3 4 5 6 7 8 9 10; do
+    sudo launchctl print "system/${label}" >/dev/null 2>&1 || return 0
+    sleep 1
+  done
+  return 0
+}
+
+# ----------------------------------------------------------------------------
+# Discover which runner names to act on. Populates TARGET_NAMES.
+# Sources, unioned + de-duplicated:
+#   - directories  ${RUNNER_ROOT}/runner-*
+#   - daemon plists ${LAUNCH_DAEMON_DIR}/com.github.runner-*.plist  (--all only,
+#     so an orphaned daemon whose dir was already deleted is still torn down)
+# ----------------------------------------------------------------------------
+discover_targets() {
+  local -a found=()
+  local d p name lbl
+
+  if [[ -n "${TARGET_RUNNER}" ]]; then
+    found+=("runner-${TARGET_RUNNER}")
+  else
+    shopt -s nullglob
+    for d in "${RUNNER_ROOT}"/runner-*; do
+      [[ -d "${d}" ]] && found+=("$(basename "${d}")")
+    done
+    for p in "${LAUNCH_DAEMON_DIR}"/com.github.runner-*.plist; do
+      [[ -f "${p}" ]] || continue
+      lbl="$(basename "${p}" .plist)"   # com.github.runner-N
+      found+=("${lbl#com.github.}")
+    done
+    shopt -u nullglob
+  fi
+
+  # De-duplicate while preserving order (bash 3.2: no associative arrays).
+  # Guard the count FIRST: on bash 3.2 expanding an EMPTY array as "${found[@]}"
+  # under `set -u` aborts ("found[@]: unbound variable"; the 4.4 relaxation is
+  # absent), which would crash the common "nothing to clean" case before the
+  # empty-target guard in main(). (Do NOT use "${found[@]:-}" — that injects one
+  # empty-string element into TARGET_NAMES.)
+  local seen=" "
+  if [[ ${#found[@]} -gt 0 ]]; then
+    for name in "${found[@]}"; do
+      case "${seen}" in
+        *" ${name} "*) ;;
+        *) TARGET_NAMES+=("${name}"); seen="${seen}${name} " ;;
+      esac
+    done
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# Remove one runner by name (e.g. "runner-1"). Tolerant of missing pieces.
+# ----------------------------------------------------------------------------
+cleanup_one() {
+  local name="$1"
+  local dir="${RUNNER_ROOT}/${name}"
+  local label="com.github.${name}"
+  local plist="${LAUNCH_DAEMON_DIR}/${label}.plist"
+
+  log "Removing ${name}"
+
+  # 1) Deregister from GitHub FIRST, while the runner files still exist. Only
+  #    possible with a removal token; a registration token cannot remove.
+  if [[ -n "${TOKEN}" && -x "${dir}/config.sh" && -f "${dir}/.runner" ]]; then
+    step "Deregistering from GitHub (config.sh remove) as ${REAL_USER}"
+    if ! ( cd "${dir}" && as_user ./config.sh remove --token "${TOKEN}" ); then
+      warn "config.sh remove failed for ${name} (removal token wrong/expired?)."
+      warn "It may remain listed in GitHub; remove it from the Runners page."
+    fi
+  elif [[ -z "${TOKEN}" && -f "${dir}/.runner" ]]; then
+    warn "${name} is registered but no --token given: NOT deregistered from GitHub."
+    warn "It will show as 'offline' until you remove it on the Runners page."
+  fi
+
+  # 2) System LaunchDaemon
+  if sudo launchctl print "system/${label}" >/dev/null 2>&1; then
+    step "Booting out system/${label}"
+    bootout_system "${label}"
+  fi
+  if [[ -e "${plist}" ]]; then
+    step "Removing ${plist}"
+    sudo rm -f "${plist}"
+  fi
+
+  # 3) Any leftover gui LaunchAgent(s) for this runner (from a manual svc.sh run)
+  local agent alabel
+  shopt -s nullglob
+  for agent in "${REAL_HOME}/Library/LaunchAgents/actions.runner."*".${name}.plist"; do
+    alabel="$(basename "${agent}" .plist)"
+    step "Booting out gui agent ${alabel}"
+    sudo launchctl asuser "${REAL_UID}" launchctl bootout "gui/${REAL_UID}/${alabel}" 2>/dev/null || true
+    as_user rm -f "${agent}" 2>/dev/null || true
+  done
+  shopt -u nullglob
+
+  # 4) Delete the runner directory (sudo: lives under root-owned /opt).
+  if [[ -d "${dir}" ]]; then
+    step "Deleting ${dir}"
+    sudo rm -rf "${dir}"
+  fi
+
+  record_status "${name}" "removed"
+  return 0
+}
+
+# ----------------------------------------------------------------------------
+# Confirmation (skipped with --yes; refuses to proceed without a TTY)
+# ----------------------------------------------------------------------------
+confirm() {
+  [[ "${ASSUME_YES}" -eq 1 ]] && return 0
+  if [[ ! -t 0 ]]; then
+    err "Refusing to remove runners without confirmation (no TTY). Re-run with --yes."
+    exit 1
+  fi
+  log "About to PERMANENTLY remove the following runner(s):"
+  local n
+  for n in "${TARGET_NAMES[@]}"; do
+    printf '     - %s/%s\n' "${RUNNER_ROOT}" "${n}" >&2
+  done
+  if [[ -z "${TOKEN}" ]]; then
+    warn "No --token: runners will NOT be deregistered from GitHub (left 'offline')."
+  fi
+  local reply
+  printf '\033[1;33m?\033[0m Proceed? [y/N] ' >&2
+  read -r reply
+  case "${reply}" in
+    y|Y|yes|YES) return 0 ;;
+    *) log "Aborted; nothing removed."; exit 0 ;;
+  esac
+}
+
+print_summary() {
+  local i
+  printf '\n'
+  printf '==> Summary\n'
+  printf '  %-12s %s\n' "RUNNER" "STATUS"
+  printf '  %-12s %s\n' "------" "------"
+  for i in "${!STATUS_NAME[@]}"; do
+    printf '  %-12s %s\n' "${STATUS_NAME[$i]}" "${STATUS_RESULT[$i]}"
+  done
+  printf '\n'
+}
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+main() {
+  parse_args "$@"
+  detect_platform
+  require_cmds
+  detect_user
+
+  discover_targets
+  if [[ ${#TARGET_NAMES[@]} -eq 0 ]]; then
+    log "No runners found under ${RUNNER_ROOT}; nothing to clean up."
+    [[ -d "${RUNNER_ROOT}" ]] && rmdir "${RUNNER_ROOT}" 2>/dev/null || true
+    exit 0
+  fi
+
+  confirm
+  ensure_sudo
+
+  local name rc=0
+  for name in "${TARGET_NAMES[@]}"; do
+    if ! cleanup_one "${name}"; then
+      rc=1
+      warn "Failed to fully clean ${name}; continuing."
+    fi
+  done
+
+  # Remove the root dir if it is now empty (only meaningful for --all).
+  if [[ -z "${TARGET_RUNNER}" && -d "${RUNNER_ROOT}" ]]; then
+    if sudo rmdir "${RUNNER_ROOT}" 2>/dev/null; then
+      step "Removed empty ${RUNNER_ROOT}"
+    fi
+  fi
+
+  print_summary
+  if [[ "${rc}" -ne 0 ]]; then
+    err "Some runners did not clean up fully. See the summary above."
+  else
+    log "Cleanup complete."
+  fi
+  return "${rc}"
+}
+
+main "$@"

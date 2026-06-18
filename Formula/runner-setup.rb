@@ -2,36 +2,55 @@
 # frozen_string_literal: true
 
 class RunnerSetup < Formula
-  desc "Provision multiple GitHub Actions self-hosted runners on macOS"
+  desc "Provision and tear down GitHub Actions self-hosted runners on macOS"
   homepage "https://github.com/joeblau/homebrew-hb"
-  url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/v1.0.1.tar.gz"
-  sha256 "6a86aac7758c8e85ee5cc1ab784f5a37572e96fbc59779be66ecce4d62eeacb6"
+  url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/v1.1.0.tar.gz"
+  # Replace the placeholder below with the real digest AFTER pushing tag v1.1.0:
+  #   curl -fsSL https://github.com/joeblau/homebrew-hb/archive/refs/tags/v1.1.0.tar.gz | shasum -a 256
+  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license "MIT"
 
   depends_on :macos
 
   def install
     bin.install "runner-setup"
+    bin.install "runner-cleanup"
   end
 
   def caveats
     <<~EOS
-      Set up self-hosted runners (defaults to 2):
+      Set up self-hosted runners (defaults to 2). Pick the scope that matches
+      where you generated the token — an org token and a repo token are NOT
+      interchangeable (using the wrong one returns HTTP 404):
 
+        # Organization runner:
         runner-setup --org ORG_NAME --token REGISTRATION_TOKEN [--runners N]
 
-      Get a REGISTRATION_TOKEN from:
-        https://github.com/organizations/ORG_NAME/settings/actions/runners/new
+        # Repository runner:
+        runner-setup --repo OWNER/REPO --token REGISTRATION_TOKEN [--runners N]
 
-      runner-setup itself does NOT need sudo to install, but at RUNTIME it uses
-      sudo to create /opt/github-runners and to install system LaunchDaemons.
-      The runner processes run as your (non-root) user, not as root, because the
-      GitHub Actions runner refuses to run as root.
+      Get a REGISTRATION_TOKEN (and the exact --url) from the "New runner" page:
+        Org:  https://github.com/organizations/ORG_NAME/settings/actions/runners/new
+        Repo: https://github.com/OWNER/REPO/settings/actions/runners/new
+
+      To share one runner across MULTIPLE repos, register at the org level
+      (--org) and grant repo access under Org Settings > Actions > Runner groups.
+      A --repo runner is bound to that single repository.
+
+      Remove runners later (use a *removal* token to also deregister on GitHub):
+        runner-cleanup --all --token REMOVE_TOKEN
+        runner-cleanup --runner 2
+
+      Neither command needs sudo to install, but at RUNTIME they use sudo to
+      manage /opt/github-runners and system LaunchDaemons. The runner processes
+      run as your (non-root) user, because the GitHub Actions runner refuses to
+      run as root.
 
       SECURITY: a token passed via --token is visible in `ps` to other local
-      users while the command runs. On shared machines prefer:
+      users while the command runs. On shared machines prefer the env var:
 
-        RUNNER_TOKEN=xxxxx runner-setup --org ORG_NAME
+        RUNNER_TOKEN=xxxxx runner-setup --repo OWNER/REPO
+        RUNNER_REMOVE_TOKEN=xxxxx runner-cleanup --all
 
       Tokens are short-lived; rotate any token that may have been exposed.
     EOS
@@ -39,11 +58,17 @@ class RunnerSetup < Formula
 
   test do
     assert_match "USAGE", shell_output("#{bin}/runner-setup --help")
-    # Missing required args must fail with a nonzero exit and a clear message.
-    # Clear RUNNER_TOKEN so the test is hermetic: the script falls back to that
-    # env var for --token, so a tester/CI with it exported would otherwise pass
+    assert_match "USAGE", shell_output("#{bin}/runner-cleanup --help")
+
+    # No registration scope chosen must fail with exit 2 and a clear message.
+    no_scope = shell_output("RUNNER_TOKEN= #{bin}/runner-setup --token x 2>&1", 2)
+    assert_match "exactly one of --org", no_scope
+
+    # Scope present but token missing must also fail with exit 2. Clear
+    # RUNNER_TOKEN so the test is hermetic: the script falls back to that env var
+    # for --token, so a tester/CI with it exported would otherwise pass
     # validation and never reach the exit-2 path.
-    output = shell_output("RUNNER_TOKEN= #{bin}/runner-setup --org acme 2>&1", 2)
-    assert_match "Missing required argument", output
+    no_token = shell_output("RUNNER_TOKEN= #{bin}/runner-setup --org acme 2>&1", 2)
+    assert_match "Missing required argument", no_token
   end
 end
