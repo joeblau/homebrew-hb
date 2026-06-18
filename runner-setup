@@ -1,0 +1,626 @@
+#!/usr/bin/env bash
+#
+# runner-setup — provision multiple GitHub Actions self-hosted runners on macOS
+#
+# Usage:
+#   runner-setup --org ORG_NAME --token REGISTRATION_TOKEN [--runners N]
+#
+# Sets up N self-hosted runners under /opt/github-runners/runner-N, configures
+# each unattended as the INVOKING (non-root) user, then authors a system
+# LaunchDaemon per runner — running as that same user, NOT root — and
+# bootstraps it with launchctl so the runners survive reboots without a
+# logged-in GUI session.
+#
+# We deliberately AUTHOR a clean LaunchDaemon ourselves (full control of Label,
+# UserName, absolute paths, KeepAlive semantics) rather than relocating the
+# gui-domain LaunchAgent that `svc.sh install` would create. We never run
+# `svc.sh install`, which avoids the "service loaded twice" hazard (a gui agent
+# AND a system daemon both registered for the same runner name).
+#
+# The GitHub Actions runner refuses to run as root unless RUNNER_ALLOW_RUNASROOT=1.
+# We intentionally NEVER set that: config.sh / runsvc.sh always run as the real
+# user, while only privileged filesystem and launchd operations use sudo.
+
+set -euo pipefail
+
+# ----------------------------------------------------------------------------
+# Constants / globals
+# ----------------------------------------------------------------------------
+PROG_NAME="$(basename "$0")"
+RUNNER_ROOT="/opt/github-runners"
+LAUNCH_DAEMON_DIR="/Library/LaunchDaemons"
+LATEST_API="https://api.github.com/repos/actions/runner/releases/latest"
+DEFAULT_RUNNERS=2
+
+ORG=""
+TOKEN=""
+RUNNERS="${DEFAULT_RUNNERS}"
+
+# Populated during detection / setup
+REAL_USER=""
+REAL_GROUP=""
+REAL_UID=""
+REAL_HOME=""
+ARCH_TAG=""
+RUNNER_VERSION=""
+TARBALL_NAME=""
+DOWNLOAD_URL=""
+EXPECTED_SHA=""
+WORK_TMPDIR=""
+TARBALL_PATH=""
+
+# Per-runner status tracking (parallel arrays keyed by index).
+declare -a STATUS_NAME=()
+declare -a STATUS_RESULT=()
+
+# ----------------------------------------------------------------------------
+# Output helpers — progress goes to stderr; the token is NEVER interpolated.
+# ----------------------------------------------------------------------------
+log()  { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
+step() { printf '\033[1;32m  ->\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[1;33mWARN:\033[0m %s\n' "$*" >&2; }
+err()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; }
+
+usage() {
+  cat >&2 <<EOF
+${PROG_NAME} — provision GitHub Actions self-hosted runners on macOS
+
+USAGE:
+  ${PROG_NAME} --org ORG_NAME --token REGISTRATION_TOKEN [--runners N]
+
+REQUIRED:
+  --org ORG_NAME        GitHub organization (https://github.com/ORG_NAME)
+  --token TOKEN         Runner registration token, from the org's
+                        Settings > Actions > Runners > New runner page.
+                        May also be supplied via the RUNNER_TOKEN env var
+                        (preferred — see SECURITY below).
+
+OPTIONS:
+  --runners N           Number of runners to create (default: ${DEFAULT_RUNNERS})
+  -h, --help            Show this help and exit
+
+EXAMPLES:
+  ${PROG_NAME} --org acme --token AYZ... --runners 3
+  RUNNER_TOKEN=AYZ... ${PROG_NAME} --org acme
+
+SECURITY NOTE:
+  A token passed via --token is visible in 'ps' to other local users while
+  this script runs. Prefer the RUNNER_TOKEN environment variable on shared
+  machines. Registration tokens are short-lived; rotate any token that may
+  have been exposed. The token is never written to logs or into the plist.
+
+  This script uses sudo for /opt and ${LAUNCH_DAEMON_DIR}; the runner
+  processes themselves run as the invoking (non-root) user, because the
+  GitHub Actions runner refuses to run as root.
+EOF
+}
+
+# ----------------------------------------------------------------------------
+# Cleanup / signal traps
+# ----------------------------------------------------------------------------
+cleanup() {
+  local code=$?
+  if [[ -n "${WORK_TMPDIR}" && -d "${WORK_TMPDIR}" ]]; then
+    rm -rf "${WORK_TMPDIR}" 2>/dev/null || true
+  fi
+  if [[ "${code}" -ne 0 ]]; then
+    err "Aborted (exit ${code}). Some runners may be partially configured."
+    err "Re-run the same command to resume; already-configured runners are skipped."
+  fi
+  return "${code}"
+}
+trap cleanup EXIT
+trap 'err "Interrupted."; exit 130' INT TERM
+
+# ----------------------------------------------------------------------------
+# Argument parsing
+# ----------------------------------------------------------------------------
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --org)
+        [[ $# -ge 2 ]] || { err "--org requires a value"; usage; exit 2; }
+        ORG="$2"; shift 2 ;;
+      --org=*)     ORG="${1#*=}"; shift ;;
+      --token)
+        [[ $# -ge 2 ]] || { err "--token requires a value"; usage; exit 2; }
+        TOKEN="$2"; shift 2 ;;
+      --token=*)   TOKEN="${1#*=}"; shift ;;
+      --runners)
+        [[ $# -ge 2 ]] || { err "--runners requires a value"; usage; exit 2; }
+        RUNNERS="$2"; shift 2 ;;
+      --runners=*) RUNNERS="${1#*=}"; shift ;;
+      -h|--help)   usage; exit 0 ;;
+      *)
+        err "Unknown argument: $1"
+        usage
+        exit 2 ;;
+    esac
+  done
+
+  # Token may come from the environment if not given on the CLI.
+  if [[ -z "${TOKEN}" && -n "${RUNNER_TOKEN:-}" ]]; then
+    TOKEN="${RUNNER_TOKEN}"
+  fi
+
+  local missing=()
+  [[ -n "${ORG}" ]]   || missing+=("--org")
+  [[ -n "${TOKEN}" ]] || missing+=("--token (or RUNNER_TOKEN env)")
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    err "Missing required argument(s): ${missing[*]}"
+    usage
+    exit 2
+  fi
+
+  if ! [[ "${RUNNERS}" =~ ^[0-9]+$ ]] || [[ "${RUNNERS}" -lt 1 ]]; then
+    err "--runners must be a positive integer (got: '${RUNNERS}')"
+    exit 2
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# Environment detection
+# ----------------------------------------------------------------------------
+detect_platform() {
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    err "This tool only supports macOS."
+    exit 1
+  fi
+}
+
+detect_user() {
+  # Configure + run the runner as the real invoking user, never root.
+  # $SUDO_USER when re-invoked under sudo, otherwise whoami. Never hardcoded.
+  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+    REAL_USER="${SUDO_USER}"
+  else
+    REAL_USER="$(whoami)"
+  fi
+  if [[ "${REAL_USER}" == "root" ]]; then
+    err "Refusing to configure runners as root. The GitHub Actions runner will"
+    err "not run as root. Run this script as a normal user; it uses sudo only"
+    err "internally for /opt and ${LAUNCH_DAEMON_DIR}."
+    exit 1
+  fi
+  REAL_GROUP="$(id -gn "${REAL_USER}")"
+  REAL_UID="$(id -u "${REAL_USER}")"
+  REAL_HOME="$(dscl . -read "/Users/${REAL_USER}" NFSHomeDirectory 2>/dev/null \
+    | awk '{print $2}')"
+  [[ -n "${REAL_HOME}" ]] || REAL_HOME="/Users/${REAL_USER}"
+  step "Runner owner: ${REAL_USER}:${REAL_GROUP} (uid ${REAL_UID}, home ${REAL_HOME})"
+}
+
+detect_arch() {
+  local m
+  m="$(uname -m)"
+  case "${m}" in
+    arm64)  ARCH_TAG="arm64" ;;
+    x86_64) ARCH_TAG="x64" ;;
+    *) err "Unsupported architecture: ${m}"; exit 1 ;;
+  esac
+  step "Architecture: ${m} -> osx-${ARCH_TAG}"
+}
+
+require_cmds() {
+  local missing=()
+  local c
+  for c in curl tar uname id sudo launchctl plutil dscl shasum; do
+    command -v "${c}" >/dev/null 2>&1 || missing+=("${c}")
+  done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    err "Required command(s) not found: ${missing[*]}"
+    exit 1
+  fi
+}
+
+# Prime sudo once, up front, so password prompts don't interleave with progress.
+ensure_sudo() {
+  log "Requesting administrator privileges (needed for /opt and LaunchDaemons)"
+  if ! sudo -v; then
+    err "Could not obtain sudo privileges."
+    exit 1
+  fi
+}
+
+# Run a command as the real (non-root) user. Direct call if we already are that
+# user; otherwise drop privileges with sudo. We never set RUNNER_ALLOW_RUNASROOT,
+# so the runner's own root-refusal stays as a safety net.
+#
+# CRITICAL: when this script is launched via `sudo runner-setup ...` the parent
+# process is root with HOME=/var/root. macOS's default sudoers does NOT enable
+# `always_set_home` and keeps HOME in env_keep, so a bare `sudo -u "${REAL_USER}"`
+# would PRESERVE root's HOME. config.sh / svc.sh / runsvc.sh compute
+# "${HOME}/Library/..." and write .runner/.credentials/.path under that home, so a
+# wrong HOME silently corrupts placement. We therefore force HOME/USER/LOGNAME for
+# the target user explicitly (via `env`), which is robust regardless of sudoers.
+as_user() {
+  if [[ "$(id -un)" == "${REAL_USER}" ]]; then
+    HOME="${REAL_HOME}" USER="${REAL_USER}" LOGNAME="${REAL_USER}" "$@"
+  else
+    sudo -H -u "${REAL_USER}" env \
+      HOME="${REAL_HOME}" \
+      USER="${REAL_USER}" \
+      LOGNAME="${REAL_USER}" \
+      "$@"
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# Resolve latest runner release (no jq dependency)
+# ----------------------------------------------------------------------------
+resolve_latest_release() {
+  log "Resolving latest actions/runner release"
+  local json tag
+  # Capture-then-check so set -e isn't masked inside command substitution.
+  if ! json="$(curl -fsSL --retry 3 --retry-delay 2 \
+      -H 'Accept: application/vnd.github+json' "${LATEST_API}")"; then
+    err "Failed to query GitHub releases API: ${LATEST_API}"
+    exit 1
+  fi
+
+  # The trailing `|| true` is REQUIRED: with `set -euo pipefail` a plain
+  # assignment whose pipeline fails (e.g. grep finds no match in a rate-limit or
+  # malformed-but-HTTP-200 body) would abort the script BEFORE the explicit
+  # emptiness check below, hiding the useful error message. curl -f only catches
+  # non-2xx, not a 200 with an unexpected body.
+  tag="$(printf '%s\n' "${json}" \
+    | grep -m1 '"tag_name"' \
+    | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' || true)"
+  if [[ -z "${tag}" ]]; then
+    err "Could not parse tag_name from releases API response."
+    err "GitHub may be rate-limiting you (unauthenticated API) or the body was malformed."
+    exit 1
+  fi
+
+  RUNNER_VERSION="${tag#v}"   # strip leading 'v' -> e.g. 2.335.1
+  TARBALL_NAME="actions-runner-osx-${ARCH_TAG}-${RUNNER_VERSION}.tar.gz"
+  DOWNLOAD_URL="https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/${TARBALL_NAME}"
+
+  # Pull the published SHA-256 for OUR asset. IMPORTANT: actions/runner does NOT
+  # expose a per-asset digest field in the releases API; the canonical checksums
+  # live in the release *body* markdown as:
+  #   <!-- BEGIN SHA osx-arm64 --><64-hex><!-- END SHA osx-arm64 -->
+  # We collapse newlines first so the marker+hex stay on one line, then extract.
+  EXPECTED_SHA="$(printf '%s' "${json}" \
+    | tr -d '\n' \
+    | grep -oE "<!-- BEGIN SHA osx-${ARCH_TAG} -->[0-9a-f]{64}<!-- END SHA osx-${ARCH_TAG} -->" \
+    | grep -oE '[0-9a-f]{64}' \
+    | head -n1 || true)"
+  if [[ -z "${EXPECTED_SHA}" ]]; then
+    err "Could not obtain the published SHA-256 for ${TARBALL_NAME} from the release notes."
+    err "Refusing to install an unverified runner tarball (supply-chain integrity)."
+    exit 1
+  fi
+
+  step "Latest version: ${RUNNER_VERSION}"
+  step "Asset: ${TARBALL_NAME}"
+  step "Published SHA-256: ${EXPECTED_SHA}"
+}
+
+# ----------------------------------------------------------------------------
+# Download + cache the tarball once (shared across all runners)
+# ----------------------------------------------------------------------------
+download_tarball() {
+  WORK_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/runner-setup.XXXXXX")"
+  TARBALL_PATH="${WORK_TMPDIR}/${TARBALL_NAME}"
+
+  log "Downloading runner ${RUNNER_VERSION} (osx-${ARCH_TAG})"
+  if ! curl -fL --retry 3 --retry-delay 2 --proto '=https' --tlsv1.2 \
+      -o "${TARBALL_PATH}" "${DOWNLOAD_URL}"; then
+    err "Download failed: ${DOWNLOAD_URL}"
+    exit 1
+  fi
+
+  # Sanity check the archive is a valid gzip tar before we touch /opt.
+  if ! tar -tzf "${TARBALL_PATH}" >/dev/null 2>&1; then
+    err "Downloaded file is not a valid tar.gz archive: ${TARBALL_PATH}"
+    exit 1
+  fi
+
+  # Verify checksum against the published digest. EXPECTED_SHA is guaranteed
+  # non-empty here (resolve_latest_release exits if it could not be obtained),
+  # so verification is mandatory, not best-effort.
+  local got
+  got="$(shasum -a 256 "${TARBALL_PATH}" | awk '{print $1}')"
+  if [[ "${got}" != "${EXPECTED_SHA}" ]]; then
+    err "SHA256 mismatch for ${TARBALL_NAME}"
+    err "  expected: ${EXPECTED_SHA}"
+    err "  actual:   ${got}"
+    exit 1
+  fi
+  step "SHA256 verified (${got})"
+
+  # macOS may quarantine downloaded archives; clear it so binaries run.
+  xattr -c "${TARBALL_PATH}" 2>/dev/null || true
+
+  step "Downloaded and validated: ${TARBALL_PATH}"
+}
+
+# ----------------------------------------------------------------------------
+# One-time root-owned scaffolding for /opt, then handed to the real user.
+# ----------------------------------------------------------------------------
+prepare_root_dir() {
+  log "Creating ${RUNNER_ROOT} (sudo) and chowning to ${REAL_USER}:${REAL_GROUP}"
+  sudo mkdir -p "${RUNNER_ROOT}"
+  sudo chown "${REAL_USER}:${REAL_GROUP}" "${RUNNER_ROOT}"
+}
+
+# ----------------------------------------------------------------------------
+# Per-runner provisioning
+# ----------------------------------------------------------------------------
+record_status() {
+  STATUS_NAME+=("$1")
+  STATUS_RESULT+=("$2")
+}
+
+# Boot a system service out and WAIT for it to actually disappear. `launchctl
+# bootout` is asynchronous: it returns before the domain has finished tearing
+# the service down, so an immediate `bootstrap` can intermittently fail with
+# "Bootstrap failed: 5: Input/output error" / "service already bootstrapped" on
+# fast machines. Poll until it is gone (bounded).
+bootout_system() {
+  local label="$1"
+  local _i
+  sudo launchctl bootout "system/${label}" 2>/dev/null || true
+  for _i in 1 2 3 4 5 6 7 8 9 10; do
+    sudo launchctl print "system/${label}" >/dev/null 2>&1 || return 0
+    sleep 1
+  done
+  return 0
+}
+
+configure_runner() {
+  local idx="$1"
+  local name="runner-${idx}"
+  local dir="${RUNNER_ROOT}/${name}"
+  local label="com.github.${name}"            # Label == plist filename stem
+  local plist_dest="${LAUNCH_DAEMON_DIR}/${label}.plist"
+  local log_dir="${dir}/_diag"
+
+  log "Configuring ${name}  (${dir})"
+
+  # --- Idempotency: already fully provisioned and loaded? ------------------
+  if [[ -f "${dir}/.runner" && -f "${plist_dest}" ]] \
+      && sudo launchctl print "system/${label}" >/dev/null 2>&1; then
+    step "${name} already configured and loaded — skipping."
+    record_status "${name}" "skipped (already loaded)"
+    return 0
+  fi
+
+  # --- Tear down any prior system daemon for a clean, idempotent re-run. ----
+  if sudo launchctl print "system/${label}" >/dev/null 2>&1; then
+    step "Booting out existing daemon system/${label}"
+    bootout_system "${label}"
+  fi
+  sudo rm -f "${plist_dest}"
+
+  # --- Create + own the runner directory (sudo for /opt). ------------------
+  step "Preparing directory"
+  sudo mkdir -p "${dir}"
+  sudo chown "${REAL_USER}:${REAL_GROUP}" "${dir}"
+
+  # --- Remove any stale service install before reconfiguring. --------------
+  # NOTE: we do NOT attempt `config.sh remove` here. Removal requires a distinct
+  # *remove* token (not the registration token in --token), so it would silently
+  # no-op and only re-expose the token in `ps`. We rely on `config.sh ... --replace`
+  # below to overwrite the existing registration cleanly.
+  if [[ -f "${dir}/.runner" && -f "${dir}/svc.sh" ]]; then
+    step "Removing stale service install in ${name}"
+    ( cd "${dir}" && as_user ./svc.sh uninstall ) 2>/dev/null || true
+  fi
+
+  # --- Extract runner files as the real user. ------------------------------
+  if [[ -x "${dir}/config.sh" ]]; then
+    step "Runner binaries already present; reusing."
+  else
+    step "Extracting runner files"
+    as_user tar -xzf "${TARBALL_PATH}" -C "${dir}"
+  fi
+  # Ensure ownership is the real user after extraction (belt-and-suspenders).
+  sudo chown -R "${REAL_USER}:${REAL_GROUP}" "${dir}"
+  xattr -rc "${dir}" 2>/dev/null || true
+
+  # --- Configure unattended. MUST run as the invoking user (not root). -----
+  step "Running config.sh (unattended) as ${REAL_USER}"
+  (
+    cd "${dir}"
+    as_user ./config.sh \
+      --unattended \
+      --url "https://github.com/${ORG}" \
+      --token "${TOKEN}" \
+      --name "${name}" \
+      --labels "macos,macmini,self-hosted" \
+      --replace
+  )
+
+  # --- Avoid the double-load hazard (spec constraint #3). ------------------
+  # We DO NOT run `svc.sh install`. svc.sh exists only to create + (via
+  # `svc.sh start`) load a gui-domain LaunchAgent labeled
+  # actions.runner.<ORG>.<runner-name>; since we author our own system
+  # LaunchDaemon below, running svc.sh install adds zero value and is the prime
+  # source of "service loaded twice" (an agent AND a daemon both registered
+  # under the same runner name, fighting for jobs). The agent label/plist name
+  # is deterministic, so we defensively boot out and remove any pre-existing
+  # agent from a prior interactive run, then verify it is truly gone.
+  local agent_label="actions.runner.${ORG}.${name}"
+  local agent_plist="${REAL_HOME}/Library/LaunchAgents/${agent_label}.plist"
+  step "Ensuring no leftover gui LaunchAgent (${agent_label})"
+  # Run the gui-domain bootout inside the user's real Aqua session. A bare
+  # `sudo -u user launchctl bootout gui/<uid>/...` from a non-session sudo
+  # context returns "Could not find domain"; `launchctl asuser <uid>` re-enters
+  # that user's GUI session so the bootout actually takes effect.
+  sudo launchctl asuser "${REAL_UID}" launchctl bootout "gui/${REAL_UID}/${agent_label}" 2>/dev/null || true
+  as_user rm -f "${agent_plist}" 2>/dev/null || true
+  if sudo launchctl asuser "${REAL_UID}" launchctl print "gui/${REAL_UID}/${agent_label}" >/dev/null 2>&1; then
+    err "gui LaunchAgent ${agent_label} is still loaded; refusing to also load a"
+    err "system daemon (that would double-run the runner). Boot it out manually:"
+    err "  launchctl bootout gui/${REAL_UID}/${agent_label}"
+    record_status "${name}" "FAILED (gui agent still loaded)"
+    return 1
+  fi
+
+  # --- Author a FRESH system LaunchDaemon plist so we fully control every
+  #     key: Label, UserName (so it does NOT run as root), absolute paths. ---
+  step "Writing LaunchDaemon ${plist_dest}"
+  as_user mkdir -p "${log_dir}"
+
+  # Service entrypoint MUST be runsvc.sh — the runner's service wrapper. It
+  # translates TERM->INT so `launchctl bootout`/`kickstart` stop the runner
+  # cleanly, and matches the official darwin service contract. run.sh is the
+  # INTERACTIVE entry point and is wrong for a launchd service, so we do NOT
+  # use it.
+  #
+  # runsvc.sh ships at ${dir}/bin/runsvc.sh in the extracted tarball. (The
+  # official `svc.sh install` would also copy it to ${dir}/runsvc.sh, but we
+  # deliberately skip svc.sh install to avoid the gui/daemon double-load, so we
+  # reference the bin/ copy directly.) runsvc.sh resolves .path / externals /
+  # RunnerService.js RELATIVE TO CWD, so the LaunchDaemon's WorkingDirectory
+  # below MUST be the runner root (${dir}) for it to work — and it is.
+  local program="${dir}/bin/runsvc.sh"
+  if [[ ! -f "${program}" ]]; then
+    err "bin/runsvc.sh not found in ${dir} (corrupt runner layout)."
+    record_status "${name}" "FAILED (no runsvc.sh)"
+    return 1
+  fi
+  as_user chmod u+x "${program}" 2>/dev/null || true
+
+  local tmp_plist="${WORK_TMPDIR}/${label}.plist"
+  cat > "${tmp_plist}" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${label}</string>
+  <key>UserName</key>
+  <string>${REAL_USER}</string>
+  <key>WorkingDirectory</key>
+  <string>${dir}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${program}</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>${REAL_HOME}</string>
+    <key>ACTIONS_RUNNER_SVC</key>
+    <string>1</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>SessionCreate</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>StandardOutPath</key>
+  <string>${log_dir}/runner-stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>${log_dir}/runner-stderr.log</string>
+</dict>
+</plist>
+EOF
+
+  # Validate the plist before installing it.
+  if ! plutil -lint "${tmp_plist}" >/dev/null 2>&1; then
+    err "Generated plist failed plutil -lint for ${name}."
+    record_status "${name}" "FAILED (invalid plist)"
+    return 1
+  fi
+
+  # Install with the strict ownership/perms LaunchDaemons require: root:wheel 644.
+  # launchd refuses to load a daemon plist that is group/other-writable or not
+  # owned by root.
+  sudo cp "${tmp_plist}" "${plist_dest}"
+  sudo chown root:wheel "${plist_dest}"
+  sudo chmod 644 "${plist_dest}"
+
+  # Pre-create log files owned by the runner user so they are writable.
+  as_user touch "${log_dir}/runner-stdout.log" "${log_dir}/runner-stderr.log"
+
+  # --- Bootstrap into the system domain, enable, kickstart. ----------------
+  step "Bootstrapping system/${label}"
+  bootout_system "${label}"
+  if ! sudo launchctl bootstrap system "${plist_dest}"; then
+    # Retry once after a brief settle — covers the async-teardown race.
+    sleep 2
+    if ! sudo launchctl bootstrap system "${plist_dest}"; then
+      err "launchctl bootstrap failed for ${name}."
+      record_status "${name}" "FAILED (bootstrap)"
+      return 1
+    fi
+  fi
+  sudo launchctl enable "system/${label}" 2>/dev/null || true
+  sudo launchctl kickstart -k "system/${label}" 2>/dev/null || true
+
+  # --- Verify it is loaded. ------------------------------------------------
+  if sudo launchctl print "system/${label}" >/dev/null 2>&1; then
+    step "${name} is configured and running as ${REAL_USER}."
+    record_status "${name}" "OK (system/${label}, user ${REAL_USER})"
+  else
+    warn "${name} installed but not visible in launchctl print."
+    record_status "${name}" "INSTALLED (not confirmed)"
+  fi
+  return 0
+}
+
+# ----------------------------------------------------------------------------
+# Final summary (printed to stdout — this is the result of the run)
+# ----------------------------------------------------------------------------
+print_summary() {
+  local i
+  printf '\n'
+  printf '==> Summary\n'
+  printf '  %-12s %-24s %s\n' "RUNNER" "LABEL" "STATUS"
+  printf '  %-12s %-24s %s\n' "------" "-----" "------"
+  for i in "${!STATUS_NAME[@]}"; do
+    printf '  %-12s %-24s %s\n' \
+      "${STATUS_NAME[$i]}" "com.github.${STATUS_NAME[$i]}" "${STATUS_RESULT[$i]}"
+  done
+  printf '\n'
+  log "Inspect with:  sudo launchctl print system/com.github.runner-1"
+  log "Logs:          ${RUNNER_ROOT}/runner-1/_diag/"
+}
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+main() {
+  parse_args "$@"
+  detect_platform
+  require_cmds
+  detect_user
+  detect_arch
+  ensure_sudo
+  resolve_latest_release
+  download_tarball
+  prepare_root_dir
+
+  log "Provisioning ${RUNNERS} runner(s) under ${RUNNER_ROOT}"
+  local overall_rc=0
+  local i
+  for ((i = 1; i <= RUNNERS; i++)); do
+    # Don't let one failed runner abort the batch; record and continue.
+    if ! configure_runner "${i}"; then
+      overall_rc=1
+      warn "runner-${i} failed; continuing with remaining runners."
+    fi
+  done
+
+  print_summary
+  if [[ "${overall_rc}" -ne 0 ]]; then
+    err "One or more runners failed. See the summary above."
+  else
+    log "All ${RUNNERS} runner(s) provisioned successfully."
+  fi
+  return "${overall_rc}"
+}
+
+main "$@"
