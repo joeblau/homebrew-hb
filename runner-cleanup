@@ -268,14 +268,21 @@ cleanup_one() {
     sudo rm -f "${plist}"
   fi
 
-  # 3) Any leftover gui LaunchAgent(s) for this runner (from a manual svc.sh run)
-  local agent alabel
+  # 3) Any leftover gui LaunchAgent(s) for this runner (from a manual svc.sh
+  #    run). The GitHub runner name may be plain (runner-N) or machine-prefixed
+  #    (PREFIX-runner-N), so match the trailing index precisely rather than a
+  #    fixed ".runner-N" suffix.
+  local idx="${name#runner-}"
+  local agent alabel rn
   shopt -s nullglob
-  for agent in "${REAL_HOME}/Library/LaunchAgents/actions.runner."*".${name}.plist"; do
-    alabel="$(basename "${agent}" .plist)"
-    step "Booting out gui agent ${alabel}"
-    sudo launchctl asuser "${REAL_UID}" launchctl bootout "gui/${REAL_UID}/${alabel}" 2>/dev/null || true
-    as_user rm -f "${agent}" 2>/dev/null || true
+  for agent in "${REAL_HOME}/Library/LaunchAgents/actions.runner."*.plist; do
+    alabel="$(basename "${agent}" .plist)"   # actions.runner.<slug>.<runner-name>
+    rn="${alabel##*.}"                         # <runner-name>
+    if [[ "${rn}" == "runner-${idx}" || "${rn}" == *"-runner-${idx}" ]]; then
+      step "Booting out gui agent ${alabel}"
+      sudo launchctl asuser "${REAL_UID}" launchctl bootout "gui/${REAL_UID}/${alabel}" 2>/dev/null || true
+      as_user rm -f "${agent}" 2>/dev/null || true
+    fi
   done
   shopt -u nullglob
 

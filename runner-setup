@@ -38,10 +38,13 @@ URL=""
 TOKEN=""
 RUNNERS="${DEFAULT_RUNNERS}"
 LABELS="macos,macmini,self-hosted"
+NAME_PREFIX=""        # GitHub runner-name prefix; defaults to this machine's name
+NAME_PREFIX_SET=0     # 1 once --name-prefix was given (even if empty)
 
 # Derived from the chosen registration scope (--org / --repo / --url).
 RUNNER_URL=""
 SCOPE_SLUG=""
+HOST_LABEL=""         # sanitized machine name, used as the default name prefix
 
 # Set to 1 once the per-runner provisioning loop actually starts, so the EXIT
 # trap only shows the "partially configured / re-run to resume" hint after work
@@ -98,6 +101,12 @@ REQUIRED:
 OPTIONS:
   --runners N           Number of runners to create (default: ${DEFAULT_RUNNERS})
   --labels CSV          Comma-separated runner labels (default: ${LABELS})
+  --name-prefix PREFIX  Prefix for the GitHub runner name; each runner registers
+                        as PREFIX-runner-N. Defaults to this machine's name, so
+                        runners from different Macs do not collide in the same
+                        scope. Use --name-prefix '' for a plain runner-N. An
+                        already-registered runner keeps its original name on
+                        re-run (runner-cleanup it first to actually rename it).
   -h, --help            Show this help and exit
 
 EXAMPLES:
@@ -170,6 +179,10 @@ parse_args() {
         [[ $# -ge 2 ]] || { err "--labels requires a value"; usage; exit 2; }
         LABELS="$2"; shift 2 ;;
       --labels=*)  LABELS="${1#*=}"; shift ;;
+      --name-prefix)
+        [[ $# -ge 2 ]] || { err "--name-prefix requires a value"; usage; exit 2; }
+        NAME_PREFIX="$2"; NAME_PREFIX_SET=1; shift 2 ;;
+      --name-prefix=*) NAME_PREFIX="${1#*=}"; NAME_PREFIX_SET=1; shift ;;
       -h|--help)   usage; exit 0 ;;
       *)
         err "Unknown argument: $1"
@@ -274,10 +287,29 @@ detect_arch() {
   step "Architecture: ${m} -> osx-${ARCH_TAG}"
 }
 
+# Resolve a sanitized machine name to prefix runner names with, so runners from
+# different Macs registered to the same org/repo do not collide (and so a second
+# machine's runner-1 does not --replace the first machine's). LocalHostName is
+# macOS's DNS-safe name; fall back to hostname/uname. Honors --name-prefix
+# (including an explicit empty value, which yields plain runner-N).
+detect_host() {
+  local h
+  h="$(scutil --get LocalHostName 2>/dev/null || true)"
+  [[ -n "${h}" ]] || h="$(hostname -s 2>/dev/null || true)"
+  [[ -n "${h}" ]] || h="$(uname -n 2>/dev/null | cut -d. -f1 || true)"
+  # Keep only [A-Za-z0-9-]; squeeze and trim dashes.
+  h="$(printf '%s' "${h}" | tr -c 'A-Za-z0-9' '-' | tr -s '-')"
+  h="${h#-}"; h="${h%-}"
+  HOST_LABEL="${h:-mac}"
+
+  [[ "${NAME_PREFIX_SET}" -eq 1 ]] || NAME_PREFIX="${HOST_LABEL}"
+  step "Runner name prefix: ${NAME_PREFIX:-(none, plain runner-N)}"
+}
+
 require_cmds() {
   local missing=()
   local c
-  for c in curl tar uname id sudo launchctl plutil dscl shasum; do
+  for c in curl tar uname id sudo launchctl plutil dscl shasum scutil tr hostname; do
     command -v "${c}" >/dev/null 2>&1 || missing+=("${c}")
   done
   if [[ ${#missing[@]} -gt 0 ]]; then
@@ -453,8 +485,31 @@ configure_runner() {
   local label="com.github.${name}"            # Label == plist filename stem
   local plist_dest="${LAUNCH_DAEMON_DIR}/${label}.plist"
   local log_dir="${dir}/_diag"
+  # GitHub-visible runner name (shown in the org/repo Runners list). The local
+  # dir + launchd label stay runner-N (already unique per machine); the prefix
+  # only disambiguates runners across machines in the SAME GitHub scope.
+  #
+  # If this runner registered before, REUSE the name recorded in .runner
+  # (agentName) instead of re-minting from NAME_PREFIX. The default prefix is
+  # LocalHostName, which macOS mutates (e.g. appends "-2" on a Bonjour name
+  # clash); re-minting could change the name on re-run and orphan the old GitHub
+  # registration (offline forever) via config.sh's name-keyed --replace. Reusing
+  # the recorded name keeps re-runs stable. To deliberately rename a runner,
+  # runner-cleanup it first, then re-provision.
+  local runner_name existing_name=""
+  if [[ -f "${dir}/.runner" ]]; then
+    existing_name="$(sed -n 's/.*"agentName"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+      "${dir}/.runner" 2>/dev/null | head -n1 || true)"
+  fi
+  if [[ -n "${existing_name}" ]]; then
+    runner_name="${existing_name}"
+  elif [[ -n "${NAME_PREFIX}" ]]; then
+    runner_name="${NAME_PREFIX}-${name}"
+  else
+    runner_name="${name}"
+  fi
 
-  log "Configuring ${name}  (${dir})"
+  log "Configuring ${name} as '${runner_name}'  (${dir})"
 
   # --- Idempotency: already provisioned, loaded, AND same scope? -----------
   # .runner is JSON containing "gitHubUrl"; only skip when it matches the
@@ -466,8 +521,8 @@ configure_runner() {
     existing_url="$(sed -n 's/.*"gitHubUrl"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
       "${dir}/.runner" 2>/dev/null | head -n1 || true)"
     if [[ "${existing_url}" == "${RUNNER_URL}" ]]; then
-      step "${name} already configured for ${RUNNER_URL} and loaded — skipping."
-      record_status "${name}" "skipped (already loaded)"
+      step "${name} already configured as '${runner_name}' for ${RUNNER_URL} and loaded — skipping."
+      record_status "${name}" "skipped (already loaded as '${runner_name}')"
       return 0
     fi
     step "${name} loaded but registered to '${existing_url:-unknown}'; re-pointing to ${RUNNER_URL}."
@@ -522,7 +577,7 @@ configure_runner() {
       --unattended \
       --url "${RUNNER_URL}" \
       --token "${TOKEN}" \
-      --name "${name}" \
+      --name "${runner_name}" \
       --labels "${LABELS}" \
       --replace
   ) || config_rc=$?
@@ -549,7 +604,7 @@ configure_runner() {
   # under the same runner name, fighting for jobs). The agent label/plist name
   # is deterministic, so we defensively boot out and remove any pre-existing
   # agent from a prior interactive run, then verify it is truly gone.
-  local agent_label="actions.runner.${SCOPE_SLUG}.${name}"
+  local agent_label="actions.runner.${SCOPE_SLUG}.${runner_name}"
   local agent_plist="${REAL_HOME}/Library/LaunchAgents/${agent_label}.plist"
   step "Ensuring no leftover gui LaunchAgent (${agent_label})"
   # Run the gui-domain bootout inside the user's real Aqua session. A bare
@@ -678,8 +733,8 @@ EOF
 
   # --- Verify it is loaded. ------------------------------------------------
   if sudo launchctl print "system/${label}" >/dev/null 2>&1; then
-    step "${name} is configured and running as ${REAL_USER}."
-    record_status "${name}" "OK (system/${label}, user ${REAL_USER})"
+    step "${name} ('${runner_name}') is configured and running as ${REAL_USER}."
+    record_status "${name}" "OK '${runner_name}' (system/${label})"
   else
     warn "${name} installed but not visible in launchctl print."
     record_status "${name}" "INSTALLED (not confirmed)"
@@ -714,6 +769,7 @@ main() {
   require_cmds
   detect_user
   detect_arch
+  detect_host
   ensure_sudo
   resolve_latest_release
   download_tarball

@@ -4,8 +4,10 @@
 class RunnerSetup < Formula
   desc "Provision and tear down GitHub Actions self-hosted runners on macOS"
   homepage "https://github.com/joeblau/homebrew-hb"
-  url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/v1.1.0.tar.gz"
-  sha256 "6c389407daa6bdc5885401d0f8471e135f4fbf5c7011dde4d6b88278e631c252"
+  url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/v1.2.0.tar.gz"
+  # Replace the placeholder below with the real digest AFTER pushing tag v1.2.0:
+  #   curl -fsSL https://github.com/joeblau/homebrew-hb/archive/refs/tags/v1.2.0.tar.gz | shasum -a 256
+  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license "MIT"
 
   depends_on :macos
@@ -34,6 +36,9 @@ class RunnerSetup < Formula
       To share one runner across MULTIPLE repos, register at the org level
       (--org) and grant repo access under Org Settings > Actions > Runner groups.
       A --repo runner is bound to that single repository.
+
+      Runners register as <machine-name>-runner-N by default, so several Macs
+      can join one scope without name clashes. Override with --name-prefix.
 
       Remove runners later (use a *removal* token to also deregister on GitHub):
         runner-cleanup --all --token REMOVE_TOKEN
