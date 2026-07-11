@@ -5,7 +5,7 @@ class AgentMcp < Formula
   desc "Generic MCP server that wraps any agent CLI (codex, claude, gemini, grok)"
   homepage "https://github.com/joeblau/homebrew-hb"
   url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/v1.5.0.tar.gz"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  sha256 "407b247f0848848bce735d55b594859f6be8e7d60d76c7c0b311ee7787f19f07"
   license "MIT"
 
   depends_on "rust" => :build
