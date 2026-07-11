@@ -4,8 +4,8 @@
 class AgentMcp < Formula
   desc "Generic MCP server that wraps any agent CLI (codex, claude, gemini, grok)"
   homepage "https://github.com/joeblau/homebrew-hb"
-  url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/v1.4.0.tar.gz"
-  sha256 "acdc852aa0ced8e313500740e9b58be830d7b31c34b6045ea4be2cd4b3c1c9cb"
+  url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/v1.5.0.tar.gz"
+  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license "MIT"
 
   depends_on "rust" => :build
@@ -27,24 +27,21 @@ class AgentMcp < Formula
 
         agent-mcp --list
 
-      Register it with an MCP client (example: Claude Code) so `ask_codex` is
-      available inside a project:
+      Register it once per agent; the host launches agent-mcp as a stdio
+      subprocess, so `ask_codex` becomes available inside a project. Run these
+      from the project directory you want the wrapped agent to work in:
 
-        claude mcp add codex -- agent-mcp codex
+        claude mcp add codex -- agent-mcp codex   # Claude Code
+        codex  mcp add codex -- agent-mcp codex   # Codex
+        grok   mcp add codex -- agent-mcp codex   # Grok
 
-      Or add it to a client config that launches stdio servers, e.g.:
+      Or add it to any client config that launches stdio servers, e.g.:
 
         {
           "mcpServers": {
             "codex": { "command": "agent-mcp", "args": ["codex"] }
           }
         }
-
-      To instead start a long-lived server in its own window that several
-      clients connect to, use HTTP daemon mode:
-
-        agent-mcp codex --http                  # binds 127.0.0.1:8787
-        claude mcp add --transport http codex http://127.0.0.1:8787/
 
       Override or add agents (command, args, timeout, stdin/arg delivery) in
       ~/.config/agent-mcp/config.toml or a project-local ./.agent-mcp.toml. See

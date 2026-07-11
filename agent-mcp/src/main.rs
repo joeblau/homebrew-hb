@@ -7,12 +7,10 @@
 
 mod adapter;
 mod config;
-mod http;
 mod mcp;
 mod runner;
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -44,12 +42,6 @@ struct Cli {
     /// Override the exposed MCP tool name (default: ask_<agent>).
     #[arg(long, value_name = "NAME")]
     tool_name: Option<String>,
-
-    /// Run as a long-running HTTP (Streamable HTTP) daemon instead of stdio,
-    /// so multiple clients can connect. Optionally pass a bind address
-    /// (default: 127.0.0.1:8787).
-    #[arg(long, value_name = "ADDR", num_args = 0..=1, default_missing_value = "127.0.0.1:8787")]
-    http: Option<String>,
 
     /// List available agent adapters and exit.
     #[arg(long)]
@@ -113,22 +105,13 @@ fn run() -> Result<()> {
             "agent-mcp: '{agent}' is not a built-in adapter; wrapping it generically."
         );
     }
-    let transport = match &cli.http {
-        Some(addr) => format!("HTTP daemon at http://{addr}/"),
-        None => "stdio".to_string(),
-    };
     eprintln!(
-        "agent-mcp v{} serving tool `{}` -> `{}` over {} (cwd: {})",
+        "agent-mcp v{} serving tool `{}` -> `{}` over stdio (cwd: {})",
         env!("CARGO_PKG_VERSION"),
         adapter.tool_name,
         adapter.invocation_hint(),
-        transport,
         cwd_display,
     );
 
-    let server = mcp::Server::new(adapter, cwd);
-    match cli.http {
-        Some(addr) => http::serve(Arc::new(server), &addr),
-        None => server.serve(),
-    }
+    mcp::Server::new(adapter, cwd).serve()
 }
