@@ -4,8 +4,8 @@
 class AgentMcp < Formula
   desc "Generic MCP server that wraps any agent CLI (codex, claude, gemini, grok)"
   homepage "https://github.com/joeblau/homebrew-hb"
-  url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/v1.3.0.tar.gz"
-  sha256 "93d8451cdf7062e9d994c61ba7c6ca56530fb4c60ea56aac8f4617c21415e19c"
+  url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/v1.4.0.tar.gz"
+  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license "MIT"
 
   depends_on "rust" => :build
@@ -39,6 +39,12 @@ class AgentMcp < Formula
             "codex": { "command": "agent-mcp", "args": ["codex"] }
           }
         }
+
+      To instead start a long-lived server in its own window that several
+      clients connect to, use HTTP daemon mode:
+
+        agent-mcp codex --http                  # binds 127.0.0.1:8787
+        claude mcp add --transport http codex http://127.0.0.1:8787/
 
       Override or add agents (command, args, timeout, stdin/arg delivery) in
       ~/.config/agent-mcp/config.toml or a project-local ./.agent-mcp.toml. See
