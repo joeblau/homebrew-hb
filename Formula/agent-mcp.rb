@@ -66,7 +66,7 @@ class AgentMcp < Formula
         params: { name: "ask_echo", arguments: { prompt: "brew-ok" } } },
     ].map { |r| "#{JSON.dump(r)}\n" }.join
 
-    out, = Open3.capture2("#{bin}/agent-mcp", "echo", stdin_data: requests)
+    out, = Open3.capture2(bin/"agent-mcp", "echo", stdin_data: requests)
     assert_match "brew-ok", out
   end
 end
