@@ -48,26 +48,54 @@ Add it once per agent; the host launches `agent-mcp` on demand as a stdio
 subprocess. Run these from the project directory you want the wrapped agent to
 work in — the host inherits that as the subprocess working directory.
 
-Claude Code:
+### Claude Code
+
+Add codex and grok as tools in the local agent swarm:
 
 ```
 claude mcp add codex -- agent-mcp codex
 claude mcp add grok  -- agent-mcp grok
 ```
 
-Codex:
+`claude mcp add` defaults to **local** scope (current directory only). Because
+agent-mcp automatically operates in whatever project the session is in, you
+usually want them available everywhere — add `--scope user`:
+
+```
+claude mcp add --scope user codex -- agent-mcp codex
+claude mcp add --scope user grok  -- agent-mcp grok
+```
+
+- `--scope user` — available in all your projects (recommended)
+- `--scope project` — written to `.mcp.json`, shared with your team via the repo
+- default (`local`) — just this directory
+
+Verify, then use the `ask_codex` / `ask_grok` tools from a session:
+
+```
+claude mcp list        # shows codex and grok
+```
+
+Inside a session, `/mcp` lists them; then ask Claude to "use ask_codex to …".
+Remove later with `claude mcp remove codex`.
+
+### Codex
 
 ```
 codex mcp add codex -- agent-mcp codex
 ```
 
-Grok (stdio is the default transport; args go after `--`):
+### Grok
+
+Stdio is the default transport; args go after `--`:
 
 ```
 grok mcp add codex -- agent-mcp codex
 ```
 
-Any other client that launches stdio MCP servers via JSON config:
+### Any other client
+
+Clients that launch stdio MCP servers via JSON config:
 
 ```json
 {
