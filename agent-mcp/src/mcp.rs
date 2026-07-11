@@ -54,26 +54,27 @@ impl Server {
                 }
             };
 
-            // A response has no `method`; a notification has a `method` but no
-            // `id`. We only need to answer requests (method + id).
-            let method = msg.get("method").and_then(Value::as_str);
-            let id = msg.get("id").cloned();
-
-            let method = match method {
-                Some(m) => m,
-                None => continue, // not a request/notification we handle
-            };
-
-            // Notifications (no id) are fire-and-forget.
-            let Some(id) = id else {
-                self.handle_notification(method);
-                continue;
-            };
-
-            let response = self.handle_request(method, msg.get("params"), id);
-            self.write(&mut stdout, response)?;
+            if let Some(response) = self.dispatch(&msg) {
+                self.write(&mut stdout, response)?;
+            }
         }
         Ok(())
+    }
+
+    /// Process one parsed JSON-RPC message. Returns `Some(response)` for a
+    /// request (has both `method` and `id`), or `None` for a notification or a
+    /// message we don't answer. This is the transport-agnostic entry point
+    /// shared by the stdio and HTTP servers.
+    pub fn dispatch(&self, msg: &Value) -> Option<Value> {
+        // A response has no `method`; a notification has a `method` but no `id`.
+        let method = msg.get("method").and_then(Value::as_str)?;
+        match msg.get("id").cloned() {
+            Some(id) => Some(self.handle_request(method, msg.get("params"), id)),
+            None => {
+                self.handle_notification(method);
+                None
+            }
+        }
     }
 
     fn handle_notification(&self, method: &str) {
