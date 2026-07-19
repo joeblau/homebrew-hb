@@ -18,11 +18,11 @@ use clap::Parser;
 use adapter::Adapter;
 use config::Layered;
 
-/// Generic MCP server that wraps any agent CLI (codex, claude, gemini, grok, …).
+/// Generic MCP server that wraps any agent CLI (codex, claude, gemini, grok, kimi, …).
 #[derive(Parser, Debug)]
 #[command(name = "agent-mcp", version, about, long_about = None)]
 struct Cli {
-    /// Agent to wrap: a built-in (codex, claude, gemini, grok) or any command
+    /// Agent to wrap: a built-in (codex, claude, gemini, grok, kimi) or any command
     /// on your PATH. Unknown names are run as `<name> "<prompt>"`.
     #[arg(value_name = "AGENT")]
     agent: Option<String>,

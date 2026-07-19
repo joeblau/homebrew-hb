@@ -2,10 +2,10 @@
 # frozen_string_literal: true
 
 class AgentMcp < Formula
-  desc "Generic MCP server that wraps any agent CLI (codex, claude, gemini, grok)"
+  desc "Generic MCP server that wraps any agent CLI (codex, claude, gemini, grok, kimi)"
   homepage "https://github.com/joeblau/homebrew-hb"
-  url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/v1.5.0.tar.gz"
-  sha256 "407b247f0848848bce735d55b594859f6be8e7d60d76c7c0b311ee7787f19f07"
+  url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/v1.6.0.tar.gz"
+  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license "MIT"
 
   depends_on "rust" => :build
@@ -22,7 +22,7 @@ class AgentMcp < Formula
       project directory; each tool call runs the wrapped agent there and returns
       its output, so any MCP client can delegate work to that agent.
 
-      Built-in agents: codex, claude, gemini, grok. Any other name is wrapped
+      Built-in agents: codex, claude, gemini, grok, kimi. Any other name is wrapped
       generically as `<name> "<prompt>"`. List them with:
 
         agent-mcp --list

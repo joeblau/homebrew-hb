@@ -159,5 +159,7 @@ pub fn builtins() -> HashMap<String, AdapterConfig> {
     m.insert("gemini".to_string(), a("gemini", &["-p", "{prompt}"]));
     // xAI Grok CLI single-turn headless: `grok -p "<prompt>"`.
     m.insert("grok".to_string(), a("grok", &["-p", "{prompt}"]));
+    // Moonshot Kimi CLI print mode: `kimi -p "<prompt>"`.
+    m.insert("kimi".to_string(), a("kimi", &["-p", "{prompt}"]));
     m
 }
