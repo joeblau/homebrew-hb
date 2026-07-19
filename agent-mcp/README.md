@@ -32,6 +32,7 @@ owns its lifecycle, which is exactly how MCP stdio servers are meant to run.
 | `claude` | `claude -p {prompt}`  |
 | `gemini` | `gemini -p {prompt}`  |
 | `grok`   | `grok -p {prompt}`    |
+| `kimi`   | `kimi -p {prompt}`    |
 
 Any other name works too and is wrapped generically as `<name> "<prompt>"`, so
 `agent-mcp mytool` runs `mytool "<prompt>"`. List everything with:
