@@ -1,0 +1,869 @@
+#!/usr/bin/env bash
+#
+# runner-netisolate — network egress isolation and VPN kill-switch for the
+# GitHub Actions runner user on macOS, built on a managed pf anchor.
+#
+# Usage:
+#   runner-netisolate install [--user USER] [--allow CIDR ...] [--vpn-interface utunX] [--yes]
+#   runner-netisolate allowlist [--allow CIDR ...]
+#   runner-netisolate status
+#   runner-netisolate uninstall [--yes]
+#
+# It installs a pf anchor (com.github-runners) under /etc/pf.anchors, adds a
+# marked reference block to /etc/pf.conf (backing the original up once and
+# verifying with `pfctl -n -f` before ever loading), and loads the ruleset.
+# The generated rules restrict OUTBOUND traffic of the runner user to:
+#   - GitHub's published endpoint ranges (fetched from api.github.com/meta at
+#     install time) plus a small set of required GitHub FQDNs,
+#   - an operator-supplied CIDR allowlist for internal endpoints,
+#   - DNS to the machine's configured resolvers, plus DHCP and NTP,
+# and block+log everything else. In --vpn-interface mode, ALL egress for the
+# runner user is pinned to the tunnel interface, so a dropped tunnel fails
+# CLOSED (no runner traffic escapes on the physical interface).
+#
+# Like runner-setup/runner-cleanup: sudo is used ONLY for /etc/pf.anchors,
+# /etc/pf.conf and pfctl; there are no secrets on the command line or in logs.
+
+set -euo pipefail
+
+# ----------------------------------------------------------------------------
+# Constants / globals
+# ----------------------------------------------------------------------------
+PROG_NAME="$(basename "$0")"
+PF_ANCHOR_NAME="com.github-runners"
+PF_ANCHOR_DIR="/etc/pf.anchors"
+PF_ANCHOR_FILE="${PF_ANCHOR_DIR}/${PF_ANCHOR_NAME}"
+PF_STATE_FILE="${PF_ANCHOR_FILE}.state"
+PF_TABLE_META="${PF_ANCHOR_FILE}.gh_meta"
+PF_TABLE_FQDN="${PF_ANCHOR_FILE}.gh_fqdn"
+PF_TABLE_ALLOW="${PF_ANCHOR_FILE}.gh_allow"
+PF_TABLE_DNS="${PF_ANCHOR_FILE}.gh_dns"
+PF_CONF="/etc/pf.conf"
+PF_CONF_BAK="${PF_CONF}.runner-netisolate.bak"
+GITHUB_META_API="https://api.github.com/meta"
+MARK_BEGIN="# >>> runner-netisolate (managed block — do not edit inside) >>>"
+MARK_END="# <<< runner-netisolate (managed block) <<<"
+
+# GitHub endpoint keys we pull out of api.github.com/meta. `containers` is not
+# currently published there; missing keys are skipped silently.
+META_KEYS="web api git packages actions containers"
+
+# FQDNs the hosted runner protocol needs in ADDITION to the meta CIDR ranges.
+# pf resolves hostnames ONLY when the ruleset is loaded (no dynamic DNS
+# tracking) and cannot expand wildcards at all — so the *.actions.githubusercontent.com
+# family is represented by its fixed, individually-resolvable members here (the
+# bare zone apex does NOT resolve and would make the table unloadable). Re-run
+# install periodically to re-resolve. See docs/network-isolation.md.
+GITHUB_FQDNS="github.com api.github.com codeload.github.com ghcr.io pipelines.actions.githubusercontent.com results-receiver.actions.githubusercontent.com objects.githubusercontent.com pkg-containers.githubusercontent.com github-cloud.s3.amazonaws.com github-production-release-asset-2e65be.s3.amazonaws.com"
+
+COMMAND=""
+TARGET_USER=""        # user whose egress is restricted; default: invoking user
+VPN_IF=""             # e.g. utun5 — kill-switch mode when set
+ASSUME_YES=0
+
+ALLOW_LIST=""         # space-separated CIDRs from --allow
+META_CIDRS=""         # space-separated CIDRs fetched from the meta API
+DNS_SERVERS=""        # space-separated resolver IPs
+
+REAL_USER=""
+REAL_UID=""
+WORK_TMPDIR=""
+PF_WAS_ENABLED=0      # captured at install time; uninstall restores it
+
+# ----------------------------------------------------------------------------
+# Output helpers — progress goes to stderr; nothing secret is interpolated.
+# ----------------------------------------------------------------------------
+log()  { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
+step() { printf '\033[1;32m  ->\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[1;33mWARN:\033[0m %s\n' "$*" >&2; }
+err()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; }
+
+usage() {
+  cat >&2 <<EOF
+${PROG_NAME} — egress isolation + VPN kill-switch for GitHub Actions runners on macOS
+
+USAGE:
+  ${PROG_NAME} <command> [options]
+
+COMMANDS:
+  install             Fetch GitHub's published endpoint ranges, generate the pf
+                      anchor ${PF_ANCHOR_NAME}, reference it from ${PF_CONF}
+                      (backing the original up once and verifying with
+                      'pfctl -n -f' before loading), and enable pf. Idempotent:
+                      re-running refreshes the GitHub ranges and DNS names.
+  allowlist           Print the current internal-endpoint allowlist. With
+                      --allow, REPLACE it and reload only the anchor (the main
+                      ruleset is untouched).
+  status              Show whether the anchor is installed/referenced, whether
+                      pf is enabled, and the live rules + table sizes.
+  uninstall           Remove the anchor and its ${PF_CONF} reference, reload
+                      the ruleset, and restore pf's prior enabled/disabled
+                      state. The one-time backup ${PF_CONF_BAK} is kept.
+
+OPTIONS:
+  --user USER         User whose OUTBOUND traffic is restricted
+                      (default: the invoking user). Runner processes created by
+                      runner-setup run as the invoking user, so the default is
+                      usually correct on a dedicated runner Mac. ALL processes
+                      of this user are restricted, not just the runner.
+  --allow CIDR        Extra destination to permit (repeatable; comma-separated
+                      values also accepted) — e.g. internal artifact servers,
+                      proxies, or SCM mirrors the jobs legitimately need.
+  --vpn-interface IF  Kill-switch mode: permit the runner user ONLY on this
+                      tunnel interface (e.g. utun5). If the tunnel drops, all
+                      runner egress stops (fail closed). Mutually exclusive
+                      with --allow; GitHub ranges are not fetched in this mode.
+  -y, --yes           Do not prompt for confirmation.
+  -h, --help          Show this help and exit.
+
+EXAMPLES:
+  ${PROG_NAME} install --allow 10.20.0.0/16 --allow 192.168.50.10/32
+  ${PROG_NAME} install --user ci-runner --vpn-interface utun5
+  ${PROG_NAME} allowlist --allow 10.20.0.0/16,10.30.1.5/32
+  ${PROG_NAME} status
+  ${PROG_NAME} uninstall
+
+AUDIT:
+  sudo pfctl -s rules  -a ${PF_ANCHOR_NAME}        # live anchor rules
+  sudo pfctl -s info | grep Status                 # pf enabled?
+  sudo pfctl -a ${PF_ANCHOR_NAME} -t gh_meta -T show | head
+  sudo tcpdump -ni pflog0                          # watch blocked packets
+
+SECURITY NOTE:
+  This is a per-USER egress policy, not a sandbox: every process of the target
+  user is restricted, and it cannot stop a job that runs as another user or
+  subverts the machine (pf is host-level). For strong isolation, segment the
+  runner on its own VLAN or hardware and treat this as a second layer. Only
+  sudo is privileged; there are no tokens or secrets involved.
+
+LIMITATIONS:
+  Hostnames are resolved once at ruleset load time (pf has no dynamic DNS);
+  wildcards like *.actions.githubusercontent.com cannot be matched by pf, so
+  re-run 'install' periodically to refresh. pf is NOT re-enabled automatically
+  after a reboot — re-run 'install' (or manage com.apple.pfctl via MDM) to
+  restore enforcement. See docs/network-isolation.md for the full discussion.
+EOF
+}
+
+# ----------------------------------------------------------------------------
+# Cleanup / signal traps
+# ----------------------------------------------------------------------------
+cleanup() {
+  local code=$?
+  if [[ -n "${WORK_TMPDIR}" && -d "${WORK_TMPDIR}" ]]; then
+    rm -rf "${WORK_TMPDIR}" 2>/dev/null || true
+  fi
+  return "${code}"
+}
+trap cleanup EXIT
+trap 'err "Interrupted."; exit 130' INT TERM
+
+# ----------------------------------------------------------------------------
+# Argument parsing
+# ----------------------------------------------------------------------------
+# Validate an IPv4 or IPv6 address with optional /prefix. A loose hex+dot regex
+# is NOT enough ("bad" and "face" are all hex letters), so check the shape for
+# real: dotted-quad with 0-255 octets, or a colon-containing IPv6 hextet string.
+valid_cidr() {
+  local addr="$1" prefix="" o
+  case "${addr}" in
+    */*) prefix="${addr##*/}"; addr="${addr%%/*}" ;;
+  esac
+  if [[ -n "${prefix}" ]]; then
+    [[ "${prefix}" =~ ^[0-9]+$ ]] || return 1
+  fi
+  if [[ "${addr}" == *.* && "${addr}" != *:* ]]; then
+    [[ "${addr}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    local IFS='.'
+    for o in ${addr}; do
+      [[ "$((10#${o}))" -le 255 ]] || return 1
+    done
+    [[ -z "${prefix}" || "${prefix}" -le 32 ]] || return 1
+    return 0
+  elif [[ "${addr}" == *:* ]]; then
+    [[ "${addr}" =~ ^[0-9a-fA-F:]+$ ]] || return 1
+    [[ -z "${prefix}" || "${prefix}" -le 128 ]] || return 1
+    return 0
+  fi
+  return 1
+}
+
+add_allow() {
+  # Accept comma-separated values; de-duplicate (bash 3.2: no assoc arrays).
+  local part
+  local IFS=','
+  for part in $1; do
+    [[ -n "${part}" ]] || continue
+    if ! valid_cidr "${part}"; then
+      err "Invalid CIDR/IP for --allow: '${part}'"
+      exit 2
+    fi
+    case " ${ALLOW_LIST} " in
+      *" ${part} "*) ;;
+      *) ALLOW_LIST="${ALLOW_LIST} ${part}" ;;
+    esac
+  done
+  ALLOW_LIST="${ALLOW_LIST# }"
+}
+
+parse_args() {
+  [[ $# -ge 1 ]] || { usage; exit 2; }
+  case "$1" in
+    install|uninstall|status|allowlist) COMMAND="$1"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) err "Unknown command: $1"; usage; exit 2 ;;
+  esac
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --user)
+        [[ $# -ge 2 ]] || { err "--user requires a value"; usage; exit 2; }
+        TARGET_USER="$2"; shift 2 ;;
+      --user=*)   TARGET_USER="${1#*=}"; shift ;;
+      --allow)
+        [[ $# -ge 2 ]] || { err "--allow requires a value"; usage; exit 2; }
+        add_allow "$2"; shift 2 ;;
+      --allow=*)  add_allow "${1#*=}"; shift ;;
+      --vpn-interface)
+        [[ $# -ge 2 ]] || { err "--vpn-interface requires a value"; usage; exit 2; }
+        VPN_IF="$2"; shift 2 ;;
+      --vpn-interface=*) VPN_IF="${1#*=}"; shift ;;
+      -y|--yes)   ASSUME_YES=1; shift ;;
+      -h|--help)  usage; exit 0 ;;
+      *) err "Unknown argument: $1"; usage; exit 2 ;;
+    esac
+  done
+
+  case "${COMMAND}" in
+    install)
+      if [[ -n "${VPN_IF}" ]]; then
+        if ! [[ "${VPN_IF}" =~ ^[a-z][a-z0-9]*$ ]]; then
+          err "--vpn-interface must be an interface name such as utun5 (got: '${VPN_IF}')"
+          exit 2
+        fi
+        if [[ -n "${ALLOW_LIST}" ]]; then
+          err "--allow cannot be combined with --vpn-interface (kill-switch mode"
+          err "permits nothing outside the tunnel except loopback)."
+          exit 2
+        fi
+      fi
+      ;;
+    allowlist)
+      if [[ -n "${VPN_IF}" || -n "${TARGET_USER}" ]]; then
+        err "--user/--vpn-interface are only valid with 'install'."
+        exit 2
+      fi
+      ;;
+    status)
+      if [[ -n "${VPN_IF}" || -n "${TARGET_USER}" || -n "${ALLOW_LIST}" ]]; then
+        err "--user/--vpn-interface/--allow are not valid with 'status'."
+        exit 2
+      fi
+      ;;
+    uninstall)
+      if [[ -n "${VPN_IF}" || -n "${TARGET_USER}" || -n "${ALLOW_LIST}" ]]; then
+        err "--user/--vpn-interface/--allow are not valid with 'uninstall'."
+        exit 2
+      fi
+      ;;
+  esac
+}
+
+# ----------------------------------------------------------------------------
+# Environment detection (mirrors runner-setup)
+# ----------------------------------------------------------------------------
+detect_platform() {
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    err "This tool only supports macOS."
+    exit 1
+  fi
+}
+
+require_cmds() {
+  local missing=() c
+  for c in curl awk sed grep sort tr uname id sudo pfctl ifconfig scutil; do
+    command -v "${c}" >/dev/null 2>&1 || missing+=("${c}")
+  done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    err "Required command(s) not found: ${missing[*]}"
+    exit 1
+  fi
+}
+
+detect_user() {
+  # $SUDO_USER when re-invoked under sudo, otherwise whoami. Never hardcoded.
+  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+    REAL_USER="${SUDO_USER}"
+  else
+    REAL_USER="$(whoami)"
+  fi
+  if [[ "${REAL_USER}" == "root" && -z "${TARGET_USER}" ]]; then
+    err "Refusing to restrict the root user. Run this as a normal user (or pass"
+    err "--user); it uses sudo only internally for /etc and pfctl."
+    exit 1
+  fi
+  REAL_UID="$(id -u "${REAL_USER}")"
+
+  # The policy target defaults to the invoking user (what runner-setup's
+  # LaunchDaemons run as); --user overrides for a dedicated runner account.
+  [[ -n "${TARGET_USER}" ]] || TARGET_USER="${REAL_USER}"
+  if [[ "${TARGET_USER}" == "root" ]]; then
+    err "Refusing to restrict root's egress — that would break the system."
+    exit 1
+  fi
+  if ! id "${TARGET_USER}" >/dev/null 2>&1; then
+    err "No such user: '${TARGET_USER}'"
+    exit 1
+  fi
+  step "Policy target user: ${TARGET_USER}"
+}
+
+ensure_sudo() {
+  log "Requesting administrator privileges (needed for /etc and pfctl)"
+  if ! sudo -v; then
+    err "Could not obtain sudo privileges."
+    exit 1
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# GitHub published endpoint ranges (no jq dependency)
+# ----------------------------------------------------------------------------
+fetch_github_meta() {
+  log "Fetching GitHub endpoint ranges from ${GITHUB_META_API}"
+  local json
+  # Capture-then-check so set -e isn't masked inside command substitution.
+  if ! json="$(curl -fsSL --retry 3 --retry-delay 2 \
+      -H 'Accept: application/vnd.github+json' "${GITHUB_META_API}")"; then
+    err "Failed to query the GitHub meta API."
+    err "Check connectivity, then re-run install (ranges are fetched fresh each time)."
+    exit 1
+  fi
+
+  # The API sometimes returns a compact single-line object and sometimes a
+  # pretty-printed multi-line one (depends on the Accept negotiation). Collapse
+  # newlines/spaces first — CIDRs, keys and domains contain no spaces, so this
+  # is lossless for what we parse — then extract each wanted key's FIRST array.
+  # NOTE: the first occurrence matters: the "domains" object near the end
+  # repeats keys like "actions"/"packages" with hostname (not CIDR) values, and
+  # a greedy sed would silently grab those instead.
+  json="$(printf '%s' "${json}" | tr -d '\n ')"
+
+  # The trailing `|| true` on each pipeline is REQUIRED: with `set -euo pipefail`
+  # a failing grep (absent key) would abort before the explicit handling below.
+  local key section cidrs
+  for key in ${META_KEYS}; do
+    if ! printf '%s' "${json}" | grep -q "\"${key}\":\["; then
+      step "meta key '${key}' not present — skipped"
+      continue
+    fi
+    # grep -oE yields occurrences in order; head -n1 keeps the first (top-level
+    # CIDR array), then strip the "key":[ ... ] wrapper.
+    section="$(printf '%s' "${json}" \
+      | grep -oE "\"${key}\":\[[^]]*\]" \
+      | head -n1 \
+      | sed -E "s/^\"${key}\":\[//; s/\]$//" || true)"
+    cidrs="$(printf '%s' "${section}" \
+      | tr ',' '\n' \
+      | tr -d '"' \
+      | grep -E '^[0-9a-fA-F:.]+/[0-9]{1,3}$' || true)"
+    if [[ -n "${cidrs}" ]]; then
+      META_CIDRS="${META_CIDRS} ${cidrs}"
+    fi
+  done
+
+  # De-duplicate and normalize to one CIDR per line.
+  META_CIDRS="$(printf '%s\n' ${META_CIDRS} | sort -u || true)"
+  if [[ -z "${META_CIDRS}" ]]; then
+    err "Parsed zero endpoint ranges from the meta API — refusing to install"
+    err "an empty allow policy (that would cut the runners off from GitHub)."
+    exit 1
+  fi
+  step "GitHub endpoint ranges: $(printf '%s\n' ${META_CIDRS} | wc -l | tr -d ' ') CIDRs (${META_KEYS})"
+}
+
+# Resolver IPs the machine is actually configured with (scutil union
+# resolv.conf), so DNS keeps working for the runner user and nothing else gets
+# to answer its lookups.
+detect_dns_servers() {
+  local from_scutil from_resolv
+  from_scutil="$(scutil --dns 2>/dev/null \
+    | awk '/nameserver\[[0-9]+\]/{print $3}' || true)"
+  from_resolv="$(awk '/^nameserver/{print $2}' /etc/resolv.conf 2>/dev/null || true)"
+  DNS_SERVERS="$(printf '%s\n%s\n' "${from_scutil}" "${from_resolv}" \
+    | grep -E '^[0-9a-fA-F:.]+$' | sort -u || true)"
+  if [[ -z "${DNS_SERVERS}" ]]; then
+    warn "No DNS resolvers detected; the runner user will have NO name resolution."
+  else
+    step "DNS resolvers permitted: $(printf '%s ' ${DNS_SERVERS})"
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# pf plumbing
+# ----------------------------------------------------------------------------
+pf_enabled() {
+  sudo pfctl -s info 2>/dev/null | grep -q 'Status: Enabled'
+}
+
+# Parse-check a pf config WITHOUT loading it. Never load anything unverified.
+verify_pf_config() {
+  local path="$1"
+  if ! pfctl -n -f "${path}" >/dev/null 2>&1; then
+    return 1
+  fi
+  return 0
+}
+
+# Render the anchor + its table files into ${WORK_TMPDIR}. Two shapes:
+#   default:  allow loopback, DNS/DHCP/NTP, GitHub ranges + FQDNs, --allow
+#             CIDRs; block+log everything else from the target user.
+#   VPN mode: allow loopback and the tunnel interface ONLY — if the tunnel
+#             drops, every remaining packet hits the logged default deny
+#             (fail closed).
+build_anchor_files() {
+  WORK_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/runner-netisolate.XXXXXX")"
+  local anchor="${WORK_TMPDIR}/anchor"
+
+  {
+    printf '# %s — managed by %s; DO NOT EDIT BY HAND.\n' "${PF_ANCHOR_NAME}" "${PROG_NAME}"
+    printf '# Regenerate with: %s install | allowlist. Table files live alongside.\n' "${PROG_NAME}"
+    printf 'runner_user = "%s"\n' "${TARGET_USER}"
+    printf '\n'
+  } > "${anchor}"
+
+  if [[ -n "${VPN_IF}" ]]; then
+    cat >> "${anchor}" <<EOF
+# VPN kill-switch mode: the runner user may egress ONLY on ${VPN_IF}.
+vpn_if = "${VPN_IF}"
+pass out quick on lo0 all user \$runner_user label "rni-pass-lo"
+pass out quick on \$vpn_if all user \$runner_user label "rni-pass-vpn"
+block out log quick all user \$runner_user label "rni-deny"
+EOF
+    step "Kill-switch anchor: allow lo0 + ${VPN_IF} only for ${TARGET_USER}"
+    return 0
+  fi
+
+  # Table files (one entry per line, '#' comments allowed by pf). File-backed
+  # tables keep the anchor short and are individually auditable with
+  # `pfctl -a <anchor> -t <name> -T show`.
+  printf '# GitHub endpoint ranges from %s (fetched at install time).\n' "${GITHUB_META_API}" > "${WORK_TMPDIR}/gh_meta"
+  printf '%s\n' ${META_CIDRS} >> "${WORK_TMPDIR}/gh_meta"
+
+  printf '# Fixed GitHub hostnames (pf resolves these once, at load time).\n' > "${WORK_TMPDIR}/gh_fqdn"
+  printf '%s\n' ${GITHUB_FQDNS} >> "${WORK_TMPDIR}/gh_fqdn"
+
+  printf '# Operator allowlist (--allow). Update with: %s allowlist --allow ...\n' "${PROG_NAME}" > "${WORK_TMPDIR}/gh_allow"
+  if [[ -n "${ALLOW_LIST}" ]]; then
+    printf '%s\n' ${ALLOW_LIST} >> "${WORK_TMPDIR}/gh_allow"
+  fi
+
+  printf '# Configured DNS resolvers at install time.\n' > "${WORK_TMPDIR}/gh_dns"
+  if [[ -n "${DNS_SERVERS}" ]]; then
+    printf '%s\n' ${DNS_SERVERS} >> "${WORK_TMPDIR}/gh_dns"
+  fi
+
+  cat >> "${anchor}" <<EOF
+table <gh_meta>  file "${PF_TABLE_META}"
+table <gh_fqdn>  file "${PF_TABLE_FQDN}"
+table <gh_allow> file "${PF_TABLE_ALLOW}"
+table <gh_dns>   file "${PF_TABLE_DNS}"
+
+# Loopback stays usable (local tool caches, language runtimes, proxies).
+pass out quick on lo0 all user \$runner_user label "rni-pass-lo"
+
+# Infrastructure: DNS only to the configured resolvers; DHCP; NTP.
+pass out quick proto { tcp udp } from any to <gh_dns> port 53 user \$runner_user label "rni-pass-dns"
+pass out quick proto udp from any to any port 123 user \$runner_user label "rni-pass-ntp"
+pass out quick proto udp from any to any port 67:68 user \$runner_user label "rni-pass-dhcp"
+
+# GitHub: published endpoint ranges + fixed required hostnames.
+pass out quick proto tcp from any to <gh_meta> user \$runner_user label "rni-pass-gh-meta"
+pass out quick proto tcp from any to <gh_fqdn> user \$runner_user label "rni-pass-gh-fqdn"
+
+# Operator-approved internal endpoints.
+pass out quick from any to <gh_allow> user \$runner_user label "rni-pass-allow"
+
+# Default deny for the runner user, logged to pflog0. With 'quick' above,
+# the first matching pass wins; anything reaching here is blocked.
+block out log quick all user \$runner_user label "rni-deny"
+EOF
+  step "Anchor rendered: GitHub + DNS/DHCP/NTP + ${ALLOW_LIST:-<empty allowlist>}; default deny (logged)"
+}
+
+# Install the rendered anchor + table files into /etc/pf.anchors (root:wheel 644).
+# The anchor references its tables by ABSOLUTE path, so the tables must already
+# be in place before the anchor can be parse-checked (pfctl -n resolves `file`
+# tables). Verification still happens BEFORE the anchor file itself is installed,
+# so a bad render can never be referenced by pf.conf.
+install_anchor_files() {
+  sudo mkdir -p "${PF_ANCHOR_DIR}"
+  if [[ -z "${VPN_IF}" ]]; then
+    sudo cp "${WORK_TMPDIR}/gh_meta"  "${PF_TABLE_META}"
+    sudo cp "${WORK_TMPDIR}/gh_fqdn"  "${PF_TABLE_FQDN}"
+    sudo cp "${WORK_TMPDIR}/gh_allow" "${PF_TABLE_ALLOW}"
+    sudo cp "${WORK_TMPDIR}/gh_dns"   "${PF_TABLE_DNS}"
+    sudo chown root:wheel "${PF_TABLE_META}" "${PF_TABLE_FQDN}" "${PF_TABLE_ALLOW}" "${PF_TABLE_DNS}"
+    sudo chmod 644 "${PF_TABLE_META}" "${PF_TABLE_FQDN}" "${PF_TABLE_ALLOW}" "${PF_TABLE_DNS}"
+  else
+    # Kill-switch mode uses no tables; remove any from a previous default-mode
+    # install so nothing stale lingers in the anchor directory.
+    sudo rm -f "${PF_TABLE_META}" "${PF_TABLE_FQDN}" "${PF_TABLE_ALLOW}" "${PF_TABLE_DNS}"
+  fi
+
+  step "Verifying generated anchor (pfctl -n)"
+  if ! verify_pf_config "${WORK_TMPDIR}/anchor"; then
+    err "Generated anchor failed 'pfctl -n -f' — NOT installing it. pf is unchanged."
+    pfctl -n -f "${WORK_TMPDIR}/anchor" 2>&1 | sed 's/^/    /' >&2 || true
+    exit 1
+  fi
+
+  sudo cp "${WORK_TMPDIR}/anchor" "${PF_ANCHOR_FILE}"
+  sudo chown root:wheel "${PF_ANCHOR_FILE}"
+  sudo chmod 644 "${PF_ANCHOR_FILE}"
+  step "Installed ${PF_ANCHOR_FILE}"
+}
+
+# Add our marked reference block to pf.conf (once). The ORIGINAL pf.conf is
+# backed up a single time (first install) so a pristine copy always exists;
+# every rewrite is verified with `pfctl -n -f` before it replaces the real
+# file — a corrupt pf.conf is never written.
+ensure_anchor_reference() {
+  if grep -qF "anchor \"${PF_ANCHOR_NAME}\"" "${PF_CONF}" 2>/dev/null; then
+    step "${PF_CONF} already references the anchor."
+    return 0
+  fi
+
+  if [[ ! -f "${PF_CONF_BAK}" && -f "${PF_CONF}" ]]; then
+    step "Backing up ${PF_CONF} -> ${PF_CONF_BAK} (once)"
+    sudo cp "${PF_CONF}" "${PF_CONF_BAK}"
+  fi
+
+  local tmp_conf="${WORK_TMPDIR}/pf.conf"
+  cat "${PF_CONF}" > "${tmp_conf}" 2>/dev/null || : > "${tmp_conf}"
+  # Guarantee the file ends with a newline before appending our block.
+  [[ -s "${tmp_conf}" && -n "$(tail -c1 "${tmp_conf}")" ]] && printf '\n' >> "${tmp_conf}"
+  cat >> "${tmp_conf}" <<EOF
+${MARK_BEGIN}
+anchor "${PF_ANCHOR_NAME}"
+load anchor "${PF_ANCHOR_NAME}" from "${PF_ANCHOR_FILE}"
+${MARK_END}
+EOF
+
+  if ! verify_pf_config "${tmp_conf}"; then
+    err "Modified ${PF_CONF} failed 'pfctl -n -f' — NOT writing it."
+    err "Your original ${PF_CONF} is untouched."
+    exit 1
+  fi
+  sudo cp "${tmp_conf}" "${PF_CONF}"
+  sudo chown root:wheel "${PF_CONF}"
+  sudo chmod 644 "${PF_CONF}"
+  step "Referenced anchor ${PF_ANCHOR_NAME} from ${PF_CONF}"
+}
+
+# Remove exactly our marked block, verify, and put pf.conf back. If nothing of
+# ours is present, leave the file alone.
+remove_anchor_reference() {
+  if ! grep -qF "${MARK_BEGIN}" "${PF_CONF}" 2>/dev/null; then
+    step "No ${PROG_NAME} block in ${PF_CONF}; nothing to remove."
+    return 0
+  fi
+  local tmp_conf="${WORK_TMPDIR}/pf.conf"
+  sed "/${MARK_BEGIN}/,/${MARK_END}/d" "${PF_CONF}" > "${tmp_conf}"
+  if ! verify_pf_config "${tmp_conf}"; then
+    err "${PF_CONF} without our block failed 'pfctl -n -f' — leaving it in place."
+    err "Inspect ${PF_CONF} manually (backup: ${PF_CONF_BAK})."
+    exit 1
+  fi
+  sudo cp "${tmp_conf}" "${PF_CONF}"
+  sudo chown root:wheel "${PF_CONF}"
+  sudo chmod 644 "${PF_CONF}"
+  step "Removed anchor reference from ${PF_CONF}"
+}
+
+# Load the full pf.conf (which pulls in our anchor) and enable pf if needed.
+# Reload-safe: pfctl -f atomically swaps the ruleset; existing connections
+# and any other anchors' rules are re-derived from the same pf.conf.
+load_and_enable() {
+  log "Loading pf ruleset"
+  if ! sudo pfctl -f "${PF_CONF}"; then
+    err "pfctl -f ${PF_CONF} failed at load time (it passed parse-check!)."
+    err "Investigate with: sudo pfctl -nf ${PF_CONF}"
+    exit 1
+  fi
+  if pf_enabled; then
+    step "pf already enabled."
+  else
+    sudo pfctl -E
+    step "pf enabled (pfctl -E)."
+  fi
+  # Ground truth: our rules must actually be live in the kernel anchor.
+  # (`pfctl -s rules` does not print labels, so match the deny rule's shape
+  # instead of the rni-deny label.)
+  if sudo pfctl -s rules -a "${PF_ANCHOR_NAME}" 2>/dev/null | grep -q 'block out log quick'; then
+    step "Anchor ${PF_ANCHOR_NAME} is live (default-deny rule present)."
+  else
+    err "Anchor rules are not visible after load; something is wrong."
+    err "Check: sudo pfctl -s rules -a ${PF_ANCHOR_NAME}"
+    exit 1
+  fi
+}
+
+# Reload ONLY our anchor (used by `allowlist`) — the main ruleset and any
+# other anchors are not touched.
+reload_anchor_only() {
+  if ! sudo pfctl -a "${PF_ANCHOR_NAME}" -f "${PF_ANCHOR_FILE}"; then
+    err "Failed to reload anchor ${PF_ANCHOR_NAME}."
+    exit 1
+  fi
+  step "Anchor reloaded in place (main ruleset untouched)."
+}
+
+# ----------------------------------------------------------------------------
+# State file — records options so allowlist/uninstall need no re-specification.
+# We generate it (controlled, root-owned content), so sourcing is safe.
+# ----------------------------------------------------------------------------
+write_state() {
+  local tmp="${WORK_TMPDIR}/state"
+  {
+    printf 'STATE_RUNNER_USER="%s"\n' "${TARGET_USER}"
+    printf 'STATE_VPN_IF="%s"\n' "${VPN_IF}"
+    printf 'STATE_ALLOW="%s"\n' "${ALLOW_LIST}"
+    printf 'STATE_PF_WAS_ENABLED=%s\n' "${PF_WAS_ENABLED}"
+  } > "${tmp}"
+  sudo cp "${tmp}" "${PF_STATE_FILE}"
+  sudo chown root:wheel "${PF_STATE_FILE}"
+  sudo chmod 644 "${PF_STATE_FILE}"
+}
+
+read_state() {
+  STATE_RUNNER_USER=""
+  STATE_VPN_IF=""
+  STATE_ALLOW=""
+  STATE_PF_WAS_ENABLED=0
+  if [[ -f "${PF_STATE_FILE}" ]]; then
+    # shellcheck disable=SC1090
+    . "${PF_STATE_FILE}"
+  fi
+}
+
+require_installed() {
+  if [[ ! -f "${PF_ANCHOR_FILE}" ]]; then
+    err "Anchor ${PF_ANCHOR_NAME} is not installed. Run '${PROG_NAME} install' first."
+    exit 1
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# Confirmation (skipped with --yes; refuses to proceed without a TTY)
+# ----------------------------------------------------------------------------
+confirm() {
+  local what="$1"
+  [[ "${ASSUME_YES}" -eq 1 ]] && return 0
+  if [[ ! -t 0 ]]; then
+    err "Refusing to ${what} without confirmation (no TTY). Re-run with --yes."
+    exit 1
+  fi
+  local reply
+  printf '\033[1;33m?\033[0m %s [y/N] ' "$2" >&2
+  read -r reply
+  case "${reply}" in
+    y|Y|yes|YES) return 0 ;;
+    *) log "Aborted; nothing changed."; exit 0 ;;
+  esac
+}
+
+# ----------------------------------------------------------------------------
+# Commands
+# ----------------------------------------------------------------------------
+cmd_install() {
+  if [[ -n "${VPN_IF}" ]]; then
+    if ! ifconfig "${VPN_IF}" >/dev/null 2>&1; then
+      warn "Interface ${VPN_IF} does not exist right now."
+      warn "The kill-switch still installs; it takes effect once the tunnel is up"
+      warn "(and fails CLOSED whenever it is down — that is the point)."
+    fi
+  else
+    fetch_github_meta
+    detect_dns_servers
+  fi
+
+  build_anchor_files
+
+  local mode_desc="GitHub endpoints + DNS/DHCP/NTP${ALLOW_LIST:+ + allowlist: ${ALLOW_LIST}}"
+  [[ -n "${VPN_IF}" ]] && mode_desc="VPN kill-switch on ${VPN_IF} (fail closed)"
+  confirm "modify the firewall" \
+    "Restrict ALL outbound traffic of user '${TARGET_USER}' (${mode_desc}). Proceed?"
+
+  ensure_sudo
+  # Capture pf's prior enabled state so uninstall can restore it exactly.
+  if pf_enabled; then PF_WAS_ENABLED=1; else PF_WAS_ENABLED=0; fi
+
+  install_anchor_files
+  ensure_anchor_reference
+  write_state
+  load_and_enable
+
+  log "Network isolation ACTIVE for user '${TARGET_USER}'."
+  log "Audit:    sudo pfctl -s rules -a ${PF_ANCHOR_NAME}"
+  log "Blocked:  sudo tcpdump -ni pflog0"
+  warn "pf does NOT auto-enable after reboot — re-run '${PROG_NAME} install' then"
+  warn "(or manage com.apple.pfctl via MDM). See docs/network-isolation.md."
+}
+
+cmd_uninstall() {
+  # Tolerate partial state: proceed if ANY of our artifacts exist (anchor file,
+  # state file, or the marked pf.conf block), so a half-removed install can
+  # still be fully unwound.
+  if [[ ! -f "${PF_ANCHOR_FILE}" && ! -f "${PF_STATE_FILE}" ]] \
+      && ! grep -qF "${MARK_BEGIN}" "${PF_CONF}" 2>/dev/null; then
+    log "Nothing installed (no anchor, state, or ${PF_CONF} block); nothing to do."
+    exit 0
+  fi
+  read_state
+  confirm "modify the firewall" \
+    "Remove network isolation (anchor ${PF_ANCHOR_NAME}) and restore prior pf state. Proceed?"
+  ensure_sudo
+
+  WORK_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/runner-netisolate.XXXXXX")"
+  remove_anchor_reference
+  sudo rm -f "${PF_ANCHOR_FILE}" "${PF_STATE_FILE}" \
+    "${PF_TABLE_META}" "${PF_TABLE_FQDN}" "${PF_TABLE_ALLOW}" "${PF_TABLE_DNS}"
+
+  # Reload the (now reference-free) pf.conf so the ruleset matches the file.
+  if ! sudo pfctl -f "${PF_CONF}"; then
+    err "Reload of ${PF_CONF} failed after removing our reference."
+    err "pf is still enforcing the OLD rules; inspect ${PF_CONF} manually."
+    exit 1
+  fi
+
+  # Restore pf's prior enabled/disabled state captured at install time.
+  if [[ "${STATE_PF_WAS_ENABLED}" -eq 0 ]] && pf_enabled; then
+    sudo pfctl -d
+    step "pf disabled again (it was off before install)."
+  fi
+
+  log "Network isolation removed; prior pf state restored."
+  log "The one-time backup was kept: ${PF_CONF_BAK}"
+}
+
+cmd_status() {
+  local ok=1
+  printf '==> %s status\n' "${PF_ANCHOR_NAME}"
+  if [[ -f "${PF_ANCHOR_FILE}" ]]; then
+    printf '  anchor file:      %s (installed)\n' "${PF_ANCHOR_FILE}"
+    ok=0
+  else
+    printf '  anchor file:      NOT installed\n'
+  fi
+  if grep -qF "anchor \"${PF_ANCHOR_NAME}\"" "${PF_CONF}" 2>/dev/null; then
+    printf '  pf.conf reference: present\n'
+  else
+    printf '  pf.conf reference: absent\n'
+  fi
+  if [[ -f "${PF_STATE_FILE}" ]]; then
+    read_state
+    printf '  target user:      %s\n' "${STATE_RUNNER_USER}"
+    if [[ -n "${STATE_VPN_IF}" ]]; then
+      printf '  mode:             VPN kill-switch (%s, fail closed)\n' "${STATE_VPN_IF}"
+    else
+      printf '  mode:             endpoint allowlist\n'
+      printf '  --allow CIDRs:    %s\n' "${STATE_ALLOW:-<none>}"
+    fi
+  fi
+
+  # Kernel-side state needs root; degrade gracefully without it.
+  if sudo -n true 2>/dev/null; then
+    if pf_enabled; then printf '  pf:               Enabled\n'; else printf '  pf:               Disabled\n'; fi
+    local rules
+    rules="$(sudo pfctl -s rules -a "${PF_ANCHOR_NAME}" 2>/dev/null || true)"
+    if [[ -n "${rules}" ]]; then
+      printf '  live rules:\n'
+      printf '%s\n' "${rules}" | sed 's/^/    /'
+      local t
+      for t in gh_meta gh_fqdn gh_allow gh_dns; do
+        local n
+        n="$(sudo pfctl -a "${PF_ANCHOR_NAME}" -t "${t}" -T show 2>/dev/null | grep -c . || true)"
+        printf '  table %-9s %s entries\n' "${t}:" "${n}"
+      done
+    else
+      printf '  live rules:       none loaded in kernel\n'
+    fi
+  else
+    printf '  (kernel rules/tables need sudo; re-run with sudo access for the full view)\n'
+  fi
+  return "${ok}"
+}
+
+cmd_allowlist() {
+  require_installed
+  read_state
+  if [[ -n "${STATE_VPN_IF}" ]]; then
+    err "This install is in VPN kill-switch mode (${STATE_VPN_IF}); there is no"
+    err "allowlist to manage. Re-run 'install' without --vpn-interface to switch."
+    exit 1
+  fi
+
+  if [[ -z "${ALLOW_LIST}" ]]; then
+    # Read-only view.
+    printf '==> Allowlist (gh_allow) for user %s\n' "${STATE_RUNNER_USER}"
+    if [[ -n "${STATE_ALLOW}" ]]; then
+      printf '%s\n' ${STATE_ALLOW} | sed 's/^/  /'
+    else
+      printf '  <empty>\n'
+    fi
+    return 0
+  fi
+
+  ensure_sudo
+  TARGET_USER="${STATE_RUNNER_USER}"
+  # Preserve the prior pf-enabled flag captured at install time; write_state
+  # would otherwise overwrite it with this command's default.
+  PF_WAS_ENABLED="${STATE_PF_WAS_ENABLED}"
+
+  # Replace the table file with the new list, then reload ONLY the anchor.
+  local tmp_table
+  tmp_table="$(mktemp "${TMPDIR:-/tmp}/runner-netisolate-allow.XXXXXX")"
+  printf '# Operator allowlist (--allow). Update with: %s allowlist --allow ...\n' "${PROG_NAME}" > "${tmp_table}"
+  printf '%s\n' ${ALLOW_LIST} >> "${tmp_table}"
+
+  # Sanity-gate: the installed anchor must still parse before we touch its
+  # tables (the new CIDRs themselves were already validated by add_allow).
+  if ! verify_pf_config "${PF_ANCHOR_FILE}"; then
+    err "Installed anchor no longer parse-checks; refusing to modify it."
+    err "Re-run '${PROG_NAME} install' to regenerate from scratch."
+    rm -f "${tmp_table}"
+    exit 1
+  fi
+
+  sudo cp "${tmp_table}" "${PF_TABLE_ALLOW}"
+  sudo chown root:wheel "${PF_TABLE_ALLOW}"
+  sudo chmod 644 "${PF_TABLE_ALLOW}"
+  rm -f "${tmp_table}"
+
+  # Persist the new list, then reload just the anchor (reload-safe).
+  WORK_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/runner-netisolate.XXXXXX")"
+  write_state
+  reload_anchor_only
+
+  log "Allowlist updated for user '${TARGET_USER}':"
+  printf '%s\n' ${ALLOW_LIST} | sed 's/^/  /' >&2
+}
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+main() {
+  parse_args "$@"
+  detect_platform
+  require_cmds
+  detect_user
+  case "${COMMAND}" in
+    install)   cmd_install ;;
+    uninstall) cmd_uninstall ;;
+    status)    cmd_status ;;
+    allowlist) cmd_allowlist ;;
+  esac
+}
+
+main "$@"
