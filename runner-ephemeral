@@ -1,0 +1,466 @@
+#!/usr/bin/env bash
+#
+# runner-ephemeral — supervise ONE ephemeral GitHub Actions self-hosted runner
+# on macOS: register -> run exactly one job -> wipe -> re-register, forever.
+#
+# Usage:
+#   runner-ephemeral --dir /opt/github-runners/runner-1 (--org ORG | --repo OWNER/REPO | --url URL)
+#
+# This is the LaunchDaemon entrypoint used by `runner-setup --ephemeral`
+# (the daemon plist's ProgramArguments point here instead of bin/runsvc.sh).
+# Each loop iteration:
+#   1. reads the previous registration's name/URL from .runner (before wiping),
+#   2. fetches a FRESH registration token from the GitHub API using GITHUB_PAT,
+#   3. wipes _work and all registration residue (.runner/.credentials/...),
+#   4. re-registers with `config.sh --unattended --ephemeral` (same name/labels/
+#      url), so GitHub auto-removes the runner after it finishes ONE job,
+#   5. runs bin/runsvc.sh in the foreground; when it exits (job done), loops.
+#
+# Re-registration failures back off exponentially; after --max-failures
+# consecutive failures the script exits non-zero so launchd's
+# KeepAlive/ThrottleInterval restarts it. It runs as the invoking (non-root)
+# user like every other runner process — no sudo, and we never set
+# RUNNER_ALLOW_RUNASROOT.
+
+set -euo pipefail
+
+# ----------------------------------------------------------------------------
+# Constants / globals
+# ----------------------------------------------------------------------------
+PROG_NAME="$(basename "$0")"
+GITHUB_API="https://api.github.com"
+
+DIR=""
+ORG=""
+REPO=""
+URL=""
+API_URL=""
+LABELS="macos,macmini,self-hosted"
+NAME_ARG=""             # --name fallback; .runner's agentName wins each cycle
+PAT_FILE=""             # fallback PAT location; defaults to ${DIR}/.github_pat
+MAX_FAILURES=5
+
+GITHUB_PAT_VALUE=""
+RUNNER_URL=""
+API_ENDPOINT=""
+CHILD_PID=""
+
+# ----------------------------------------------------------------------------
+# Output helpers — progress goes to stderr (the daemon plist redirects it to
+# _diag/runner-stderr.log); tokens are NEVER interpolated.
+# ----------------------------------------------------------------------------
+log()  { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
+step() { printf '\033[1;32m  ->\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[1;33mWARN:\033[0m %s\n' "$*" >&2; }
+err()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; }
+
+usage() {
+  cat >&2 <<EOF
+${PROG_NAME} — supervise one ephemeral GitHub Actions self-hosted runner
+
+USAGE:
+  ${PROG_NAME} --dir RUNNER_DIR (--org ORG | --repo OWNER/REPO | --url URL) [options]
+
+REQUIRED:
+  --dir RUNNER_DIR    Existing runner directory provisioned by runner-setup
+                      (e.g. /opt/github-runners/runner-1). Must contain the
+                      extracted runner (config.sh, bin/runsvc.sh).
+
+SCOPE (choose exactly ONE — where the runner registers):
+  --org ORG_NAME      Organization runner (needs a PAT with admin:org scope).
+  --repo OWNER/REPO   Repository runner (needs a PAT with repo scope).
+  --url URL           Full runner URL; 1 path segment is treated as an org,
+                      2 as a repo. Works for GitHub Enterprise (API base is
+                      derived as https://HOST/api/v3 unless --api-url is set).
+
+OPTIONS:
+  --labels CSV        Runner labels applied on every re-registration
+                      (default: ${LABELS})
+  --name NAME         Fallback GitHub runner name. Normally unnecessary: the
+                      previous registration's name is read from .runner and
+                      reused so the runner keeps its identity across jobs.
+  --pat-file FILE     File containing the GitHub PAT (default:
+                      RUNNER_DIR/.github_pat). Only used when the GITHUB_PAT
+                      environment variable is unset.
+  --api-url URL       GitHub API base (default: ${GITHUB_API})
+  --max-failures N    Consecutive re-registration failures before giving up
+                      and exiting non-zero for launchd to restart (default: ${MAX_FAILURES})
+  -h, --help          Show this help and exit
+
+EXAMPLES:
+  GITHUB_PAT=ghp_... ${PROG_NAME} --dir /opt/github-runners/runner-1 --org acme
+  ${PROG_NAME} --dir /opt/github-runners/runner-2 --repo acme/monorepo \
+    --labels macos,macmini,self-hosted,ephemeral
+
+SECURITY NOTE:
+  The PAT needs admin:org (org runners) or repo (repo runners) scope. Prefer
+  the GITHUB_PAT environment variable or a mode-600 --pat-file owned by the
+  runner user; the PAT is used only in an Authorization header and is never
+  logged. The short-lived REGISTRATION token is passed to config.sh as an
+  argument (config.sh has no env alternative), so it is briefly visible in
+  'ps' to other local users — registration tokens expire in ~1 hour and are
+  single-purpose.
+
+  This script never uses sudo and refuses to run as root; runner processes
+  run as the invoking (non-root) user, because the GitHub Actions runner
+  refuses to run as root.
+EOF
+}
+
+# ----------------------------------------------------------------------------
+# Argument parsing
+# ----------------------------------------------------------------------------
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dir)
+        [[ $# -ge 2 ]] || { err "--dir requires a value"; usage; exit 2; }
+        DIR="$2"; shift 2 ;;
+      --dir=*)     DIR="${1#*=}"; shift ;;
+      --org)
+        [[ $# -ge 2 ]] || { err "--org requires a value"; usage; exit 2; }
+        ORG="$2"; shift 2 ;;
+      --org=*)     ORG="${1#*=}"; shift ;;
+      --repo)
+        [[ $# -ge 2 ]] || { err "--repo requires a value"; usage; exit 2; }
+        REPO="$2"; shift 2 ;;
+      --repo=*)    REPO="${1#*=}"; shift ;;
+      --url)
+        [[ $# -ge 2 ]] || { err "--url requires a value"; usage; exit 2; }
+        URL="$2"; shift 2 ;;
+      --url=*)     URL="${1#*=}"; shift ;;
+      --labels)
+        [[ $# -ge 2 ]] || { err "--labels requires a value"; usage; exit 2; }
+        LABELS="$2"; shift 2 ;;
+      --labels=*)  LABELS="${1#*=}"; shift ;;
+      --name)
+        [[ $# -ge 2 ]] || { err "--name requires a value"; usage; exit 2; }
+        NAME_ARG="$2"; shift 2 ;;
+      --name=*)    NAME_ARG="${1#*=}"; shift ;;
+      --pat-file)
+        [[ $# -ge 2 ]] || { err "--pat-file requires a value"; usage; exit 2; }
+        PAT_FILE="$2"; shift 2 ;;
+      --pat-file=*) PAT_FILE="${1#*=}"; shift ;;
+      --api-url)
+        [[ $# -ge 2 ]] || { err "--api-url requires a value"; usage; exit 2; }
+        API_URL="$2"; shift 2 ;;
+      --api-url=*) API_URL="${1#*=}"; shift ;;
+      --max-failures)
+        [[ $# -ge 2 ]] || { err "--max-failures requires a value"; usage; exit 2; }
+        MAX_FAILURES="$2"; shift 2 ;;
+      --max-failures=*) MAX_FAILURES="${1#*=}"; shift ;;
+      -h|--help)   usage; exit 0 ;;
+      *)
+        err "Unknown argument: $1"
+        usage
+        exit 2 ;;
+    esac
+  done
+
+  if [[ -z "${DIR}" ]]; then
+    err "Missing required argument: --dir"
+    usage
+    exit 2
+  fi
+  # Normalize away any trailing slashes.
+  while [[ "${DIR}" == */ ]]; do DIR="${DIR%/}"; done
+
+  local scope_count=0
+  [[ -z "${ORG}" ]]  || scope_count=$((scope_count + 1))
+  [[ -z "${REPO}" ]] || scope_count=$((scope_count + 1))
+  [[ -z "${URL}" ]]  || scope_count=$((scope_count + 1))
+  if [[ "${scope_count}" -ne 1 ]]; then
+    err "Choose exactly one of --org, --repo, or --url (got ${scope_count})."
+    usage
+    exit 2
+  fi
+
+  if ! [[ "${MAX_FAILURES}" =~ ^[0-9]+$ ]] || [[ "${MAX_FAILURES}" -lt 1 ]]; then
+    err "--max-failures must be a positive integer (got: '${MAX_FAILURES}')"
+    exit 2
+  fi
+
+  [[ -n "${PAT_FILE}" ]] || PAT_FILE="${DIR}/.github_pat"
+  [[ -n "${API_URL}" ]] || API_URL="${GITHUB_API}"
+  while [[ "${API_URL}" == */ ]]; do API_URL="${API_URL%/}"; done
+}
+
+# ----------------------------------------------------------------------------
+# Environment detection (mirrors runner-setup; this script NEVER uses sudo)
+# ----------------------------------------------------------------------------
+detect_platform() {
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    err "This tool only supports macOS."
+    exit 1
+  fi
+}
+
+detect_user() {
+  if [[ "$(whoami)" == "root" ]]; then
+    err "Refusing to run as root. The GitHub Actions runner will not run as"
+    err "root. The LaunchDaemon must set UserName to the runner user."
+    exit 1
+  fi
+}
+
+require_cmds() {
+  local missing=()
+  local c
+  for c in curl sed grep uname id whoami sleep rm mkdir basename; do
+    command -v "${c}" >/dev/null 2>&1 || missing+=("${c}")
+  done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    err "Required command(s) not found: ${missing[*]}"
+    exit 1
+  fi
+}
+
+check_runner_dir() {
+  if [[ ! -d "${DIR}" ]]; then
+    err "Runner directory not found: ${DIR} (provision it with runner-setup first)."
+    exit 1
+  fi
+  if [[ ! -x "${DIR}/config.sh" ]]; then
+    err "config.sh not found/executable in ${DIR} (corrupt runner layout)."
+    exit 1
+  fi
+  if [[ ! -f "${DIR}/bin/runsvc.sh" ]]; then
+    err "bin/runsvc.sh not found in ${DIR} (corrupt runner layout)."
+    exit 1
+  fi
+  chmod u+x "${DIR}/bin/runsvc.sh" 2>/dev/null || true
+}
+
+# ----------------------------------------------------------------------------
+# PAT resolution: GITHUB_PAT env wins, else the (mode-600) PAT file.
+# ----------------------------------------------------------------------------
+resolve_pat() {
+  if [[ -n "${GITHUB_PAT:-}" ]]; then
+    GITHUB_PAT_VALUE="${GITHUB_PAT}"
+  elif [[ -f "${PAT_FILE}" ]]; then
+    GITHUB_PAT_VALUE="$(head -n1 "${PAT_FILE}" | tr -d '[:space:]')"
+  fi
+  if [[ -z "${GITHUB_PAT_VALUE}" ]]; then
+    err "No GitHub PAT available. Set the GITHUB_PAT environment variable or"
+    err "write a PAT (admin:org for org runners, repo for repo runners) to:"
+    err "  ${PAT_FILE}   (chmod 600, owned by the runner user)"
+    exit 1
+  fi
+  step "GitHub PAT loaded ($([[ -n "${GITHUB_PAT:-}" ]] && echo env || echo "${PAT_FILE}"))"
+}
+
+# ----------------------------------------------------------------------------
+# Resolve the registration URL and the registration-token API endpoint from
+# the chosen scope (no jq dependency anywhere in this script).
+# ----------------------------------------------------------------------------
+resolve_scope() {
+  if [[ -n "${ORG}" ]]; then
+    RUNNER_URL="https://github.com/${ORG}"
+    API_ENDPOINT="${API_URL}/orgs/${ORG}/actions/runners/registration-token"
+  elif [[ -n "${REPO}" ]]; then
+    if ! [[ "${REPO}" =~ ^[^/]+/[^/]+$ ]]; then
+      err "--repo must be in OWNER/REPO form (got: '${REPO}')"
+      exit 2
+    fi
+    RUNNER_URL="https://github.com/${REPO}"
+    API_ENDPOINT="${API_URL}/repos/${REPO}/actions/runners/registration-token"
+  else
+    RUNNER_URL="${URL}"
+    while [[ "${RUNNER_URL}" == */ ]]; do RUNNER_URL="${RUNNER_URL%/}"; done
+    local host path
+    host="${RUNNER_URL#*://}"; host="${host%%/*}"        # strip scheme:// and /path
+    path="${RUNNER_URL#*://}"; path="${path#*/}"          # strip scheme://host/
+    # GitHub Enterprise: API lives at https://HOST/api/v3 unless --api-url
+    # was given explicitly.
+    if [[ -z "${API_URL:-}" || "${API_URL}" == "${GITHUB_API}" ]]; then
+      if [[ "${host}" != "github.com" && "${host}" != "www.github.com" ]]; then
+        API_URL="https://${host}/api/v3"
+      fi
+    fi
+    case "${path}" in
+      */*/*|"")
+        err "Cannot derive org/repo scope from --url '${URL}'."
+        err "Use --org or --repo (or --api-url) for this target."
+        exit 2 ;;
+      */*)
+        API_ENDPOINT="${API_URL}/repos/${path}/actions/runners/registration-token" ;;
+      *)
+        API_ENDPOINT="${API_URL}/orgs/${path}/actions/runners/registration-token" ;;
+    esac
+  fi
+  step "Runner URL: ${RUNNER_URL}"
+  step "Token endpoint: ${API_ENDPOINT}"
+}
+
+# ----------------------------------------------------------------------------
+# Signal handling: forward TERM/INT to the running runsvc.sh child and exit
+# cleanly so `launchctl bootout` stops the supervisor without orphans.
+# ----------------------------------------------------------------------------
+shutdown() {
+  log "Shutdown requested; stopping runner."
+  if [[ -n "${CHILD_PID}" ]] && kill -0 "${CHILD_PID}" 2>/dev/null; then
+    kill -TERM "${CHILD_PID}" 2>/dev/null || true
+    wait "${CHILD_PID}" 2>/dev/null || true
+  fi
+  exit 0
+}
+trap shutdown TERM INT
+
+# ----------------------------------------------------------------------------
+# Fetch a FRESH registration token (never logged). Returns non-zero on any
+# HTTP or parse failure so the caller can back off and retry.
+# ----------------------------------------------------------------------------
+fetch_registration_token() {
+  local json token
+  # Capture-then-check so set -e isn't masked inside command substitution.
+  if ! json="$(curl -fsSL --retry 3 --retry-delay 2 \
+      -X POST \
+      -H "Authorization: Bearer ${GITHUB_PAT_VALUE}" \
+      -H 'Accept: application/vnd.github+json' \
+      -H 'X-GitHub-Api-Version: 2022-11-28' \
+      "${API_ENDPOINT}")"; then
+    warn "Registration-token request failed (HTTP error from GitHub API)."
+    return 1
+  fi
+
+  # The trailing `|| true` is REQUIRED (see runner-setup): with pipefail a
+  # no-match grep would abort before the explicit emptiness check.
+  token="$(printf '%s\n' "${json}" \
+    | grep -m1 '"token"' \
+    | sed -E 's/.*"token"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' || true)"
+  if [[ -z "${token}" ]]; then
+    warn "Could not parse a registration token from the API response."
+    warn "Check that the PAT has admin:org (org) or repo (repo) scope."
+    return 1
+  fi
+  FETCHED_TOKEN="${token}"
+  return 0
+}
+
+# ----------------------------------------------------------------------------
+# Read the previous registration's name/URL from .runner BEFORE wiping, like
+# runner-setup's existing_name logic: the runner keeps its GitHub identity
+# (and its LaunchDaemon/label naming) stable across ephemeral re-registrations.
+# ----------------------------------------------------------------------------
+read_saved_identity() {
+  SAVED_NAME=""
+  SAVED_URL=""
+  if [[ -f "${DIR}/.runner" ]]; then
+    SAVED_NAME="$(sed -n 's/.*"agentName"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+      "${DIR}/.runner" 2>/dev/null | head -n1 || true)"
+    SAVED_URL="$(sed -n 's/.*"gitHubUrl"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+      "${DIR}/.runner" 2>/dev/null | head -n1 || true)"
+  fi
+  # Precedence: --name CLI arg > previous registration's agentName > dir name.
+  # Recomputed EVERY cycle (NAME_ARG never mutates) so a runner provisioned
+  # under one name keeps the .runner-recorded identity forever after.
+  RUNNER_NAME="${NAME_ARG:-${SAVED_NAME}}"
+  [[ -n "${RUNNER_NAME}" ]] || RUNNER_NAME="$(basename "${DIR}")"
+  [[ -n "${SAVED_URL}" ]] && RUNNER_URL="${SAVED_URL}"
+}
+
+# ----------------------------------------------------------------------------
+# Wipe job output and registration residue so every cycle starts from a
+# pristine runner directory (binaries and _diag logs are kept).
+# ----------------------------------------------------------------------------
+wipe_state() {
+  rm -rf "${DIR}/_work"
+  rm -f "${DIR}/.runner" "${DIR}/.credentials" \
+        "${DIR}/.credentials_rsaparams" "${DIR}/.env" "${DIR}/.path"
+}
+
+# ----------------------------------------------------------------------------
+# One lifecycle: register (ephemeral) -> run one job in the foreground.
+# ----------------------------------------------------------------------------
+FETCHED_TOKEN=""
+SAVED_NAME=""
+SAVED_URL=""
+RUNNER_NAME=""
+
+run_cycle() {
+  read_saved_identity
+  step "Identity: '${RUNNER_NAME}' @ ${RUNNER_URL} (labels: ${LABELS})"
+
+  if ! fetch_registration_token; then
+    return 1
+  fi
+  step "Fresh registration token obtained (not logged)."
+
+  wipe_state
+  step "Wiped _work and registration residue."
+
+  # config.sh re-creates .runner/.credentials; --ephemeral makes GitHub remove
+  # the runner automatically after it completes ONE job. --replace overwrites
+  # any stale same-name registration left by an interrupted previous cycle.
+  local config_rc=0
+  (
+    cd "${DIR}"
+    ./config.sh \
+      --unattended \
+      --ephemeral \
+      --url "${RUNNER_URL}" \
+      --token "${FETCHED_TOKEN}" \
+      --name "${RUNNER_NAME}" \
+      --labels "${LABELS}" \
+      --replace
+  ) || config_rc=$?
+  FETCHED_TOKEN=""
+  if [[ "${config_rc}" -ne 0 || ! -f "${DIR}/.runner" ]]; then
+    local marker; marker="$( [[ -f "${DIR}/.runner" ]] && echo present || echo missing )"
+    warn "Registration failed (config.sh rc=${config_rc}, .runner ${marker})."
+    return 1
+  fi
+  log "Registered ephemeral runner '${RUNNER_NAME}'. Waiting for one job..."
+
+  # runsvc.sh is the service entrypoint (translates TERM->INT); it resolves
+  # .path/externals/RunnerService.js relative to CWD, so run it from ${DIR}.
+  # Foreground from OUR perspective: background + wait so the TERM trap can
+  # forward signals to the child.
+  local run_rc=0
+  (
+    cd "${DIR}"
+    ACTIONS_RUNNER_SVC=1 exec ./bin/runsvc.sh
+  ) &
+  CHILD_PID=$!
+  wait "${CHILD_PID}" && run_rc=0 || run_rc=$?
+  CHILD_PID=""
+  log "Runner '${RUNNER_NAME}' exited (rc=${run_rc}); job complete or service stopped."
+  return 0
+}
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+main() {
+  parse_args "$@"
+  detect_platform
+  require_cmds
+  detect_user
+  check_runner_dir
+  resolve_pat
+  resolve_scope
+
+  log "Supervising ephemeral runner in ${DIR}"
+  local failures=0 delay cycle=0
+  while :; do
+    cycle=$((cycle + 1))
+    log "Lifecycle cycle ${cycle} starting."
+    if run_cycle; then
+      failures=0
+    else
+      failures=$((failures + 1))
+      if [[ "${failures}" -ge "${MAX_FAILURES}" ]]; then
+        err "Re-registration failed ${failures} times in a row; giving up."
+        err "Exiting non-zero so launchd (KeepAlive/ThrottleInterval) restarts us."
+        exit 1
+      fi
+      # Exponential backoff: 10s, 20s, 40s, ... capped at 300s.
+      delay=$((10 * 2 ** (failures - 1)))
+      [[ "${delay}" -le 300 ]] || delay=300
+      warn "Cycle failed (${failures}/${MAX_FAILURES}); retrying in ${delay}s."
+      sleep "${delay}"
+    fi
+  done
+}
+
+main "$@"

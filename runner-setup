@@ -40,6 +40,8 @@ RUNNERS="${DEFAULT_RUNNERS}"
 LABELS="macos,macmini,self-hosted"
 NAME_PREFIX=""        # GitHub runner-name prefix; defaults to this machine's name
 NAME_PREFIX_SET=0     # 1 once --name-prefix was given (even if empty)
+EPHEMERAL=0           # 1 => LaunchDaemon runs runner-ephemeral, not runsvc.sh
+EPHEMERAL_BIN=""      # resolved absolute path of the runner-ephemeral supervisor
 
 # Derived from the chosen registration scope (--org / --repo / --url).
 RUNNER_URL=""
@@ -107,12 +109,22 @@ OPTIONS:
                         scope. Use --name-prefix '' for a plain runner-N. An
                         already-registered runner keeps its original name on
                         re-run (runner-cleanup it first to actually rename it).
+  --ephemeral           Make each runner ephemeral: instead of pointing the
+                        LaunchDaemon at bin/runsvc.sh directly, point it at the
+                        runner-ephemeral supervisor, which re-registers the
+                        runner with a FRESH token (via the GitHub API) before
+                        every job and lets GitHub tear it down after ONE job.
+                        Requires a GitHub PAT in the GITHUB_PAT env var (or a
+                        mode-600 .github_pat file per runner dir) with
+                        admin:org (org runners) or repo (repo runners) scope.
+                        See docs/ephemeral-runners.md.
   -h, --help            Show this help and exit
 
 EXAMPLES:
   ${PROG_NAME} --org acme --token AYZ... --runners 3
   ${PROG_NAME} --repo acme/monorepo --token AYZ... --runners 2
   RUNNER_TOKEN=AYZ... ${PROG_NAME} --url https://github.com/acme/monorepo
+  GITHUB_PAT=ghp_... ${PROG_NAME} --org acme --token AYZ... --ephemeral
 
 MULTIPLE REPOSITORIES:
   A single runner can serve many repos ONLY when registered at the org level
@@ -183,6 +195,7 @@ parse_args() {
         [[ $# -ge 2 ]] || { err "--name-prefix requires a value"; usage; exit 2; }
         NAME_PREFIX="$2"; NAME_PREFIX_SET=1; shift 2 ;;
       --name-prefix=*) NAME_PREFIX="${1#*=}"; NAME_PREFIX_SET=1; shift ;;
+      --ephemeral) EPHEMERAL=1; shift ;;
       -h|--help)   usage; exit 0 ;;
       *)
         err "Unknown argument: $1"
@@ -571,10 +584,13 @@ configure_runner() {
   # .runner artifact as ground truth that registration actually completed.
   step "Running config.sh (unattended) as ${REAL_USER}"
   local config_rc=0
+  local -a ephemeral_flag=()
+  [[ "${EPHEMERAL}" -eq 1 ]] && ephemeral_flag=(--ephemeral)
   (
     cd "${dir}"
     as_user ./config.sh \
       --unattended \
+      "${ephemeral_flag[@]+"${ephemeral_flag[@]}"}" \
       --url "${RUNNER_URL}" \
       --token "${TOKEN}" \
       --name "${runner_name}" \
@@ -642,6 +658,11 @@ configure_runner() {
   # reference the bin/ copy directly.) runsvc.sh resolves .path / externals /
   # RunnerService.js RELATIVE TO CWD, so the LaunchDaemon's WorkingDirectory
   # below MUST be the runner root (${dir}) for it to work — and it is.
+  #
+  # With --ephemeral the daemon instead launches the runner-ephemeral
+  # supervisor (with the scope args), which re-registers a FRESH ephemeral
+  # runner via the GitHub API before each job and then execs bin/runsvc.sh
+  # itself; the same WorkingDirectory contract applies.
   local program="${dir}/bin/runsvc.sh"
   if [[ ! -f "${program}" ]]; then
     err "bin/runsvc.sh not found in ${dir} (corrupt runner layout)."
@@ -649,6 +670,46 @@ configure_runner() {
     return 1
   fi
   as_user chmod u+x "${program}" 2>/dev/null || true
+
+  local -a program_args=("${program}")
+  if [[ "${EPHEMERAL}" -eq 1 ]]; then
+    program="${EPHEMERAL_BIN}"
+    if [[ -n "${ORG}" ]]; then
+      program_args=("${program}" --dir "${dir}" --org "${ORG}" --labels "${LABELS}")
+    elif [[ -n "${REPO}" ]]; then
+      program_args=("${program}" --dir "${dir}" --repo "${REPO}" --labels "${LABELS}")
+    else
+      program_args=("${program}" --dir "${dir}" --url "${RUNNER_URL}" --labels "${LABELS}")
+    fi
+
+    # The supervisor needs a GitHub PAT to mint fresh registration tokens on
+    # every cycle. The plist must NOT contain it (plists are world-readable),
+    # so store it as a mode-600 file owned by the runner user; GITHUB_PAT from
+    # this environment seeds it. Piped via stdin so the PAT never appears in
+    # 'ps' arguments.
+    local pat_file="${dir}/.github_pat"
+    if [[ -n "${GITHUB_PAT:-}" ]]; then
+      step "Storing GitHub PAT for ephemeral re-registration (${pat_file}, mode 600)"
+      if ! printf '%s' "${GITHUB_PAT}" | as_user sh -c 'umask 077 && cat > "$1"' _ "${pat_file}"; then
+        err "Could not write ${pat_file} for ${name}."
+        record_status "${name}" "FAILED (pat file)"
+        return 1
+      fi
+    elif [[ ! -f "${pat_file}" ]]; then
+      err "--ephemeral requires a GitHub PAT: set the GITHUB_PAT environment"
+      err "variable (admin:org for org runners, repo for repo runners) or write"
+      err "a mode-600 PAT file to ${pat_file} and re-run."
+      record_status "${name}" "FAILED (no GITHUB_PAT)"
+      return 1
+    fi
+  fi
+
+  # Build the ProgramArguments XML (bash 3.2-safe: plain string append).
+  local args_xml="" parg
+  for parg in "${program_args[@]}"; do
+    args_xml="${args_xml}    <string>${parg}</string>
+"
+  done
 
   local tmp_plist="${WORK_TMPDIR}/${label}.plist"
   cat > "${tmp_plist}" <<EOF
@@ -664,8 +725,7 @@ configure_runner() {
   <string>${dir}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${program}</string>
-  </array>
+${args_xml}  </array>
   <key>EnvironmentVariables</key>
   <dict>
     <key>HOME</key>
@@ -777,6 +837,30 @@ main() {
 
   log "Provisioning ${RUNNERS} runner(s) under ${RUNNER_ROOT}"
   PROVISIONING_STARTED=1
+
+  # --ephemeral: the LaunchDaemons launch the runner-ephemeral supervisor, so
+  # it must exist as an absolute path BEFORE any plist is written. Prefer the
+  # copy next to this script (repo checkout / Homebrew bin), then PATH.
+  if [[ "${EPHEMERAL}" -eq 1 ]]; then
+    local self_dir
+    self_dir="$(cd "$(dirname "$0")" && pwd)"
+    if [[ -x "${self_dir}/runner-ephemeral" ]]; then
+      EPHEMERAL_BIN="${self_dir}/runner-ephemeral"
+    elif command -v runner-ephemeral >/dev/null 2>&1; then
+      EPHEMERAL_BIN="$(command -v runner-ephemeral)"
+    else
+      err "--ephemeral requires the runner-ephemeral supervisor, but it was"
+      err "not found next to ${PROG_NAME} or on PATH."
+      exit 1
+    fi
+    if [[ -z "${GITHUB_PAT:-}" ]]; then
+      warn "GITHUB_PAT is not set: each runner without a pre-seeded mode-600"
+      warn ".github_pat file in its directory will fail below — the ephemeral"
+      warn "supervisor cannot mint fresh registration tokens without a PAT."
+    fi
+    step "Ephemeral mode: daemons launch ${EPHEMERAL_BIN}"
+  fi
+
   local overall_rc=0
   local i
   for ((i = 1; i <= RUNNERS; i++)); do
