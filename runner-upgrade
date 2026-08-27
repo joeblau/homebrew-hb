@@ -1,0 +1,875 @@
+#!/usr/bin/env bash
+#
+# runner-upgrade — detect and apply actions/runner version upgrades to the
+# self-hosted runners that runner-setup provisioned on macOS.
+#
+# Usage:
+#   runner-upgrade check [--runners N | --all]
+#   runner-upgrade run   [--runners N | --all] [--yes]
+#   runner-upgrade rollback (--runner N | --all) [--yes]
+#
+# Designed to be driven by a launchd StartInterval/StartCalendarInterval job
+# (see docs/auto-upgrades.md for a sample plist):
+#
+#   check    Resolve the latest actions/runner release (same releases API and
+#            SHA-marker parsing as runner-setup) and compare it against each
+#            installed runner's version (bin/Runner.Listener --version),
+#            reporting which runners need an upgrade. Exits 3 when upgrades
+#            are pending so a wrapper job can decide to invoke `run`.
+#
+#   run      CANARY FIRST: upgrade ONLY runner-1 — quiesce it (bootout the
+#            system daemon), download + SHA-verify the new tarball (same
+#            logic as runner-setup), move the old install aside to
+#            runner-1.prev, swap in the new binaries preserving
+#            .runner/.credentials/_work (so the GitHub registration and
+#            labels survive untouched), re-bootstrap, and verify health by
+#            waiting for the newest _diag log to print 'Listening for Jobs'.
+#            If the canary fails, runner-1.prev is restored automatically.
+#            Only after canary success are the remaining runners rolled.
+#
+#   rollback Restore runner-N.prev over runner-N (the pre-upgrade install)
+#            and re-bootstrap its daemon. Use after a bad `run`.
+#
+# Like runner-setup, everything runner-facing runs as the INVOKING (non-root)
+# user; sudo is used ONLY for /opt and /Library/LaunchDaemons, and we never
+# set RUNNER_ALLOW_RUNASROOT. Every upgrade event is appended to a stable log
+# file: /opt/github-runners/upgrade.log.
+
+set -euo pipefail
+
+# ----------------------------------------------------------------------------
+# Constants / globals
+# ----------------------------------------------------------------------------
+PROG_NAME="$(basename "$0")"
+RUNNER_ROOT="/opt/github-runners"
+LAUNCH_DAEMON_DIR="/Library/LaunchDaemons"
+LATEST_API="https://api.github.com/repos/actions/runner/releases/latest"
+LOG_FILE="${RUNNER_ROOT}/upgrade.log"
+HEALTH_TIMEOUT=120        # seconds to wait for 'Listening for Jobs'
+
+COMMAND=""
+RUNNERS=""                # --runners N (runners 1..N)
+SELECT_ALL=0              # --all
+TARGET_RUNNER=""          # --runner N (rollback)
+ASSUME_YES=0
+
+REAL_USER=""
+REAL_GROUP=""
+REAL_UID=""
+REAL_HOME=""
+ARCH_TAG=""
+RUNNER_VERSION=""
+TARBALL_NAME=""
+DOWNLOAD_URL=""
+EXPECTED_SHA=""
+WORK_TMPDIR=""
+TARBALL_PATH=""
+
+# Runner names (e.g. "runner-1") selected for the operation, and a parallel
+# status table for the final summary.
+declare -a RUNNER_NAMES=()
+declare -a STATUS_NAME=()
+declare -a STATUS_RESULT=()
+
+# ----------------------------------------------------------------------------
+# Output helpers — progress goes to stderr.
+# ----------------------------------------------------------------------------
+log()  { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
+step() { printf '\033[1;32m  ->\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[1;33mWARN:\033[0m %s\n' "$*" >&2; }
+err()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; }
+
+usage() {
+  cat >&2 <<EOF
+${PROG_NAME} — upgrade actions/runner versions on macOS self-hosted runners
+
+USAGE:
+  ${PROG_NAME} check [--runners N | --all]
+  ${PROG_NAME} run   [--runners N | --all] [--yes]
+  ${PROG_NAME} rollback (--runner N | --all) [--yes]
+
+COMMANDS:
+  check      Resolve the latest actions/runner release and report which
+             installed runners are behind. Exit codes:
+               0  all selected runners are current
+               3  one or more runners need an upgrade
+               1  an error occurred
+  run        Canary-first upgrade: runner-1 is upgraded and health-checked
+             FIRST; only on success are the remaining runners rolled. Each
+             runner's previous install is kept as runner-N.prev for rollback.
+  rollback   Restore runner-N.prev over runner-N and re-bootstrap its daemon.
+
+OPTIONS:
+  --runners N   Operate on runners 1..N (check/run).
+  --all         Operate on every runner under ${RUNNER_ROOT} (default).
+  --runner N    Operate only on runner-N (rollback).
+  -y, --yes     Do not prompt for confirmation (required for launchd jobs).
+  -h, --help    Show this help and exit.
+
+EXAMPLES:
+  ${PROG_NAME} check --all
+  ${PROG_NAME} run --all --yes
+  ${PROG_NAME} rollback --runner 2
+
+  launchd runs the job unattended; a typical StartInterval job executes:
+    ${PROG_NAME} run --all --yes
+  See docs/auto-upgrades.md for a ready-to-use plist.
+
+SECURITY NOTE:
+  This script uses sudo for /opt and ${LAUNCH_DAEMON_DIR}; the runner
+  processes themselves run as the invoking (non-root) user, because the
+  GitHub Actions runner refuses to run as root. Upgrade events are appended
+  to ${LOG_FILE}. Run from launchd as a NON-ROOT daemon (UserName key)
+  together with a narrowly-scoped passwordless sudoers entry — see
+  docs/auto-upgrades.md.
+EOF
+}
+
+# ----------------------------------------------------------------------------
+# Cleanup / signal traps
+# ----------------------------------------------------------------------------
+cleanup() {
+  local code=$?
+  if [[ -n "${WORK_TMPDIR}" && -d "${WORK_TMPDIR}" ]]; then
+    rm -rf "${WORK_TMPDIR}" 2>/dev/null || true
+  fi
+  return "${code}"
+}
+trap cleanup EXIT
+trap 'err "Interrupted."; exit 130' INT TERM
+
+# ----------------------------------------------------------------------------
+# Stable event log — one line per upgrade event, best-effort (never fatal).
+# ----------------------------------------------------------------------------
+log_event() {
+  printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "${LOG_FILE}" 2>/dev/null \
+    || warn "Could not append to ${LOG_FILE}"
+}
+
+# ----------------------------------------------------------------------------
+# Argument parsing
+# ----------------------------------------------------------------------------
+parse_args() {
+  if [[ $# -lt 1 ]]; then
+    err "Missing command: check, run, or rollback."
+    usage
+    exit 2
+  fi
+  case "$1" in
+    check|run|rollback) COMMAND="$1"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) err "Unknown command: $1"; usage; exit 2 ;;
+  esac
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --all)        SELECT_ALL=1; shift ;;
+      --runners)
+        [[ $# -ge 2 ]] || { err "--runners requires a value"; usage; exit 2; }
+        RUNNERS="$2"; shift 2 ;;
+      --runners=*)  RUNNERS="${1#*=}"; shift ;;
+      --runner)
+        [[ $# -ge 2 ]] || { err "--runner requires a value"; usage; exit 2; }
+        TARGET_RUNNER="$2"; shift 2 ;;
+      --runner=*)   TARGET_RUNNER="${1#*=}"; shift ;;
+      -y|--yes)     ASSUME_YES=1; shift ;;
+      -h|--help)    usage; exit 0 ;;
+      *) err "Unknown argument: $1"; usage; exit 2 ;;
+    esac
+  done
+
+  if [[ -n "${RUNNERS}" ]] && { ! [[ "${RUNNERS}" =~ ^[0-9]+$ ]] || [[ "${RUNNERS}" -lt 1 ]]; }; then
+    err "--runners must be a positive integer (got: '${RUNNERS}')"
+    exit 2
+  fi
+  if [[ -n "${TARGET_RUNNER}" ]] && ! [[ "${TARGET_RUNNER}" =~ ^[0-9]+$ ]]; then
+    err "--runner must be a positive integer (got: '${TARGET_RUNNER}')"
+    exit 2
+  fi
+
+  case "${COMMAND}" in
+    check|run)
+      if [[ -n "${TARGET_RUNNER}" ]]; then
+        err "--runner is only valid with rollback; use --runners N or --all."
+        exit 2
+      fi
+      # Default selection is --all.
+      [[ -n "${RUNNERS}" ]] || SELECT_ALL=1
+      ;;
+    rollback)
+      if [[ -n "${RUNNERS}" ]]; then
+        err "--runners is only valid with check/run; use --runner N or --all."
+        exit 2
+      fi
+      if [[ -z "${TARGET_RUNNER}" && "${SELECT_ALL}" -eq 0 ]]; then
+        err "rollback requires --runner N or --all."
+        exit 2
+      fi
+      ;;
+  esac
+}
+
+# ----------------------------------------------------------------------------
+# Environment detection (mirrors runner-setup)
+# ----------------------------------------------------------------------------
+detect_platform() {
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    err "This tool only supports macOS."
+    exit 1
+  fi
+}
+
+detect_user() {
+  # Run everything runner-facing as the real invoking user, never root.
+  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+    REAL_USER="${SUDO_USER}"
+  else
+    REAL_USER="$(whoami)"
+  fi
+  if [[ "${REAL_USER}" == "root" ]]; then
+    err "Refusing to manage runners as root. The GitHub Actions runner will"
+    err "not run as root. Run this script as a normal user; it uses sudo only"
+    err "internally for /opt and ${LAUNCH_DAEMON_DIR}."
+    exit 1
+  fi
+  REAL_GROUP="$(id -gn "${REAL_USER}")"
+  REAL_UID="$(id -u "${REAL_USER}")"
+  # `|| true`: dscl exits non-zero for a non-local (e.g. MDM/AD) user record,
+  # and with `pipefail` that would abort the whole script before the fallback.
+  REAL_HOME="$(dscl . -read "/Users/${REAL_USER}" NFSHomeDirectory 2>/dev/null \
+    | awk '{print $2}' || true)"
+  [[ -n "${REAL_HOME}" ]] || REAL_HOME="/Users/${REAL_USER}"
+  step "Runner owner: ${REAL_USER}:${REAL_GROUP} (uid ${REAL_UID}, home ${REAL_HOME})"
+}
+
+detect_arch() {
+  local m
+  m="$(uname -m)"
+  case "${m}" in
+    arm64)  ARCH_TAG="arm64" ;;
+    x86_64) ARCH_TAG="x64" ;;
+    *) err "Unsupported architecture: ${m}"; exit 1 ;;
+  esac
+  step "Architecture: ${m} -> osx-${ARCH_TAG}"
+}
+
+require_cmds() {
+  local missing=()
+  local c
+  for c in curl tar uname id sudo launchctl dscl shasum tr grep sed awk ls date sleep; do
+    command -v "${c}" >/dev/null 2>&1 || missing+=("${c}")
+  done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    err "Required command(s) not found: ${missing[*]}"
+    exit 1
+  fi
+}
+
+# Prime sudo once, up front, so password prompts don't interleave with progress.
+ensure_sudo() {
+  log "Requesting administrator privileges (needed for /opt and LaunchDaemons)"
+  if ! sudo -v; then
+    err "Could not obtain sudo privileges."
+    exit 1
+  fi
+}
+
+# Run a command as the real (non-root) user, forcing HOME/USER/LOGNAME (see
+# runner-setup for why a bare `sudo -u` is not enough). We never set
+# RUNNER_ALLOW_RUNASROOT, so the runner's own root-refusal stays as a safety net.
+as_user() {
+  if [[ "$(id -un)" == "${REAL_USER}" ]]; then
+    HOME="${REAL_HOME}" USER="${REAL_USER}" LOGNAME="${REAL_USER}" "$@"
+  else
+    sudo -H -u "${REAL_USER}" env \
+      HOME="${REAL_HOME}" \
+      USER="${REAL_USER}" \
+      LOGNAME="${REAL_USER}" \
+      "$@"
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# Resolve latest runner release (no jq dependency) — identical approach to
+# runner-setup: same releases API, same SHA-marker parsing from the body.
+# ----------------------------------------------------------------------------
+resolve_latest_release() {
+  log "Resolving latest actions/runner release"
+  local json tag
+  # Capture-then-check so set -e isn't masked inside command substitution.
+  if ! json="$(curl -fsSL --retry 3 --retry-delay 2 \
+      -H 'Accept: application/vnd.github+json' "${LATEST_API}")"; then
+    err "Failed to query GitHub releases API: ${LATEST_API}"
+    exit 1
+  fi
+
+  # The trailing `|| true` is REQUIRED: with `set -euo pipefail` a plain
+  # assignment whose pipeline fails (e.g. grep finds no match in a rate-limit or
+  # malformed-but-HTTP-200 body) would abort the script BEFORE the explicit
+  # emptiness check below, hiding the useful error message. curl -f only catches
+  # non-2xx, not a 200 with an unexpected body.
+  tag="$(printf '%s\n' "${json}" \
+    | grep -m1 '"tag_name"' \
+    | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' || true)"
+  if [[ -z "${tag}" ]]; then
+    err "Could not parse tag_name from releases API response."
+    err "GitHub may be rate-limiting you (unauthenticated API) or the body was malformed."
+    exit 1
+  fi
+
+  RUNNER_VERSION="${tag#v}"   # strip leading 'v' -> e.g. 2.335.1
+  TARBALL_NAME="actions-runner-osx-${ARCH_TAG}-${RUNNER_VERSION}.tar.gz"
+  DOWNLOAD_URL="https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/${TARBALL_NAME}"
+
+  # The canonical checksums live in the release *body* markdown as:
+  #   <!-- BEGIN SHA osx-arm64 --><64-hex><!-- END SHA osx-arm64 -->
+  # Collapse newlines first so the marker+hex stay on one line, then extract.
+  EXPECTED_SHA="$(printf '%s' "${json}" \
+    | tr -d '\n' \
+    | grep -oE "<!-- BEGIN SHA osx-${ARCH_TAG} -->[0-9a-f]{64}<!-- END SHA osx-${ARCH_TAG} -->" \
+    | grep -oE '[0-9a-f]{64}' \
+    | head -n1 || true)"
+  if [[ -z "${EXPECTED_SHA}" ]]; then
+    err "Could not obtain the published SHA-256 for ${TARBALL_NAME} from the release notes."
+    err "Refusing to install an unverified runner tarball (supply-chain integrity)."
+    exit 1
+  fi
+
+  step "Latest version: ${RUNNER_VERSION}"
+  step "Asset: ${TARBALL_NAME}"
+  step "Published SHA-256: ${EXPECTED_SHA}"
+}
+
+# ----------------------------------------------------------------------------
+# Download + verify the tarball once (shared across all runners) — same
+# download/shasum logic as runner-setup.
+# ----------------------------------------------------------------------------
+download_tarball() {
+  WORK_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/runner-upgrade.XXXXXX")"
+  TARBALL_PATH="${WORK_TMPDIR}/${TARBALL_NAME}"
+
+  log "Downloading runner ${RUNNER_VERSION} (osx-${ARCH_TAG})"
+  if ! curl -fL --retry 3 --retry-delay 2 --proto '=https' --tlsv1.2 \
+      -o "${TARBALL_PATH}" "${DOWNLOAD_URL}"; then
+    err "Download failed: ${DOWNLOAD_URL}"
+    exit 1
+  fi
+
+  # Sanity check the archive is a valid gzip tar before we touch /opt.
+  if ! tar -tzf "${TARBALL_PATH}" >/dev/null 2>&1; then
+    err "Downloaded file is not a valid tar.gz archive: ${TARBALL_PATH}"
+    exit 1
+  fi
+
+  # Verify checksum against the published digest (mandatory, not best-effort).
+  local got
+  got="$(shasum -a 256 "${TARBALL_PATH}" | awk '{print $1}')"
+  if [[ "${got}" != "${EXPECTED_SHA}" ]]; then
+    err "SHA256 mismatch for ${TARBALL_NAME}"
+    err "  expected: ${EXPECTED_SHA}"
+    err "  actual:   ${got}"
+    exit 1
+  fi
+  step "SHA256 verified (${got})"
+
+  # macOS may quarantine downloaded archives; clear it so binaries run.
+  xattr -c "${TARBALL_PATH}" 2>/dev/null || true
+
+  step "Downloaded and validated: ${TARBALL_PATH}"
+}
+
+# ----------------------------------------------------------------------------
+# Discover runners under ${RUNNER_ROOT}. Populates RUNNER_NAMES, excluding
+# *.prev rollback backups. --runners N selects runner-1..runner-N (existing
+# dirs only); --all selects every runner-N directory.
+# ----------------------------------------------------------------------------
+discover_runners() {
+  local d name i
+  local -a found=()
+
+  if [[ -n "${RUNNERS}" ]]; then
+    for ((i = 1; i <= RUNNERS; i++)); do
+      [[ -d "${RUNNER_ROOT}/runner-${i}" ]] && found+=("runner-${i}")
+    done
+  else
+    shopt -s nullglob
+    for d in "${RUNNER_ROOT}"/runner-*; do
+      [[ -d "${d}" ]] || continue
+      name="$(basename "${d}")"
+      case "${name}" in
+        *.prev) continue ;;   # rollback backup, not a live runner
+        *) found+=("${name}") ;;
+      esac
+    done
+    shopt -u nullglob
+  fi
+
+  # De-duplicate while preserving order (bash 3.2: no associative arrays).
+  # Guard the count FIRST: on bash 3.2 expanding an EMPTY array as
+  # "${found[@]}" under `set -u` aborts ("found[@]: unbound variable").
+  local seen=" "
+  if [[ ${#found[@]} -gt 0 ]]; then
+    for name in "${found[@]}"; do
+      case "${seen}" in
+        *" ${name} "*) ;;
+        *) RUNNER_NAMES+=("${name}"); seen="${seen}${name} " ;;
+      esac
+    done
+  fi
+}
+
+record_status() {
+  STATUS_NAME+=("$1")
+  STATUS_RESULT+=("$2")
+}
+
+# Boot a system service out and WAIT for it to actually disappear (bootout is
+# asynchronous — see runner-setup).
+bootout_system() {
+  local label="$1"
+  local _i
+  sudo launchctl bootout "system/${label}" 2>/dev/null || true
+  for _i in 1 2 3 4 5 6 7 8 9 10; do
+    sudo launchctl print "system/${label}" >/dev/null 2>&1 || return 0
+    sleep 1
+  done
+  return 0
+}
+
+# ----------------------------------------------------------------------------
+# Installed version of one runner: ask the binary itself. Runner.Listener
+# --version prints e.g. "2.335.1". Runs as the real user; empty on failure.
+# ----------------------------------------------------------------------------
+installed_version() {
+  local dir="$1"
+  local bin="${dir}/bin/Runner.Listener"
+  local v=""
+  if [[ -x "${bin}" ]]; then
+    v="$(as_user "${bin}" --version 2>/dev/null \
+      | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
+  fi
+  printf '%s' "${v}"
+}
+
+# ----------------------------------------------------------------------------
+# Health check: wait until the NEWEST _diag/Runner_*.log under ${dir} contains
+# 'Listening for Jobs' (bounded by HEALTH_TIMEOUT). The fresh install dir has
+# no _diag from the old version — the old logs moved away with runner-N.prev —
+# so any Runner_*.log found here belongs to the new process.
+# ----------------------------------------------------------------------------
+wait_for_listening() {
+  local dir="$1"
+  local waited=0 f
+  while [[ "${waited}" -lt "${HEALTH_TIMEOUT}" ]]; do
+    f="$(ls -t "${dir}"/_diag/Runner_*.log 2>/dev/null | head -n1 || true)"
+    if [[ -n "${f}" ]] && grep -q 'Listening for Jobs' "${f}" 2>/dev/null; then
+      return 0
+    fi
+    sleep 3
+    waited=$((waited + 3))
+  done
+  return 1
+}
+
+# ----------------------------------------------------------------------------
+# Re-bootstrap the existing daemon for one runner. The plist path is unchanged
+# across upgrades (it points at ${dir}/bin/runsvc.sh), so we just boot out and
+# bootstrap the same file runner-setup installed.
+# ----------------------------------------------------------------------------
+bootstrap_daemon() {
+  local name="$1"
+  local label="com.github.${name}"
+  local plist="${LAUNCH_DAEMON_DIR}/${label}.plist"
+
+  if [[ ! -f "${plist}" ]]; then
+    err "LaunchDaemon plist ${plist} not found for ${name}."
+    err "Was this runner provisioned by runner-setup? Cannot bootstrap."
+    return 1
+  fi
+  step "Bootstrapping system/${label}"
+  bootout_system "${label}"
+  if ! sudo launchctl bootstrap system "${plist}"; then
+    # Retry once after a brief settle — covers the async-teardown race.
+    sleep 2
+    if ! sudo launchctl bootstrap system "${plist}"; then
+      err "launchctl bootstrap failed for ${name}."
+      return 1
+    fi
+  fi
+  sudo launchctl enable "system/${label}" 2>/dev/null || true
+  sudo launchctl kickstart -k "system/${label}" 2>/dev/null || true
+  return 0
+}
+
+# ----------------------------------------------------------------------------
+# Restore runner-N.prev over runner-N (used by rollback AND by the automatic
+# canary-failure path). Tolerant: if the failed new dir is absent that's fine.
+# NOTE: called under `if ! ...`, so set -e is INACTIVE — check statuses.
+# ----------------------------------------------------------------------------
+rollback_runner() {
+  local name="$1"
+  local dir="${RUNNER_ROOT}/${name}"
+  local prev="${dir}.prev"
+
+  if [[ ! -d "${prev}" ]]; then
+    err "No rollback backup found: ${prev}"
+    record_status "${name}" "FAILED (no .prev backup)"
+    return 1
+  fi
+
+  warn "Rolling back ${name} from ${prev}"
+  log_event "${PROG_NAME} rollback ${name} start"
+
+  # Quiesce before touching the install dir.
+  bootout_system "com.github.${name}"
+
+  if [[ -d "${dir}" ]]; then
+    step "Removing failed install ${dir}"
+    if ! sudo rm -rf "${dir}"; then
+      err "Could not remove ${dir}; manual intervention required."
+      record_status "${name}" "FAILED (rollback: rm)"
+      log_event "${PROG_NAME} rollback ${name} FAILED (rm)"
+      return 1
+    fi
+  fi
+
+  step "Restoring ${prev} -> ${dir}"
+  if ! sudo mv "${prev}" "${dir}"; then
+    err "Could not restore ${prev}; manual intervention required."
+    record_status "${name}" "FAILED (rollback: mv)"
+    log_event "${PROG_NAME} rollback ${name} FAILED (mv)"
+    return 1
+  fi
+  sudo chown -R "${REAL_USER}:${REAL_GROUP}" "${dir}" 2>/dev/null || true
+  xattr -rc "${dir}" 2>/dev/null || true
+
+  if ! bootstrap_daemon "${name}"; then
+    record_status "${name}" "ROLLED BACK (bootstrap failed)"
+    log_event "${PROG_NAME} rollback ${name} FAILED (bootstrap)"
+    return 1
+  fi
+
+  if wait_for_listening "${dir}"; then
+    step "${name} rolled back and listening for jobs."
+    record_status "${name}" "rolled back (healthy)"
+    log_event "${PROG_NAME} rollback ${name} OK"
+  else
+    warn "${name} rolled back but no 'Listening for Jobs' within ${HEALTH_TIMEOUT}s."
+    record_status "${name}" "ROLLED BACK (unconfirmed)"
+    log_event "${PROG_NAME} rollback ${name} unconfirmed"
+  fi
+  return 0
+}
+
+# ----------------------------------------------------------------------------
+# Upgrade one runner (e.g. "runner-1") to the already-downloaded version.
+# Preserves the registration state (.runner/.credentials*/.path/.env) and the
+# _work directory, so the runner keeps its GitHub identity and labels — no
+# re-registration token is needed.
+# NOTE: called under `if ! ...`, so set -e is INACTIVE — check statuses.
+# ----------------------------------------------------------------------------
+upgrade_runner() {
+  local name="$1"
+  local dir="${RUNNER_ROOT}/${name}"
+  local prev="${dir}.prev"
+  local label="com.github.${name}"
+  local old_version
+  old_version="$(installed_version "${dir}")"
+
+  log "Upgrading ${name} (${old_version:-unknown} -> ${RUNNER_VERSION})"
+  log_event "${PROG_NAME} upgrade ${name} ${old_version:-unknown} -> ${RUNNER_VERSION} start"
+
+  if [[ -d "${prev}" ]]; then
+    err "${prev} already exists (leftover from a previous upgrade)."
+    err "Run '${PROG_NAME} rollback --runner ${name#runner-}' or remove it first."
+    record_status "${name}" "FAILED (.prev exists)"
+    log_event "${PROG_NAME} upgrade ${name} FAILED (.prev exists)"
+    return 1
+  fi
+
+  # --- Quiesce: boot the daemon out so no job is mid-flight on old code. ----
+  step "Booting out system/${label}"
+  bootout_system "${label}"
+
+  # --- Move the old install aside (kept for rollback), extract the new. -----
+  step "Moving ${dir} aside to ${prev}"
+  if ! sudo mv "${dir}" "${prev}"; then
+    err "Could not move ${dir} aside; aborting upgrade of ${name}."
+    record_status "${name}" "FAILED (mv aside)"
+    log_event "${PROG_NAME} upgrade ${name} FAILED (mv aside)"
+    return 1
+  fi
+
+  step "Extracting runner ${RUNNER_VERSION} into ${dir}"
+  if ! { sudo mkdir -p "${dir}" \
+      && sudo chown "${REAL_USER}:${REAL_GROUP}" "${dir}" \
+      && as_user tar -xzf "${TARBALL_PATH}" -C "${dir}"; }; then
+    err "Extraction failed for ${name}; rolling back."
+    log_event "${PROG_NAME} upgrade ${name} FAILED (extract)"
+    rollback_runner "${name}"
+    return 1
+  fi
+
+  # --- Preserve registration state + work dir from the previous install. ----
+  # .runner/.credentials ARE the registration (agent id, OAuth credentials,
+  # labels); carrying them over means config.sh never re-runs and the GitHub
+  # identity is untouched. _work carries job workspaces. _diag stays behind in
+  # .prev on purpose: fresh logs make the health check unambiguous.
+  step "Preserving registration state and _work"
+  local f
+  for f in .runner .credentials .credentials_rsaparams .path .env; do
+    if [[ -f "${prev}/${f}" ]]; then
+      if ! as_user cp -a "${prev}/${f}" "${dir}/${f}"; then
+        err "Could not preserve ${f} for ${name}; rolling back."
+        log_event "${PROG_NAME} upgrade ${name} FAILED (preserve ${f})"
+        rollback_runner "${name}"
+        return 1
+      fi
+    fi
+  done
+  if [[ -d "${prev}/_work" ]]; then
+    if ! as_user mv "${prev}/_work" "${dir}/_work"; then
+      err "Could not preserve _work for ${name}; rolling back."
+      log_event "${PROG_NAME} upgrade ${name} FAILED (preserve _work)"
+      rollback_runner "${name}"
+      return 1
+    fi
+  fi
+  sudo chown -R "${REAL_USER}:${REAL_GROUP}" "${dir}" 2>/dev/null || true
+  xattr -rc "${dir}" 2>/dev/null || true
+
+  # --- Re-bootstrap the SAME daemon (plist path unchanged) and health check.
+  if ! bootstrap_daemon "${name}"; then
+    err "Bootstrap failed for ${name}; rolling back."
+    log_event "${PROG_NAME} upgrade ${name} FAILED (bootstrap)"
+    rollback_runner "${name}"
+    return 1
+  fi
+
+  step "Waiting for '${name}' to listen for jobs (up to ${HEALTH_TIMEOUT}s)"
+  if ! wait_for_listening "${dir}"; then
+    err "${name} did not report 'Listening for Jobs' within ${HEALTH_TIMEOUT}s; rolling back."
+    log_event "${PROG_NAME} upgrade ${name} FAILED (health check)"
+    rollback_runner "${name}"
+    return 1
+  fi
+
+  step "${name} upgraded to ${RUNNER_VERSION} and is listening for jobs."
+  record_status "${name}" "upgraded ${old_version:-unknown} -> ${RUNNER_VERSION}"
+  log_event "${PROG_NAME} upgrade ${name} ${old_version:-unknown} -> ${RUNNER_VERSION} OK"
+  return 0
+}
+
+# ----------------------------------------------------------------------------
+# Confirmation (skipped with --yes; refuses to proceed without a TTY)
+# ----------------------------------------------------------------------------
+confirm() {
+  local what="$1"
+  [[ "${ASSUME_YES}" -eq 1 ]] && return 0
+  if [[ ! -t 0 ]]; then
+    err "Refusing to ${what} without confirmation (no TTY). Re-run with --yes."
+    exit 1
+  fi
+  log "About to ${what} the following runner(s):"
+  local n
+  if [[ ${#RUNNER_NAMES[@]} -gt 0 ]]; then
+    for n in "${RUNNER_NAMES[@]}"; do
+      printf '     - %s/%s\n' "${RUNNER_ROOT}" "${n}" >&2
+    done
+  fi
+  local reply
+  printf '\033[1;33m?\033[0m Proceed? [y/N] ' >&2
+  read -r reply
+  case "${reply}" in
+    y|Y|yes|YES) return 0 ;;
+    *) log "Aborted; nothing changed."; exit 0 ;;
+  esac
+}
+
+print_summary() {
+  local i
+  printf '\n'
+  printf '==> Summary\n'
+  printf '  %-12s %s\n' "RUNNER" "STATUS"
+  printf '  %-12s %s\n' "------" "------"
+  for i in "${!STATUS_NAME[@]}"; do
+    printf '  %-12s %s\n' "${STATUS_NAME[$i]}" "${STATUS_RESULT[$i]}"
+  done
+  printf '\n'
+  log "Event log: ${LOG_FILE}"
+}
+
+# ----------------------------------------------------------------------------
+# check — report which runners are behind the latest release.
+# ----------------------------------------------------------------------------
+cmd_check() {
+  detect_arch
+  discover_runners
+  if [[ ${#RUNNER_NAMES[@]} -eq 0 ]]; then
+    log "No runners found under ${RUNNER_ROOT}; nothing to check."
+    exit 0
+  fi
+
+  resolve_latest_release
+
+  local name v pending=0
+  printf '\n'
+  printf '==> Version check (latest: %s)\n' "${RUNNER_VERSION}"
+  printf '  %-12s %-14s %s\n' "RUNNER" "INSTALLED" "STATUS"
+  printf '  %-12s %-14s %s\n' "------" "---------" "------"
+  for name in "${RUNNER_NAMES[@]}"; do
+    v="$(installed_version "${RUNNER_ROOT}/${name}")"
+    if [[ -z "${v}" ]]; then
+      printf '  %-12s %-14s %s\n' "${name}" "unknown" "UNKNOWN (bin/Runner.Listener --version failed)"
+    elif [[ "${v}" == "${RUNNER_VERSION}" ]]; then
+      printf '  %-12s %-14s %s\n' "${name}" "${v}" "current"
+    else
+      printf '  %-12s %-14s %s\n' "${name}" "${v}" "NEEDS UPGRADE -> ${RUNNER_VERSION}"
+      pending=$((pending + 1))
+    fi
+  done
+  printf '\n'
+
+  if [[ "${pending}" -gt 0 ]]; then
+    log "${pending} runner(s) need an upgrade. Run: ${PROG_NAME} run --all --yes"
+    log_event "${PROG_NAME} check pending=${pending} latest=${RUNNER_VERSION}"
+    exit 3
+  fi
+  log "All runners are current (${RUNNER_VERSION})."
+  log_event "${PROG_NAME} check current latest=${RUNNER_VERSION}"
+  exit 0
+}
+
+# ----------------------------------------------------------------------------
+# run — canary-first upgrade of the selected runners.
+# ----------------------------------------------------------------------------
+cmd_run() {
+  detect_arch
+  discover_runners
+  if [[ ${#RUNNER_NAMES[@]} -eq 0 ]]; then
+    log "No runners found under ${RUNNER_ROOT}; nothing to upgrade."
+    exit 0
+  fi
+
+  resolve_latest_release
+
+  # Skip runners already on the latest version; upgrade only the rest.
+  local -a pending=()
+  local name v
+  for name in "${RUNNER_NAMES[@]}"; do
+    v="$(installed_version "${RUNNER_ROOT}/${name}")"
+    if [[ "${v}" == "${RUNNER_VERSION}" ]]; then
+      step "${name} already on ${RUNNER_VERSION} — skipping."
+      record_status "${name}" "skipped (already ${RUNNER_VERSION})"
+    else
+      pending+=("${name}")
+    fi
+  done
+
+  if [[ ${#pending[@]} -eq 0 ]]; then
+    log "All runners are current (${RUNNER_VERSION}); nothing to do."
+    print_summary
+    exit 0
+  fi
+
+  RUNNER_NAMES=("${pending[@]}")
+  confirm "upgrade to actions/runner ${RUNNER_VERSION} (canary: ${RUNNER_NAMES[0]})"
+
+  ensure_sudo
+  # Stable event log: create root-free, owned by the runner user, on first use.
+  if [[ ! -f "${LOG_FILE}" ]]; then
+    sudo mkdir -p "${RUNNER_ROOT}"
+    sudo touch "${LOG_FILE}"
+    sudo chown "${REAL_USER}:${REAL_GROUP}" "${LOG_FILE}"
+  fi
+  log_event "${PROG_NAME} run start latest=${RUNNER_VERSION} targets=${RUNNER_NAMES[*]}"
+
+  download_tarball
+
+  # --- CANARY: upgrade ONLY the first runner and health-check it. -----------
+  local canary="${RUNNER_NAMES[0]}"
+  log "Canary: upgrading ${canary} first"
+  if ! upgrade_runner "${canary}"; then
+    err "Canary ${canary} FAILED and was rolled back. Remaining runners untouched."
+    log_event "${PROG_NAME} run aborted canary=${canary} FAILED"
+    print_summary
+    err "Investigate ${RUNNER_ROOT}/${canary}/_diag/ before retrying."
+    exit 1
+  fi
+  log "Canary ${canary} healthy on ${RUNNER_VERSION}; rolling remaining runners."
+
+  # --- Roll the rest. -------------------------------------------------------
+  local overall_rc=0 i
+  for ((i = 1; i < ${#RUNNER_NAMES[@]}; i++)); do
+    if ! upgrade_runner "${RUNNER_NAMES[$i]}"; then
+      overall_rc=1
+      warn "${RUNNER_NAMES[$i]} failed (rolled back); continuing with remaining runners."
+    fi
+  done
+
+  log_event "${PROG_NAME} run done latest=${RUNNER_VERSION} rc=${overall_rc}"
+  print_summary
+  if [[ "${overall_rc}" -ne 0 ]]; then
+    err "One or more runners failed to upgrade (each was rolled back). See above."
+  else
+    log "All selected runners upgraded to ${RUNNER_VERSION}."
+    log "Previous installs kept as runner-N.prev; remove them once satisfied,"
+    log "or use '${PROG_NAME} rollback --runner N' to revert."
+  fi
+  return "${overall_rc}"
+}
+
+# ----------------------------------------------------------------------------
+# rollback — restore runner-N.prev over runner-N.
+# ----------------------------------------------------------------------------
+cmd_rollback() {
+  if [[ -n "${TARGET_RUNNER}" ]]; then
+    [[ -d "${RUNNER_ROOT}/runner-${TARGET_RUNNER}.prev" ]] \
+      && RUNNER_NAMES+=("runner-${TARGET_RUNNER}") \
+      || { err "No backup ${RUNNER_ROOT}/runner-${TARGET_RUNNER}.prev found."; exit 1; }
+  else
+    local d
+    shopt -s nullglob
+    for d in "${RUNNER_ROOT}"/runner-*.prev; do
+      [[ -d "${d}" ]] && RUNNER_NAMES+=("$(basename "${d}" .prev)")
+    done
+    shopt -u nullglob
+  fi
+
+  if [[ ${#RUNNER_NAMES[@]} -eq 0 ]]; then
+    log "No .prev backups under ${RUNNER_ROOT}; nothing to roll back."
+    exit 0
+  fi
+
+  confirm "roll back"
+  ensure_sudo
+
+  local name rc=0
+  for name in "${RUNNER_NAMES[@]}"; do
+    if ! rollback_runner "${name}"; then
+      rc=1
+      warn "Failed to roll back ${name}; continuing."
+    fi
+  done
+
+  print_summary
+  return "${rc}"
+}
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+main() {
+  parse_args "$@"
+  detect_platform
+  require_cmds
+  detect_user
+
+  case "${COMMAND}" in
+    check)    cmd_check ;;
+    run)      cmd_run ;;
+    rollback) cmd_rollback ;;
+  esac
+}
+
+main "$@"
