@@ -1,0 +1,628 @@
+#!/usr/bin/env bash
+#
+# runner-autoscale — queue-aware autoscaling for GitHub Actions self-hosted
+# runners on macOS.
+#
+# Usage:
+#   runner-autoscale (--org ORG | --repo OWNER/REPO) [--daemon] [--interval N]
+#
+# Polls the GitHub API for queued workflow runs in the registration scope, then
+# scales the LOCAL fleet by invoking runner-setup (scale up) / runner-cleanup
+# (scale down). It never provisions runners directly: every scale-up mints a
+# fresh registration token via the API and hands it to runner-setup through
+# RUNNER_TOKEN; every scale-down mints a removal token and hands it to
+# runner-cleanup through RUNNER_REMOVE_TOKEN. Privileged work (/opt,
+# LaunchDaemons) stays inside those scripts — this controller uses no sudo.
+#
+# Runs a single scaling tick by default (pair it with a launchd StartInterval
+# service), or loops with --daemon. Every decision — timestamp, queue depth,
+# action, reason — is appended to a stable decision log, and a lockfile ensures
+# only one scale operation is ever in flight. See docs/autoscaling.md for the
+# launchd plist, the multi-host primary/standby model, and rate-limit math.
+
+set -euo pipefail
+
+# ----------------------------------------------------------------------------
+# Constants / globals
+# ----------------------------------------------------------------------------
+PROG_NAME="$(basename "$0")"
+RUNNER_ROOT="/opt/github-runners"
+API_BASE="https://api.github.com"
+
+DEFAULT_INTERVAL=60
+DEFAULT_MIN=1
+DEFAULT_MAX=4
+DEFAULT_SCALE_UP_THRESHOLD=1
+DEFAULT_COOLDOWN_MINUTES=30
+DEFAULT_LABELS="macos,macmini,self-hosted"
+LOCK_STALE_SECONDS=3600     # break a lock older than this (holder died mid-op)
+
+ORG=""
+REPO=""
+SCOPE_API=""                # /orgs/ORG or /repos/OWNER/REPO
+SCOPE_SLUG=""
+DAEMON=0
+INTERVAL="${DEFAULT_INTERVAL}"
+MIN_RUNNERS="${DEFAULT_MIN}"
+MAX_RUNNERS="${DEFAULT_MAX}"
+SCALE_UP_THRESHOLD="${DEFAULT_SCALE_UP_THRESHOLD}"
+COOLDOWN_MINUTES="${DEFAULT_COOLDOWN_MINUTES}"
+LABELS="${DEFAULT_LABELS}"
+
+STATE_DIR="${RUNNER_ROOT}/.autoscale"
+STATE_FILE=""               # ${STATE_DIR}/state   (IDLE_SINCE tracking)
+LOCK_DIR=""                 # ${STATE_DIR}/lock    (mkdir-based mutex)
+LOG_FILE=""                 # decision log (default ${STATE_DIR}/autoscale.log)
+LOG_FILE_SET=0
+
+GITHUB_PAT="${GITHUB_PAT:-}"
+WORK_TMPDIR=""
+LOCK_HELD=0
+RUNNER_SETUP_BIN=""
+RUNNER_CLEANUP_BIN=""
+
+# ----------------------------------------------------------------------------
+# Output helpers — progress goes to stderr; tokens are NEVER interpolated.
+# ----------------------------------------------------------------------------
+log()  { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
+step() { printf '\033[1;32m  ->\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[1;33mWARN:\033[0m %s\n' "$*" >&2; }
+err()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; }
+
+usage() {
+  cat >&2 <<EOF
+${PROG_NAME} — queue-aware autoscaling for GitHub Actions runners on macOS
+
+USAGE:
+  ${PROG_NAME} (--org ORG | --repo OWNER/REPO) [options]
+
+Polls the GitHub API for queued workflow runs in the scope, then scales the
+LOCAL runner fleet by invoking runner-setup (up) and runner-cleanup (down).
+Runs ONE scaling tick by default — pair it with a launchd StartInterval
+service — or loops forever with --daemon.
+
+SCOPE (choose exactly ONE — it must match the runner-setup registration):
+  --org ORG_NAME        Organization runners (polls /orgs/ORG/actions/runs).
+  --repo OWNER/REPO     Repository runners (polls /repos/OWNER/REPO/actions/runs).
+
+REQUIRED (environment):
+  GITHUB_PAT            Personal access token used to read the queue and to
+                        mint runner registration/removal tokens. Needs 'repo'
+                        for --repo scopes or 'admin:org' for --org scopes.
+                        GITHUB_PAT_FILE (path to a file holding the token) is
+                        accepted instead — preferred for launchd services, so
+                        the token never appears in a plist.
+
+OPTIONS:
+  --daemon              Loop forever instead of running a single tick.
+  --interval N          Seconds between ticks in --daemon mode (default: ${DEFAULT_INTERVAL}).
+  --min N               Never scale below N runners (default: ${DEFAULT_MIN}).
+  --max N               Never scale above N runners (default: ${DEFAULT_MAX}).
+  --scale-up-threshold N
+                        Scale up while queued runs > N (default: ${DEFAULT_SCALE_UP_THRESHOLD}).
+  --cooldown-minutes N  Scale down only after N minutes with an empty queue
+                        and no busy runner (default: ${DEFAULT_COOLDOWN_MINUTES}).
+  --labels CSV          Labels for newly provisioned runners; should match the
+                        labels your queued jobs request
+                        (default: ${DEFAULT_LABELS}).
+  --log-file PATH       Decision log path
+                        (default: ${STATE_DIR}/autoscale.log).
+  -h, --help            Show this help and exit.
+
+EXAMPLES:
+  GITHUB_PAT=github_pat_... ${PROG_NAME} --org acme
+  GITHUB_PAT=github_pat_... ${PROG_NAME} --repo acme/monorepo --daemon --interval 120 --max 6
+  GITHUB_PAT_FILE=/etc/github-runner-pat ${PROG_NAME} --org acme --max 8
+
+SCALING MODEL:
+  scale UP   queue depth > threshold AND runners < max
+             -> mint registration token via API, then
+                RUNNER_TOKEN=... runner-setup SCOPE --runners current+1
+             (runner-setup skips already-configured runners, so only the new
+             highest-numbered runner is actually configured; registration
+             tokens are single-scope and fetched fresh for EVERY provision).
+  scale DOWN queue empty, no local runner busy, idle longer than the cooldown,
+             AND runners > min
+             -> mint removal token via API, then
+                RUNNER_REMOVE_TOKEN=... runner-cleanup --runner HIGHEST --yes
+  Every decision (timestamp, queue depth, action, reason) is appended to the
+  decision log, and a lockfile under ${STATE_DIR} guarantees only one scale
+  operation is in flight at a time.
+
+SECURITY NOTE:
+  GITHUB_PAT is never placed on a command line: curl reads the Authorization
+  header from a 0600 config file in a private tmpdir. Registration and removal
+  tokens are passed to runner-setup/runner-cleanup via environment variables,
+  never CLI arguments, and are never written to logs.
+
+  This controller itself needs no sudo, but runner-setup and runner-cleanup
+  use sudo for /opt and /Library/LaunchDaemons. For unattended operation under
+  launchd, grant scoped NOPASSWD sudoers entries — see docs/autoscaling.md.
+EOF
+}
+
+# ----------------------------------------------------------------------------
+# Cleanup / signal traps
+# ----------------------------------------------------------------------------
+cleanup() {
+  local code=$?
+  release_lock
+  if [[ -n "${WORK_TMPDIR}" && -d "${WORK_TMPDIR}" ]]; then
+    rm -rf "${WORK_TMPDIR}" 2>/dev/null || true
+  fi
+  return "${code}"
+}
+trap cleanup EXIT
+trap 'log "Interrupted."; exit 130' INT TERM
+
+# ----------------------------------------------------------------------------
+# Argument parsing
+# ----------------------------------------------------------------------------
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --org)
+        [[ $# -ge 2 ]] || { err "--org requires a value"; usage; exit 2; }
+        ORG="$2"; shift 2 ;;
+      --org=*)     ORG="${1#*=}"; shift ;;
+      --repo)
+        [[ $# -ge 2 ]] || { err "--repo requires a value"; usage; exit 2; }
+        REPO="$2"; shift 2 ;;
+      --repo=*)    REPO="${1#*=}"; shift ;;
+      --daemon)    DAEMON=1; shift ;;
+      --interval)
+        [[ $# -ge 2 ]] || { err "--interval requires a value"; usage; exit 2; }
+        INTERVAL="$2"; shift 2 ;;
+      --interval=*) INTERVAL="${1#*=}"; shift ;;
+      --min)
+        [[ $# -ge 2 ]] || { err "--min requires a value"; usage; exit 2; }
+        MIN_RUNNERS="$2"; shift 2 ;;
+      --min=*)     MIN_RUNNERS="${1#*=}"; shift ;;
+      --max)
+        [[ $# -ge 2 ]] || { err "--max requires a value"; usage; exit 2; }
+        MAX_RUNNERS="$2"; shift 2 ;;
+      --max=*)     MAX_RUNNERS="${1#*=}"; shift ;;
+      --scale-up-threshold)
+        [[ $# -ge 2 ]] || { err "--scale-up-threshold requires a value"; usage; exit 2; }
+        SCALE_UP_THRESHOLD="$2"; shift 2 ;;
+      --scale-up-threshold=*) SCALE_UP_THRESHOLD="${1#*=}"; shift ;;
+      --cooldown-minutes)
+        [[ $# -ge 2 ]] || { err "--cooldown-minutes requires a value"; usage; exit 2; }
+        COOLDOWN_MINUTES="$2"; shift 2 ;;
+      --cooldown-minutes=*) COOLDOWN_MINUTES="${1#*=}"; shift ;;
+      --labels)
+        [[ $# -ge 2 ]] || { err "--labels requires a value"; usage; exit 2; }
+        LABELS="$2"; shift 2 ;;
+      --labels=*)  LABELS="${1#*=}"; shift ;;
+      --log-file)
+        [[ $# -ge 2 ]] || { err "--log-file requires a value"; usage; exit 2; }
+        LOG_FILE="$2"; LOG_FILE_SET=1; shift 2 ;;
+      --log-file=*) LOG_FILE="${1#*=}"; LOG_FILE_SET=1; shift ;;
+      -h|--help)   usage; exit 0 ;;
+      *)
+        err "Unknown argument: $1"
+        usage
+        exit 2 ;;
+    esac
+  done
+
+  # Exactly one scope.
+  local scope_count=0
+  [[ -z "${ORG}" ]]  || scope_count=$((scope_count + 1))
+  [[ -z "${REPO}" ]] || scope_count=$((scope_count + 1))
+  if [[ "${scope_count}" -ne 1 ]]; then
+    err "Choose exactly one of --org or --repo (got ${scope_count})."
+    err "It must match the scope the runners were registered with via runner-setup."
+    usage
+    exit 2
+  fi
+
+  local v name
+  for name in INTERVAL MIN_RUNNERS MAX_RUNNERS SCALE_UP_THRESHOLD COOLDOWN_MINUTES; do
+    v="${!name}"
+    if ! [[ "${v}" =~ ^[0-9]+$ ]]; then
+      err "${name} must be a non-negative integer (got: '${v}')"
+      exit 2
+    fi
+  done
+  if [[ "${INTERVAL}" -lt 1 ]]; then
+    err "--interval must be at least 1 second."
+    exit 2
+  fi
+  if [[ "${MIN_RUNNERS}" -gt "${MAX_RUNNERS}" ]]; then
+    err "--min (${MIN_RUNNERS}) must not exceed --max (${MAX_RUNNERS})."
+    exit 2
+  fi
+
+  if [[ -n "${ORG}" ]]; then
+    SCOPE_API="/orgs/${ORG}"
+    SCOPE_SLUG="${ORG}"
+  else
+    if ! [[ "${REPO}" =~ ^[^/]+/[^/]+$ ]]; then
+      err "--repo must be in OWNER/REPO form (got: '${REPO}')"
+      exit 2
+    fi
+    SCOPE_API="/repos/${REPO}"
+    SCOPE_SLUG="${REPO//\//-}"
+  fi
+
+  STATE_FILE="${STATE_DIR}/state"
+  LOCK_DIR="${STATE_DIR}/lock"
+  [[ "${LOG_FILE_SET}" -eq 1 ]] || LOG_FILE="${STATE_DIR}/autoscale.log"
+}
+
+# ----------------------------------------------------------------------------
+# Environment detection / preconditions
+# ----------------------------------------------------------------------------
+detect_platform() {
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    err "This tool only supports macOS."
+    exit 1
+  fi
+}
+
+require_cmds() {
+  local missing=()
+  local c
+  for c in curl sed grep tr sort tail head date stat mkdir rm mktemp chmod basename uname; do
+    command -v "${c}" >/dev/null 2>&1 || missing+=("${c}")
+  done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    err "Required command(s) not found: ${missing[*]}"
+    exit 1
+  fi
+}
+
+resolve_pat() {
+  if [[ -z "${GITHUB_PAT}" && -n "${GITHUB_PAT_FILE:-}" ]]; then
+    if [[ ! -r "${GITHUB_PAT_FILE}" ]]; then
+      err "GITHUB_PAT_FILE is not readable: ${GITHUB_PAT_FILE}"
+      exit 2
+    fi
+    GITHUB_PAT="$(tr -d '[:space:]' < "${GITHUB_PAT_FILE}")"
+  fi
+  if [[ -z "${GITHUB_PAT}" ]]; then
+    err "Missing credentials: set GITHUB_PAT (or GITHUB_PAT_FILE)."
+    err "The PAT needs 'repo' (--repo scope) or 'admin:org' (--org scope) to"
+    err "read queued runs and mint registration/removal tokens."
+    exit 2
+  fi
+}
+
+resolve_tools() {
+  RUNNER_SETUP_BIN="$(command -v runner-setup 2>/dev/null || true)"
+  RUNNER_CLEANUP_BIN="$(command -v runner-cleanup 2>/dev/null || true)"
+  if [[ -z "${RUNNER_SETUP_BIN}" || -z "${RUNNER_CLEANUP_BIN}" ]]; then
+    err "runner-setup and runner-cleanup must be in PATH (scaling is delegated to them)."
+    exit 1
+  fi
+  step "Using runner-setup:   ${RUNNER_SETUP_BIN}"
+  step "Using runner-cleanup: ${RUNNER_CLEANUP_BIN}"
+}
+
+# The state dir lives under RUNNER_ROOT, which runner-setup creates and chowns
+# to the invoking user — so the controller needs no sudo to write here.
+setup_state() {
+  if [[ ! -d "${RUNNER_ROOT}" ]]; then
+    err "${RUNNER_ROOT} does not exist. Provision the initial fleet first, e.g.:"
+    err "  RUNNER_TOKEN=... runner-setup --org ${ORG:-ORG} --runners ${MIN_RUNNERS}"
+    exit 1
+  fi
+  if ! mkdir -p "${STATE_DIR}" 2>/dev/null; then
+    err "Cannot create state directory ${STATE_DIR}."
+    err "${RUNNER_ROOT} should be owned by you (runner-setup chowns it)."
+    exit 1
+  fi
+  if ! touch "${LOG_FILE}" 2>/dev/null; then
+    err "Cannot write decision log: ${LOG_FILE}"
+    exit 1
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# Locking — mkdir is atomic on macOS (no flock dependency). One scale
+# operation in flight at a time, across ticks, daemons, and manual runs.
+# ----------------------------------------------------------------------------
+acquire_lock() {
+  if mkdir "${LOCK_DIR}" 2>/dev/null; then
+    LOCK_HELD=1
+    return 0
+  fi
+  # Break a stale lock (holder died mid-operation, e.g. killed during setup).
+  local mtime now
+  mtime="$(stat -f %m "${LOCK_DIR}" 2>/dev/null || echo 0)"
+  now="$(date +%s)"
+  if [[ "${mtime}" =~ ^[0-9]+$ ]] && [[ $((now - mtime)) -gt "${LOCK_STALE_SECONDS}" ]]; then
+    warn "Removing stale lock ${LOCK_DIR} (age $((now - mtime))s)."
+    rm -rf "${LOCK_DIR}"
+    if mkdir "${LOCK_DIR}" 2>/dev/null; then
+      LOCK_HELD=1
+      return 0
+    fi
+  fi
+  return 1
+}
+
+release_lock() {
+  if [[ "${LOCK_HELD}" -eq 1 ]]; then
+    rm -rf "${LOCK_DIR}" 2>/dev/null || true
+    LOCK_HELD=0
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# Decision log — one line per tick: timestamp, queue depth, action, reason.
+# ----------------------------------------------------------------------------
+log_decision() {
+  local depth="$1" current="$2" action="$3" reason="$4"
+  local line
+  line="$(printf '%s queue=%s runners=%s min=%s max=%s action=%s reason="%s"' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    "${depth}" "${current}" "${MIN_RUNNERS}" "${MAX_RUNNERS}" "${action}" "${reason}")"
+  printf '%s\n' "${line}" >> "${LOG_FILE}" 2>/dev/null \
+    || warn "Could not write decision log ${LOG_FILE}"
+  step "${line}"
+}
+
+# ----------------------------------------------------------------------------
+# GitHub API (no jq). The PAT goes into a 0600 curl config file in a private
+# tmpdir so it never appears in `ps` output; only the (secret-free) URL is on
+# the curl command line.
+# ----------------------------------------------------------------------------
+api_request() {
+  local method="$1" endpoint="$2"
+  local cfg="${WORK_TMPDIR}/curl.conf"
+  {
+    printf 'silent\n'
+    printf 'show-error\n'
+    printf 'fail\n'
+    printf 'location\n'
+    printf 'retry = 3\n'
+    printf 'retry-delay = 2\n'
+    printf 'header = "Accept: application/vnd.github+json"\n'
+    printf 'header = "X-GitHub-Api-Version: 2022-11-28"\n'
+    printf 'header = "Authorization: Bearer %s"\n' "${GITHUB_PAT}"
+    [[ "${method}" == "GET" ]] || printf 'request = "%s"\n' "${method}"
+  } > "${cfg}"
+  chmod 600 "${cfg}"
+  curl -K "${cfg}" "${API_BASE}${endpoint}"
+}
+
+# Queued workflow runs in the scope -> prints the integer queue depth.
+fetch_queue_depth() {
+  local json depth
+  if ! json="$(api_request GET "${SCOPE_API}/actions/runs?status=queued&per_page=100")"; then
+    warn "Failed to query queued workflow runs for ${SCOPE_SLUG}."
+    return 1
+  fi
+  # The trailing `|| true` is REQUIRED under set -e/pipefail (see runner-setup):
+  # a no-match sed must not abort before the explicit emptiness check.
+  depth="$(printf '%s\n' "${json}" \
+    | sed -n 's/.*"total_count"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+    | head -n1 || true)"
+  if [[ -z "${depth}" ]]; then
+    warn "Could not parse total_count from the queued-runs API response."
+    return 1
+  fi
+  printf '%s' "${depth}"
+}
+
+# Mint a fresh token: kind is "registration-token" (scale up) or "remove-token"
+# (scale down). Registration tokens are scope-bound and fetched fresh for every
+# provision; removal tokens likewise for every teardown. Prints the token.
+fetch_token() {
+  local kind="$1"
+  local json token
+  if ! json="$(api_request POST "${SCOPE_API}/actions/runners/${kind}")"; then
+    warn "Failed to mint ${kind} for ${SCOPE_SLUG}."
+    return 1
+  fi
+  token="$(printf '%s\n' "${json}" \
+    | sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    | head -n1 || true)"
+  if [[ -z "${token}" ]]; then
+    warn "Could not parse ${kind} from the API response."
+    return 1
+  fi
+  printf '%s' "${token}"
+}
+
+# ----------------------------------------------------------------------------
+# Local fleet inspection (runner-N directories under /opt/github-runners)
+# ----------------------------------------------------------------------------
+list_runner_indices() {
+  local d base idx
+  shopt -s nullglob
+  for d in "${RUNNER_ROOT}"/runner-*; do
+    [[ -d "${d}" ]] || continue
+    base="$(basename "${d}")"
+    idx="${base#runner-}"
+    [[ "${idx}" =~ ^[0-9]+$ ]] && printf '%s\n' "${idx}"
+  done
+  shopt -u nullglob
+}
+
+count_runners() {
+  list_runner_indices | wc -l | tr -d ' '
+}
+
+highest_runner_index() {
+  list_runner_indices | sort -n | tail -n1
+}
+
+# Returns 0 if ANY local runner is busy according to the API runner list.
+# Local runners register as [HOST-]runner-N (see runner-setup), so match the
+# trailing index inside the quoted name; the closing quote keeps runner-1 from
+# matching runner-10. The API returns compact JSON, so split runner objects
+# onto their own lines before matching.
+any_runner_busy() {
+  local json="$1"
+  local objects idx line
+  objects="$(printf '%s' "${json}" | sed 's/},{/}\n{/g')"
+  while IFS= read -r idx; do
+    [[ -n "${idx}" ]] || continue
+    line="$(printf '%s\n' "${objects}" \
+      | grep -E "\"name\"[[:space:]]*:[[:space:]]*\"([^\"]*-)?runner-${idx}\"" \
+      | head -n1 || true)"
+    if printf '%s' "${line}" | grep -qE '"busy"[[:space:]]*:[[:space:]]*true'; then
+      return 0
+    fi
+  done <<EOF
+$(list_runner_indices)
+EOF
+  return 1
+}
+
+# ----------------------------------------------------------------------------
+# Idle-since state (cooldown tracking), persisted between ticks.
+# ----------------------------------------------------------------------------
+load_idle_since() {
+  local v
+  v="$(sed -n 's/^IDLE_SINCE=//p' "${STATE_FILE}" 2>/dev/null | head -n1 || true)"
+  [[ "${v}" =~ ^[0-9]+$ ]] || v=0
+  printf '%s' "${v}"
+}
+
+save_idle_since() {
+  printf 'IDLE_SINCE=%s\n' "$1" > "${STATE_FILE}"
+}
+
+# ----------------------------------------------------------------------------
+# Scaling operations (delegated to runner-setup / runner-cleanup)
+# ----------------------------------------------------------------------------
+do_scale_up() {
+  local depth="$1" current="$2"
+  local next=$((current + 1))
+  local token
+  if ! token="$(fetch_token registration-token)"; then
+    log_decision "${depth}" "${current}" "error" "scale-up aborted: could not mint a registration token"
+    return 1
+  fi
+  log_decision "${depth}" "${current}" "scale-up" \
+    "queue depth ${depth} > threshold ${SCALE_UP_THRESHOLD} and runners < max; provisioning runner-${next} via runner-setup"
+
+  local -a scope_args=()
+  if [[ -n "${ORG}" ]]; then
+    scope_args=(--org "${ORG}")
+  else
+    scope_args=(--repo "${REPO}")
+  fi
+  # runner-setup provisions 1..N and skips already-configured runners, so
+  # asking for current+1 configures exactly one new runner. The token travels
+  # via the environment — never a ps-visible argument.
+  if ! RUNNER_TOKEN="${token}" "${RUNNER_SETUP_BIN}" \
+      "${scope_args[@]}" --runners "${next}" --labels "${LABELS}"; then
+    log_decision "${depth}" "${current}" "error" "runner-setup failed while scaling to ${next} runner(s)"
+    return 1
+  fi
+  save_idle_since 0
+  return 0
+}
+
+do_scale_down() {
+  local depth="$1" current="$2"
+  local highest
+  highest="$(highest_runner_index)"
+  if [[ -z "${highest}" ]]; then
+    log_decision "${depth}" "${current}" "error" "scale-down aborted: no runner directories found"
+    return 1
+  fi
+  local token
+  if ! token="$(fetch_token remove-token)"; then
+    log_decision "${depth}" "${current}" "error" "scale-down aborted: could not mint a removal token"
+    return 1
+  fi
+  log_decision "${depth}" "${current}" "scale-down" \
+    "queue empty and runners idle beyond ${COOLDOWN_MINUTES}m cooldown; removing runner-${highest} via runner-cleanup"
+
+  if ! RUNNER_REMOVE_TOKEN="${token}" "${RUNNER_CLEANUP_BIN}" \
+      --runner "${highest}" --yes; then
+    log_decision "${depth}" "${current}" "error" "runner-cleanup failed while removing runner-${highest}"
+    return 1
+  fi
+  # Reset the cooldown so the next removal waits a full idle period.
+  save_idle_since 0
+  return 0
+}
+
+# ----------------------------------------------------------------------------
+# One scaling tick: observe -> update idle state -> decide -> act.
+# Never leaves the lock held; returns non-zero on API/action failure so a
+# single-shot invocation reports failure, while --daemon mode keeps looping.
+# ----------------------------------------------------------------------------
+run_tick() {
+  if ! acquire_lock; then
+    log_decision "?" "$(count_runners)" "skip" "another scale operation is already in flight (lock held)"
+    return 0
+  fi
+
+  local depth current now idle_since busy=0
+  if ! depth="$(fetch_queue_depth)"; then
+    log_decision "?" "$(count_runners)" "error" "could not fetch queue depth from the GitHub API"
+    release_lock
+    return 1
+  fi
+  current="$(count_runners)"
+  now="$(date +%s)"
+  idle_since="$(load_idle_since)"
+
+  # Idleness = empty queue AND no local runner busy. On a runner-list API
+  # failure, assume busy: never scale down blind.
+  if [[ "${depth}" -gt 0 ]]; then
+    busy=1
+  else
+    local rjson=""
+    if rjson="$(api_request GET "${SCOPE_API}/actions/runners?per_page=100")"; then
+      any_runner_busy "${rjson}" && busy=1
+    else
+      warn "Could not fetch the runner list; assuming runners are busy."
+      busy=1
+    fi
+  fi
+
+  if [[ "${busy}" -eq 1 ]]; then
+    idle_since=0
+  elif [[ "${idle_since}" -eq 0 ]]; then
+    idle_since="${now}"
+  fi
+  save_idle_since "${idle_since}"
+
+  if [[ "${depth}" -gt "${SCALE_UP_THRESHOLD}" && "${current}" -lt "${MAX_RUNNERS}" ]]; then
+    do_scale_up "${depth}" "${current}"
+  elif [[ "${depth}" -eq 0 && "${busy}" -eq 0 && "${current}" -gt "${MIN_RUNNERS}" \
+      && "${idle_since}" -gt 0 && $((now - idle_since)) -ge $((COOLDOWN_MINUTES * 60)) ]]; then
+    do_scale_down "${depth}" "${current}"
+  else
+    log_decision "${depth}" "${current}" "none" \
+      "within bounds (busy=${busy}, idle_since=${idle_since}, threshold=${SCALE_UP_THRESHOLD}, cooldown=${COOLDOWN_MINUTES}m)"
+  fi
+
+  release_lock
+  return 0
+}
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+main() {
+  parse_args "$@"
+  detect_platform
+  require_cmds
+  resolve_pat
+  resolve_tools
+  setup_state
+  WORK_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/runner-autoscale.XXXXXX")"
+
+  if [[ "${DAEMON}" -eq 1 ]]; then
+    log "Autoscale controller starting: scope=${SCOPE_SLUG} interval=${INTERVAL}s min=${MIN_RUNNERS} max=${MAX_RUNNERS} threshold=${SCALE_UP_THRESHOLD} cooldown=${COOLDOWN_MINUTES}m"
+    log "Decision log: ${LOG_FILE}"
+    while true; do
+      run_tick || warn "Scaling tick failed; will retry at the next interval."
+      sleep "${INTERVAL}"
+    done
+  else
+    run_tick
+  fi
+}
+
+main "$@"
