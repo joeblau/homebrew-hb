@@ -11,8 +11,20 @@ class RunnerSetup < Formula
   depends_on :macos
 
   def install
-    bin.install "runner-setup"
-    bin.install "runner-cleanup"
+    bin.install %w[
+      runner-setup
+      runner-cleanup
+      runner-ephemeral
+      runner-prune
+      runner-health
+      runner-cache
+      runner-logs
+      runner-upgrade
+      runner-autoscale
+      runner-token
+      runner-netisolate
+      runner-docker-builder
+    ]
   end
 
   def caveats
@@ -58,8 +70,22 @@ class RunnerSetup < Formula
   end
 
   test do
-    assert_match "USAGE", shell_output("#{bin}/runner-setup --help")
-    assert_match "USAGE", shell_output("#{bin}/runner-cleanup --help")
+    %w[
+      runner-setup
+      runner-cleanup
+      runner-ephemeral
+      runner-prune
+      runner-health
+      runner-cache
+      runner-logs
+      runner-upgrade
+      runner-autoscale
+      runner-token
+      runner-netisolate
+      runner-docker-builder
+    ].each do |tool|
+      assert_match "USAGE", shell_output("#{bin}/#{tool} --help")
+    end
 
     # No registration scope chosen must fail with exit 2 and a clear message.
     no_scope = shell_output("RUNNER_TOKEN= #{bin}/runner-setup --token x 2>&1", 2)
