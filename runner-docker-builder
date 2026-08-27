@@ -1,0 +1,421 @@
+#!/usr/bin/env bash
+#
+# runner-docker-builder — fast Docker image builds on macOS GitHub Actions runners
+#
+# Usage:
+#   runner-docker-builder setup-remote --host ssh://user@linux-builder [--platform CSV]
+#   runner-docker-builder setup-colima [--cpu N] [--mem GB] [--disk GB]
+#   runner-docker-builder use-desktop
+#   runner-docker-builder status
+#
+# Docker Desktop on macOS builds images inside a Linux VM, paying a
+# virtualization and file-sharing tax on every build. This tool wires the
+# docker buildx CLI on a macOS self-hosted runner to a faster builder instead:
+#
+#   setup-remote   Build on a remote Linux machine over SSH (buildx "remote"
+#                  driver). This is the fastest option: builds run on native
+#                  Linux with no VM layer at all.
+#   setup-colima   Build locally via colima (a lightweight Lima VM) instead of
+#                  Docker Desktop. Slower than remote Linux but fully local.
+#   use-desktop    Revert to Docker Desktop's built-in builder.
+#   status         Show which builder is active and how it is reachable.
+#
+# All docker/buildx/colima state lives in the invoking user's $HOME. This
+# script NEVER uses sudo: it does not touch /opt or /Library/LaunchDaemons,
+# and it never sets RUNNER_ALLOW_RUNASROOT. Run it as the same non-root user
+# that the runner's LaunchDaemon runs as (see runner-setup).
+
+set -euo pipefail
+
+# ----------------------------------------------------------------------------
+# Constants / globals
+# ----------------------------------------------------------------------------
+PROG_NAME="$(basename "$0")"
+REMOTE_BUILDER_NAME="runner-remote"
+COLIMA_BUILDER_NAME="runner-colima"
+
+COMMAND=""
+SSH_HOST=""            # setup-remote: ssh://user@linux-builder (or BUILDER_SSH_HOST)
+PLATFORM=""            # optional CSV of target platforms for the builder
+COLIMA_CPU=4           # setup-colima defaults
+COLIMA_MEM=8           # GiB
+COLIMA_DISK=60         # GiB
+
+# ----------------------------------------------------------------------------
+# Output helpers — progress goes to stderr.
+# ----------------------------------------------------------------------------
+log()  { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
+step() { printf '\033[1;32m  ->\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[1;33mWARN:\033[0m %s\n' "$*" >&2; }
+err()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; }
+
+usage() {
+  cat >&2 <<EOF
+${PROG_NAME} — fast Docker image builds on macOS GitHub Actions runners
+
+USAGE:
+  ${PROG_NAME} setup-remote --host ssh://user@linux-builder [options]
+  ${PROG_NAME} setup-colima [options]
+  ${PROG_NAME} use-desktop
+  ${PROG_NAME} status
+
+COMMANDS:
+  setup-remote     Point docker buildx at a remote Linux builder over SSH
+                   (buildx remote driver, builder name: ${REMOTE_BUILDER_NAME}).
+                   Builds run on native Linux — no Docker Desktop VM overhead.
+                   Requires: docker CLI on this Mac, Docker on the remote host,
+                   and SSH key auth from this user to the remote user.
+  setup-colima     Local alternative: install colima + docker CLI + buildx via
+                   Homebrew, start a lightweight Lima VM, and wire buildx to it
+                   (builder name: ${COLIMA_BUILDER_NAME}, docker-container driver).
+  use-desktop      Revert the default builder to Docker Desktop (desktop-linux).
+  status           Show the active docker context and buildx builders.
+
+OPTIONS (setup-remote):
+  --host URL          SSH URL of the Linux builder, e.g. ssh://ci@builder.local.
+                      May also be supplied via the BUILDER_SSH_HOST env var.
+  --platform CSV      Comma-separated target platforms for the builder,
+                      e.g. linux/amd64,linux/arm64. Passed to buildx create.
+
+OPTIONS (setup-colima):
+  --cpu N             vCPUs for the colima VM (default: ${COLIMA_CPU})
+  --mem GB            Memory in GiB for the colima VM (default: ${COLIMA_MEM})
+  --disk GB           Disk in GiB for the colima VM (default: ${COLIMA_DISK})
+
+OTHER:
+  -h, --help          Show this help and exit
+
+EXAMPLES:
+  ${PROG_NAME} setup-remote --host ssh://ci@linux-builder.internal
+  BUILDER_SSH_HOST=ssh://ci@10.0.0.5 ${PROG_NAME} setup-remote \\
+      --platform linux/amd64,linux/arm64
+  ${PROG_NAME} setup-colima --cpu 6 --mem 12
+  ${PROG_NAME} use-desktop
+  ${PROG_NAME} status
+
+LAYER CACHING:
+  The named builders above pair with buildx cache backends
+  (cache-from / cache-to type=registry or type=s3) so CI builds reuse layers
+  across runner hosts. See docs/docker-builds.md for the exact
+  docker/build-push-action configuration and the benchmark methodology.
+
+SECURITY NOTE:
+  This script NEVER uses sudo and never touches /opt or LaunchDaemons; all
+  docker/buildx/colima state lives under the invoking user's \$HOME. Run it as
+  the same non-root user that runs the runner daemons. The SSH URL carries no
+  credentials — use SSH keys (optionally agent-forwarded) for the remote
+  builder, never passwords on the command line. Registry/S3 cache credentials
+  should come from environment variables or CI secrets, not CLI arguments.
+EOF
+}
+
+# ----------------------------------------------------------------------------
+# Argument parsing
+# ----------------------------------------------------------------------------
+parse_args() {
+  if [[ $# -lt 1 ]]; then
+    err "Missing command (setup-remote | setup-colima | use-desktop | status)"
+    usage
+    exit 2
+  fi
+  COMMAND="$1"; shift
+  case "${COMMAND}" in
+    setup-remote|setup-colima|use-desktop|status) ;;
+    -h|--help) usage; exit 0 ;;
+    *)
+      err "Unknown command: ${COMMAND}"
+      usage
+      exit 2 ;;
+  esac
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --host)
+        [[ $# -ge 2 ]] || { err "--host requires a value"; usage; exit 2; }
+        SSH_HOST="$2"; shift 2 ;;
+      --host=*)    SSH_HOST="${1#*=}"; shift ;;
+      --platform)
+        [[ $# -ge 2 ]] || { err "--platform requires a value"; usage; exit 2; }
+        PLATFORM="$2"; shift 2 ;;
+      --platform=*) PLATFORM="${1#*=}"; shift ;;
+      --cpu)
+        [[ $# -ge 2 ]] || { err "--cpu requires a value"; usage; exit 2; }
+        COLIMA_CPU="$2"; shift 2 ;;
+      --cpu=*)     COLIMA_CPU="${1#*=}"; shift ;;
+      --mem)
+        [[ $# -ge 2 ]] || { err "--mem requires a value"; usage; exit 2; }
+        COLIMA_MEM="$2"; shift 2 ;;
+      --mem=*)     COLIMA_MEM="${1#*=}"; shift ;;
+      --disk)
+        [[ $# -ge 2 ]] || { err "--disk requires a value"; usage; exit 2; }
+        COLIMA_DISK="$2"; shift 2 ;;
+      --disk=*)    COLIMA_DISK="${1#*=}"; shift ;;
+      -h|--help)   usage; exit 0 ;;
+      *)
+        err "Unknown argument: $1"
+        usage
+        exit 2 ;;
+    esac
+  done
+
+  # SSH host may come from the environment if not given on the CLI.
+  if [[ -z "${SSH_HOST}" && -n "${BUILDER_SSH_HOST:-}" ]]; then
+    SSH_HOST="${BUILDER_SSH_HOST}"
+  fi
+
+  case "${COMMAND}" in
+    setup-remote)
+      if [[ -z "${SSH_HOST}" ]]; then
+        err "setup-remote requires --host (or BUILDER_SSH_HOST env)"
+        usage
+        exit 2
+      fi
+      if [[ "${SSH_HOST}" != ssh://* ]]; then
+        err "--host must be an ssh:// URL (got: '${SSH_HOST}')"
+        exit 2
+      fi
+      ;;
+    setup-colima)
+      local v
+      for v in "${COLIMA_CPU}" "${COLIMA_MEM}" "${COLIMA_DISK}"; do
+        if ! [[ "${v}" =~ ^[0-9]+$ ]] || [[ "${v}" -lt 1 ]]; then
+          err "--cpu/--mem/--disk must be positive integers (got: '${v}')"
+          exit 2
+        fi
+      done
+      ;;
+  esac
+}
+
+# ----------------------------------------------------------------------------
+# Environment detection
+# ----------------------------------------------------------------------------
+detect_platform() {
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    err "This tool only supports macOS."
+    exit 1
+  fi
+}
+
+require_cmds() {
+  local missing=() c
+  for c in uname whoami sed awk head; do
+    command -v "${c}" >/dev/null 2>&1 || missing+=("${c}")
+  done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    err "Required command(s) not found: ${missing[*]}"
+    exit 1
+  fi
+}
+
+require_docker() {
+  if ! command -v docker >/dev/null 2>&1; then
+    if command -v brew >/dev/null 2>&1; then
+      log "docker CLI not found; installing via Homebrew (CLI only, not Docker Desktop)"
+      brew install docker
+    fi
+  fi
+  if ! command -v docker >/dev/null 2>&1; then
+    err "docker CLI not found. Install it with: brew install docker"
+    exit 1
+  fi
+  step "docker CLI: $(docker version --format '{{.Client.Version}}' 2>/dev/null || echo unknown)"
+}
+
+# Ensure the buildx CLI plugin is available; install via Homebrew if missing.
+ensure_buildx() {
+  if docker buildx version >/dev/null 2>&1; then
+    step "buildx: $(docker buildx version 2>/dev/null | head -n1)"
+    return 0
+  fi
+  if command -v brew >/dev/null 2>&1; then
+    log "docker buildx plugin not found; installing via Homebrew"
+    brew install docker-buildx
+  fi
+  if ! docker buildx version >/dev/null 2>&1; then
+    err "docker buildx is not available. Install it with: brew install docker-buildx"
+    err "(the plugin must land in ~/.docker/cli-plugins/ — brew does this for you)"
+    exit 1
+  fi
+  step "buildx: $(docker buildx version 2>/dev/null | head -n1)"
+}
+
+# Set the named builder as the default for this user's docker config.
+# Newer buildx supports --default; older versions make the used builder the
+# default implicitly, so fall back to a plain `use` if the flag is rejected.
+use_builder_default() {
+  local name="$1"
+  if ! docker buildx use --default "${name}" 2>/dev/null; then
+    docker buildx use "${name}"
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# setup-remote — buildx remote driver over SSH
+# ----------------------------------------------------------------------------
+setup_remote() {
+  require_docker
+  ensure_buildx
+
+  log "Setting up remote buildx builder '${REMOTE_BUILDER_NAME}' -> ${SSH_HOST}"
+
+  # Probe SSH + remote docker before creating the builder, so a bad host fails
+  # with a clear message instead of a half-created builder.
+  local ssh_target="${SSH_HOST#ssh://}"
+  step "Probing SSH connectivity to ${ssh_target}"
+  if ! ssh -o BatchMode=yes -o ConnectTimeout=5 "${ssh_target}" docker version >/dev/null 2>&1; then
+    err "Cannot reach docker on ${ssh_target} over SSH."
+    err "Check: SSH key auth works non-interactively (ssh ${ssh_target}), and the"
+    err "remote user can run docker (member of the docker group on Linux)."
+    exit 1
+  fi
+  step "Remote docker reachable"
+
+  # Idempotency: if the builder already exists with this endpoint, keep it.
+  local existing_endpoint=""
+  if docker buildx inspect "${REMOTE_BUILDER_NAME}" >/dev/null 2>&1; then
+    existing_endpoint="$(docker buildx inspect "${REMOTE_BUILDER_NAME}" 2>/dev/null \
+      | sed -n 's/^[[:space:]]*Endpoint:[[:space:]]*\(.*\)$/\1/p' | head -n1 || true)"
+    if [[ "${existing_endpoint}" == "${SSH_HOST}" ]]; then
+      step "Builder '${REMOTE_BUILDER_NAME}' already points at ${SSH_HOST} — reusing."
+    else
+      step "Builder '${REMOTE_BUILDER_NAME}' points at '${existing_endpoint:-unknown}'; recreating."
+      docker buildx rm "${REMOTE_BUILDER_NAME}" >/dev/null 2>&1 || true
+      existing_endpoint=""
+    fi
+  fi
+
+  if [[ "${existing_endpoint}" != "${SSH_HOST}" ]]; then
+    step "Creating buildx builder (remote driver)"
+    local -a create_args=(create --name "${REMOTE_BUILDER_NAME}" --driver remote)
+    if [[ -n "${PLATFORM}" ]]; then
+      create_args+=(--platform "${PLATFORM}")
+    fi
+    create_args+=("${SSH_HOST}")
+    docker buildx "${create_args[@]}"
+  fi
+
+  step "Bootstrapping and verifying builder"
+  docker buildx inspect --bootstrap "${REMOTE_BUILDER_NAME}" >/dev/null
+  use_builder_default "${REMOTE_BUILDER_NAME}"
+
+  log "Done. '${REMOTE_BUILDER_NAME}' is now the default builder."
+  log "Next: wire layer caching into your workflows — see docs/docker-builds.md"
+}
+
+# ----------------------------------------------------------------------------
+# setup-colima — local lightweight Linux VM via colima
+# ----------------------------------------------------------------------------
+setup_colima() {
+  if ! command -v brew >/dev/null 2>&1; then
+    err "Homebrew is required for setup-colima (brew install colima docker docker-buildx)."
+    exit 1
+  fi
+
+  log "Installing colima, docker CLI, and buildx via Homebrew (as $(whoami))"
+  brew install colima docker docker-buildx
+  require_docker
+  ensure_buildx
+
+  # Start colima (or restart with new sizing when the flags differ). colima
+  # start is idempotent for an already-running VM with the same config.
+  if colima status >/dev/null 2>&1; then
+    step "colima VM already running"
+  else
+    log "Starting colima VM (--cpu ${COLIMA_CPU} --memory ${COLIMA_MEM} --disk ${COLIMA_DISK})"
+    colima start --cpu "${COLIMA_CPU}" --memory "${COLIMA_MEM}" --disk "${COLIMA_DISK}"
+  fi
+
+  # Wire buildx: a docker-container driver builder on the colima context gives
+  # full cache export (type=registry/s3/local) and multi-platform support,
+  # which the plain docker driver cannot do.
+  if docker buildx inspect "${COLIMA_BUILDER_NAME}" >/dev/null 2>&1; then
+    step "Builder '${COLIMA_BUILDER_NAME}' already exists — reusing."
+  else
+    step "Creating buildx builder '${COLIMA_BUILDER_NAME}' (docker-container driver)"
+    docker buildx create --name "${COLIMA_BUILDER_NAME}" --driver docker-container
+  fi
+
+  step "Bootstrapping and verifying builder"
+  docker buildx inspect --bootstrap "${COLIMA_BUILDER_NAME}" >/dev/null
+  use_builder_default "${COLIMA_BUILDER_NAME}"
+
+  log "Done. '${COLIMA_BUILDER_NAME}' is now the default builder."
+  log "Next: wire layer caching into your workflows — see docs/docker-builds.md"
+}
+
+# ----------------------------------------------------------------------------
+# use-desktop — revert to Docker Desktop's builder
+# ----------------------------------------------------------------------------
+use_desktop() {
+  require_docker
+  ensure_buildx
+
+  log "Reverting default builder to Docker Desktop"
+  # Docker Desktop registers a builder named desktop-linux. If it is absent
+  # (Docker Desktop not installed/running), fall back to the plain 'default'
+  # docker-driver builder and warn.
+  if docker buildx inspect desktop-linux >/dev/null 2>&1; then
+    use_builder_default desktop-linux
+    docker context use desktop-linux >/dev/null 2>&1 || true
+    log "Default builder is now 'desktop-linux' (Docker Desktop)."
+  else
+    warn "Builder 'desktop-linux' not found — is Docker Desktop installed and running?"
+    warn "Falling back to the plain 'default' builder for the current context."
+    use_builder_default default
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# status — show active context and builders (parse without jq)
+# ----------------------------------------------------------------------------
+status() {
+  require_docker
+
+  log "docker context"
+  local ctx
+  ctx="$(docker context show 2>/dev/null || true)"
+  step "current context: ${ctx:-unknown}"
+
+  log "buildx builders (* = default for this user)"
+  docker buildx ls 2>/dev/null | sed 's/^/  /' >&2 || warn "docker buildx ls failed"
+
+  local default_builder=""
+  default_builder="$(docker buildx ls 2>/dev/null | awk '$1=="*"{print $2; exit}' || true)"
+  printf '\n'
+  if [[ -n "${default_builder}" ]]; then
+    step "default builder: ${default_builder}"
+    case "${default_builder}" in
+      "${REMOTE_BUILDER_NAME}")  step "mode: remote Linux builder (no VM overhead)" ;;
+      "${COLIMA_BUILDER_NAME}")  step "mode: local colima VM" ;;
+      desktop-linux)             step "mode: Docker Desktop VM (slow path)" ;;
+      *)                         step "mode: other" ;;
+    esac
+  else
+    warn "Could not determine the default builder."
+  fi
+
+  if command -v colima >/dev/null 2>&1; then
+    printf '\n'
+    log "colima"
+    colima status 2>&1 | sed 's/^/  /' >&2 || step "colima VM not running"
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+main() {
+  parse_args "$@"
+  detect_platform
+  require_cmds
+
+  case "${COMMAND}" in
+    setup-remote) setup_remote ;;
+    setup-colima) setup_colima ;;
+    use-desktop)  use_desktop ;;
+    status)       status ;;
+  esac
+}
+
+main "$@"
