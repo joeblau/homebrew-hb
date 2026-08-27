@@ -1,0 +1,561 @@
+#!/usr/bin/env bash
+#
+# runner-token — mint short-lived GitHub Actions runner tokens on demand (macOS)
+#
+# Usage:
+#   runner-token registration (--org ORG | --repo OWNER/REPO) [--keychain-item NAME]
+#   runner-token removal      (--org ORG | --repo OWNER/REPO) [--keychain-item NAME]
+#   runner-token audit
+#
+# Registration and removal tokens are only valid for ~1 hour, so the safe way to
+# use them is to fetch one seconds before config.sh needs it instead of pasting
+# a token into a shell (where it lands in history) or an env file (where it
+# lingers on disk). This helper does exactly that: it prints ONLY the token to
+# stdout, so it composes with runner-setup / runner-cleanup:
+#
+#   RUNNER_TOKEN=$(runner-token registration --org acme) runner-setup --org acme
+#   runner-cleanup --all --yes --token "$(runner-token removal --org acme)"
+#
+# The *authorizing* credential used to mint the token comes from, in priority
+# order (first fully-configured backend wins):
+#   1. A GitHub App (GH_APP_ID + GH_APP_INSTALLATION_ID + GH_APP_KEY or
+#      GH_APP_KEY_PATH): we sign a short-lived RS256 JWT with openssl and
+#      exchange it for an installation access token. Least privilege: the app
+#      only needs "Self-hosted runners" (org) or "Administration" (repo) write.
+#   2. A fine-grained PAT from the GITHUB_PAT env var.
+#   3. The macOS Keychain, when --keychain-item NAME is given explicitly: the
+#      PAT is read with `security find-generic-password -w` and never lives in
+#      the shell environment.
+#
+# `audit` scans /opt/github-runners and the runner-setup LaunchDaemon plists for
+# anything that looks like a persisted token (ghp_/github_pat_/private-key
+# patterns, stray .env files, unexpected EnvironmentVariables keys) and reports
+# findings WITHOUT printing the secret values.
+#
+# No sudo anywhere: runner dirs are owned by the invoking user and the
+# LaunchDaemon plists are world-readable. No jq: JSON is parsed with sed/grep.
+
+set -euo pipefail
+
+# ----------------------------------------------------------------------------
+# Constants / globals
+# ----------------------------------------------------------------------------
+PROG_NAME="$(basename "$0")"
+RUNNER_ROOT="/opt/github-runners"
+LAUNCH_DAEMON_DIR="/Library/LaunchDaemons"
+API_BASE="${GITHUB_API_URL:-https://api.github.com}"
+
+COMMAND=""            # registration | removal | audit
+ORG=""
+REPO=""
+KEYCHAIN_ITEM=""
+
+WORK_TMPDIR=""
+APP_KEY_FILE=""       # PEM file used for JWT signing (temp file if inline key)
+CURL_CFG=""           # curl --config file holding the Authorization header,
+                      # so the credential NEVER appears in `ps`
+BACKEND=""            # github-app | keychain | env-pat (for stderr progress)
+AUTH_TOKEN=""         # installation access token or PAT; never logged
+FINDINGS=0            # audit: number of findings reported
+
+# ----------------------------------------------------------------------------
+# Output helpers — progress goes to stderr; credentials are NEVER interpolated.
+# ----------------------------------------------------------------------------
+log()  { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
+step() { printf '\033[1;32m  ->\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[1;33mWARN:\033[0m %s\n' "$*" >&2; }
+err()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; }
+
+usage() {
+  cat >&2 <<EOF
+${PROG_NAME} — mint short-lived runner tokens on demand (registration/removal/audit)
+
+USAGE:
+  ${PROG_NAME} registration (--org ORG | --repo OWNER/REPO) [--keychain-item NAME]
+  ${PROG_NAME} removal      (--org ORG | --repo OWNER/REPO) [--keychain-item NAME]
+  ${PROG_NAME} audit
+
+COMMANDS:
+  registration   Mint a runner REGISTRATION token for the scope. The token is
+                 printed ALONE on stdout (progress goes to stderr) so it can be
+                 captured: RUNNER_TOKEN=\$(${PROG_NAME} registration --org acme)
+  removal        Mint a runner REMOVAL token (a registration token CANNOT be
+                 used to remove a runner); pair with runner-cleanup.
+  audit          Scan ${RUNNER_ROOT} and ${LAUNCH_DAEMON_DIR}/com.github.runner-*.plist
+                 for persisted tokens (ghp_/github_pat_/private-key patterns,
+                 .env files, unexpected plist EnvironmentVariables keys, loose
+                 permissions on .runner/.credentials). Findings are reported
+                 WITHOUT printing the secret values. Exit 0 = clean, 1 = findings.
+
+SCOPE (choose exactly ONE for registration/removal):
+  --org ORG_NAME        Organization runner token.
+  --repo OWNER/REPO     Repository runner token.
+
+AUTHORIZATION BACKENDS (first fully-configured one wins):
+  1. GitHub App (preferred — least privilege, auditable):
+       GH_APP_ID                App ID
+       GH_APP_INSTALLATION_ID   Installation ID for the org/account
+       GH_APP_KEY               PEM private key, OR a path to the PEM file
+       GH_APP_KEY_PATH          Path to the PEM private key (alternative)
+     An RS256 JWT (valid ~9 min) is signed with openssl and exchanged for an
+     installation access token, which is then used to mint the runner token.
+  2. Fine-grained PAT via the GITHUB_PAT env var. Needs "Self-hosted runners"
+     (organization, write) or "Administration" (repository, write) only.
+  3. macOS Keychain, when --keychain-item NAME is passed explicitly:
+       security add-generic-password -s NAME -a "\$USER" -w
+     The PAT is read straight from the Keychain and never sits in the shell
+     environment. May trigger a Keychain unlock prompt.
+
+OPTIONS:
+  --keychain-item NAME  Read the PAT from a generic Keychain item (service NAME).
+  -h, --help            Show this help and exit.
+
+ENVIRONMENT:
+  GITHUB_API_URL        API base URL (default: https://api.github.com); set to
+                        https://HOST/api/v3 for GitHub Enterprise Server.
+
+EXAMPLES:
+  RUNNER_TOKEN=\$(${PROG_NAME} registration --org acme) runner-setup --org acme
+  ${PROG_NAME} removal --repo acme/monorepo --keychain-item gh-runner-pat
+  ${PROG_NAME} audit
+
+SECURITY NOTE:
+  The minted runner token is valid for ~1 hour and is the ONLY thing printed to
+  stdout. The authorizing credential (installation token / PAT) is passed to
+  curl through a 0600 --config file so it never appears in 'ps', and is never
+  written to logs, runner directories, or LaunchDaemon plists. Registration and
+  removal tokens must never be stored under ${RUNNER_ROOT} — run
+  '${PROG_NAME} audit' to check.
+EOF
+}
+
+# ----------------------------------------------------------------------------
+# Cleanup / signal traps
+# ----------------------------------------------------------------------------
+cleanup() {
+  local code=$?
+  if [[ -n "${WORK_TMPDIR}" && -d "${WORK_TMPDIR}" ]]; then
+    rm -rf "${WORK_TMPDIR}" 2>/dev/null || true
+  fi
+  return "${code}"
+}
+trap cleanup EXIT
+trap 'err "Interrupted."; exit 130' INT TERM
+
+# ----------------------------------------------------------------------------
+# Argument parsing
+# ----------------------------------------------------------------------------
+parse_args() {
+  if [[ $# -lt 1 ]]; then
+    err "Missing command."
+    usage
+    exit 2
+  fi
+
+  case "$1" in
+    registration|removal|audit) COMMAND="$1"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) err "Unknown command: $1 (expected registration, removal, or audit)"; usage; exit 2 ;;
+  esac
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --org)
+        [[ $# -ge 2 ]] || { err "--org requires a value"; usage; exit 2; }
+        ORG="$2"; shift 2 ;;
+      --org=*)     ORG="${1#*=}"; shift ;;
+      --repo)
+        [[ $# -ge 2 ]] || { err "--repo requires a value"; usage; exit 2; }
+        REPO="$2"; shift 2 ;;
+      --repo=*)    REPO="${1#*=}"; shift ;;
+      --keychain-item)
+        [[ $# -ge 2 ]] || { err "--keychain-item requires a value"; usage; exit 2; }
+        KEYCHAIN_ITEM="$2"; shift 2 ;;
+      --keychain-item=*) KEYCHAIN_ITEM="${1#*=}"; shift ;;
+      -h|--help)   usage; exit 0 ;;
+      *)
+        err "Unknown argument: $1"
+        usage
+        exit 2 ;;
+    esac
+  done
+
+  if [[ "${COMMAND}" == "audit" ]]; then
+    if [[ -n "${ORG}" || -n "${REPO}" || -n "${KEYCHAIN_ITEM}" ]]; then
+      err "audit takes no scope or credential arguments."
+      usage
+      exit 2
+    fi
+    return 0
+  fi
+
+  # Exactly one registration scope must be chosen (org vs repo).
+  local scope_count=0
+  [[ -z "${ORG}" ]]  || scope_count=$((scope_count + 1))
+  [[ -z "${REPO}" ]] || scope_count=$((scope_count + 1))
+  if [[ "${scope_count}" -ne 1 ]]; then
+    err "Choose exactly one of --org or --repo (got ${scope_count})."
+    usage
+    exit 2
+  fi
+
+  if [[ -n "${REPO}" ]] && ! [[ "${REPO}" =~ ^[^/]+/[^/]+$ ]]; then
+    err "--repo must be in OWNER/REPO form (got: '${REPO}')"
+    exit 2
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# Environment detection
+# ----------------------------------------------------------------------------
+detect_platform() {
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    err "This tool only supports macOS."
+    exit 1
+  fi
+}
+
+require_cmds() {
+  local missing=() c
+  for c in curl openssl sed grep tr date mktemp uname; do
+    command -v "${c}" >/dev/null 2>&1 || missing+=("${c}")
+  done
+  if [[ "${COMMAND}" != "audit" && -n "${KEYCHAIN_ITEM}" ]]; then
+    command -v security >/dev/null 2>&1 || missing+=("security")
+  fi
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    err "Required command(s) not found: ${missing[*]}"
+    exit 1
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# Authorization backends
+# ----------------------------------------------------------------------------
+
+# base64url encode stdin (no padding), per RFC 7515.
+b64url() {
+  openssl base64 -e -A | tr '+/' '-_' | tr -d '='
+}
+
+# Resolve the GitHub App private key to a readable PEM file. GH_APP_KEY may be
+# a path OR the inline PEM itself; GH_APP_KEY_PATH is always a path. Inline PEM
+# is staged in the 0700 work tmpdir (multi-line env values are awkward to keep
+# intact, so a path is the better practice — see docs/token-management.md).
+resolve_app_key() {
+  local key_src="${GH_APP_KEY:-}"
+  if [[ -z "${key_src}" && -n "${GH_APP_KEY_PATH:-}" ]]; then
+    key_src="${GH_APP_KEY_PATH}"
+  fi
+
+  if [[ -z "${key_src}" ]]; then
+    err "GitHub App backend: GH_APP_ID/GH_APP_INSTALLATION_ID are set but no"
+    err "private key was given (GH_APP_KEY or GH_APP_KEY_PATH)."
+    exit 1
+  fi
+
+  if [[ -f "${key_src}" ]]; then
+    APP_KEY_FILE="${key_src}"
+  else
+    case "${key_src}" in
+      -----BEGIN*PRIVATE\ KEY-----*)
+        APP_KEY_FILE="${WORK_TMPDIR}/app-key.pem"
+        printf '%s\n' "${key_src}" > "${APP_KEY_FILE}"
+        chmod 600 "${APP_KEY_FILE}"
+        ;;
+      *)
+        err "GitHub App backend: '${key_src}' is neither a readable file nor a PEM key."
+        exit 1
+        ;;
+    esac
+  fi
+
+  # Sanity-check the key parses before we try to sign with it.
+  if ! openssl rsa -in "${APP_KEY_FILE}" -check -noout >/dev/null 2>&1; then
+    err "GitHub App backend: private key failed 'openssl rsa -check'."
+    exit 1
+  fi
+}
+
+# Sign an RS256 JWT for the GitHub App and exchange it for an installation
+# access token. The JWT lives ~9 minutes (GitHub caps exp at iat+10min); the
+# installation token it buys lives ~1 hour.
+backend_github_app() {
+  resolve_app_key
+
+  log "Authorizing via GitHub App ${GH_APP_ID} (installation ${GH_APP_INSTALLATION_ID})"
+  local now iat exp header payload signing_input sig jwt
+  now="$(date +%s)"
+  iat=$((now - 60))      # 60s of clock-skew allowance
+  exp=$((now + 540))     # 9 minutes, safely under GitHub's 10-minute cap
+  header='{"alg":"RS256","typ":"JWT"}'
+  payload="{\"iat\":${iat},\"exp\":${exp},\"iss\":\"${GH_APP_ID}\"}"
+  signing_input="$(printf '%s' "${header}" | b64url).$(printf '%s' "${payload}" | b64url)"
+  if ! sig="$(printf '%s' "${signing_input}" \
+      | openssl dgst -sha256 -sign "${APP_KEY_FILE}" | b64url)"; then
+    err "Failed to sign the app JWT with ${APP_KEY_FILE}."
+    exit 1
+  fi
+  jwt="${signing_input}.${sig}"
+
+  step "Exchanging JWT for an installation access token"
+  write_curl_config "${jwt}"
+  local json
+  if ! json="$(curl -fsSL --retry 3 --retry-delay 2 \
+      --config "${CURL_CFG}" -X POST -d '' \
+      "${API_BASE}/app/installations/${GH_APP_INSTALLATION_ID}/access_tokens")"; then
+    err "Could not mint an installation access token (check GH_APP_ID,"
+    err "GH_APP_INSTALLATION_ID, and that the key matches the app)."
+    exit 1
+  fi
+
+  AUTH_TOKEN="$(printf '%s\n' "${json}" \
+    | grep -m1 '"token"' \
+    | sed -E 's/.*"token"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' || true)"
+  if [[ -z "${AUTH_TOKEN}" ]]; then
+    err "Could not parse an installation access token from the API response."
+    exit 1
+  fi
+  BACKEND="github-app"
+  step "Installation access token acquired (expires ~1h)"
+}
+
+# PAT straight from the macOS Keychain; never touches the shell environment.
+backend_keychain() {
+  log "Reading PAT from Keychain item '${KEYCHAIN_ITEM}'"
+  if ! AUTH_TOKEN="$(security find-generic-password -s "${KEYCHAIN_ITEM}" -w 2>/dev/null)"; then
+    err "Keychain item '${KEYCHAIN_ITEM}' not found or unreadable."
+    err "Create it with: security add-generic-password -s '${KEYCHAIN_ITEM}' -a \"\${USER}\" -w"
+    exit 1
+  fi
+  if [[ -z "${AUTH_TOKEN}" ]]; then
+    err "Keychain item '${KEYCHAIN_ITEM}' is empty."
+    exit 1
+  fi
+  BACKEND="keychain"
+}
+
+backend_env_pat() {
+  log "Authorizing via GITHUB_PAT env var"
+  AUTH_TOKEN="${GITHUB_PAT}"
+  BACKEND="env-pat"
+}
+
+# Pick the authorizing credential. Explicit --keychain-item wins; otherwise the
+# GitHub App (when fully configured), then the GITHUB_PAT env var.
+resolve_auth() {
+  if [[ -n "${KEYCHAIN_ITEM}" ]]; then
+    backend_keychain
+  elif [[ -n "${GH_APP_ID:-}" && -n "${GH_APP_INSTALLATION_ID:-}" ]]; then
+    backend_github_app
+  elif [[ -n "${GITHUB_PAT:-}" ]]; then
+    if [[ -n "${GH_APP_ID:-}" || -n "${GH_APP_INSTALLATION_ID:-}" ]]; then
+      warn "GitHub App env is partially set (need GH_APP_ID + GH_APP_INSTALLATION_ID"
+      warn "+ GH_APP_KEY/GH_APP_KEY_PATH); falling back to GITHUB_PAT."
+    fi
+    backend_env_pat
+  else
+    err "No authorization backend available. Provide one of:"
+    err "  1. GitHub App: GH_APP_ID + GH_APP_INSTALLATION_ID + GH_APP_KEY (or GH_APP_KEY_PATH)"
+    err "  2. GITHUB_PAT env var (fine-grained PAT)"
+    err "  3. --keychain-item NAME (PAT stored in the macOS Keychain)"
+    exit 1
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# GitHub API (no jq; credential kept out of `ps` via a 0600 curl --config file)
+# ----------------------------------------------------------------------------
+
+# curl reads headers from this file instead of the command line, so the bearer
+# credential never shows up in `ps` for other local users. The file lives in a
+# 0700 mktemp dir and is removed by the EXIT trap.
+write_curl_config() {
+  WORK_TMPDIR="${WORK_TMPDIR:-$(mktemp -d "${TMPDIR:-/tmp}/runner-token.XXXXXX")}"
+  chmod 700 "${WORK_TMPDIR}" 2>/dev/null || true
+  CURL_CFG="${WORK_TMPDIR}/curl.cfg"
+  {
+    printf 'header = "Authorization: Bearer %s"\n' "$1"
+    printf 'header = "Accept: application/vnd.github+json"\n'
+    printf 'header = "X-GitHub-Api-Version: 2022-11-28"\n'
+  } > "${CURL_CFG}"
+  chmod 600 "${CURL_CFG}"
+}
+
+# POST to a runner-token endpoint and print ONLY the minted token to stdout.
+mint_token() {
+  local path="$1" json token
+  if ! json="$(curl -fsSL --retry 3 --retry-delay 2 \
+      --config "${CURL_CFG}" -X POST -d '' "${API_BASE}${path}")"; then
+    err "GitHub API call failed: POST ${path}"
+    err "Check the scope and that your credential has the required permission:"
+    err "  org:  'Self-hosted runners' (write);  repo: 'Administration' (write)."
+    exit 1
+  fi
+
+  # The trailing `|| true` is REQUIRED: with `set -euo pipefail` a plain
+  # assignment whose pipeline fails (e.g. grep finds no "token" key in an
+  # error-shaped but HTTP-200 body) would abort BEFORE the emptiness check.
+  token="$(printf '%s\n' "${json}" \
+    | grep -m1 '"token"' \
+    | sed -E 's/.*"token"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' || true)"
+  if [[ -z "${token}" ]]; then
+    err "Could not parse a token from the API response for POST ${path}."
+    exit 1
+  fi
+  printf '%s\n' "${token}"
+}
+
+# ----------------------------------------------------------------------------
+# audit — look for persisted secrets; report paths, NEVER the secret values
+# ----------------------------------------------------------------------------
+
+# Extended regex matching GitHub's well-known secret shapes plus PEM blocks.
+TOKEN_PATTERN='(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{22,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)'
+
+finding() {
+  FINDINGS=$((FINDINGS + 1))
+  printf '  FINDING: %s\n' "$1"
+}
+
+audit_runner_dirs() {
+  if [[ ! -d "${RUNNER_ROOT}" ]]; then
+    step "${RUNNER_ROOT} does not exist; skipping directory scan."
+    return 0
+  fi
+
+  log "Scanning ${RUNNER_ROOT} for persisted token patterns"
+  # -I skips binaries (bin/, externals/), -l prints only the path (never the
+  # matched secret), first match per file. Files unreadable by this user are
+  # reported separately below.
+  local hits f
+  hits="$(grep -rlIE "${TOKEN_PATTERN}" "${RUNNER_ROOT}" 2>/dev/null || true)"
+  # Heredoc (not a `| while` pipeline) so the loop runs in THIS shell and the
+  # FINDINGS counter actually increments.
+  while IFS= read -r f; do
+    [[ -n "${f}" ]] || continue
+    finding "token-like material in ${f} — remove it and rotate the credential"
+  done <<EOF
+${hits}
+EOF
+
+  log "Checking for stray env/dotenv files"
+  while IFS= read -r f; do
+    [[ -n "${f}" ]] || continue
+    finding "env file ${f} — secrets belong in the Keychain or env vars, not on disk"
+  done <<EOF
+$(find "${RUNNER_ROOT}" -type f \( -name '.env' -o -name '.env.*' -o -name '*.env' \) 2>/dev/null || true)
+EOF
+
+  log "Checking permissions on runner state files"
+  local state perm
+  for state in .runner .credentials .credentials_rsaparams; do
+    while IFS= read -r f; do
+      [[ -n "${f}" ]] || continue
+      perm="$(stat -f '%Lp' "${f}" 2>/dev/null || echo "")"
+      [[ -n "${perm}" ]] || continue
+      # Strip leading zeros: 600 ok; anything granting group/other bits is not.
+      if [[ "${perm}" != "600" && "${perm}" != "400" ]]; then
+        finding "${f} is mode ${perm} — runner credentials should be 0600"
+      fi
+    done <<EOF
+$(find "${RUNNER_ROOT}" -type f -name "${state}" 2>/dev/null || true)
+EOF
+  done
+
+  local unreadable
+  unreadable="$(find "${RUNNER_ROOT}" -type d ! -readable 2>/dev/null | head -n 5 || true)"
+  if [[ -n "${unreadable}" ]]; then
+    warn "Some directories under ${RUNNER_ROOT} are not readable by $(whoami);"
+    warn "the scan above is partial. Re-run as the runner owner for full coverage."
+  fi
+}
+
+audit_plists() {
+  log "Scanning LaunchDaemon plists in ${LAUNCH_DAEMON_DIR}"
+  local plist label key val_found
+  shopt -s nullglob
+  for plist in "${LAUNCH_DAEMON_DIR}"/com.github.runner-*.plist; do
+    label="$(basename "${plist}" .plist)"
+    if [[ ! -r "${plist}" ]]; then
+      warn "${plist} is not readable; skipping."
+      continue
+    fi
+
+    # Token-shaped values anywhere in the plist.
+    if grep -qIE "${TOKEN_PATTERN}" "${plist}" 2>/dev/null; then
+      finding "${plist} embeds token-like material — plists must never carry secrets"
+    fi
+
+    # EnvironmentVariables keys: runner-setup only ever writes HOME and
+    # ACTIONS_RUNNER_SVC. Extract keys of the FIRST <dict> after the
+    # EnvironmentVariables key with awk (bash 3.2-safe, no plutil -p dependence).
+    local env_keys
+    env_keys="$(awk '
+      /<key>EnvironmentVariables<\/key>/ { in_env=1; next }
+      in_env && /<dict>/ { in_dict=1; next }
+      in_dict && /<key>/ {
+        k=$0; gsub(/.*<key>/, "", k); gsub(/<\/key>.*/, "", k); print k; next
+      }
+      in_dict && /<\/dict>/ { exit }
+    ' "${plist}" 2>/dev/null || true)"
+
+    while IFS= read -r key; do
+      [[ -n "${key}" ]] || continue
+      case "${key}" in
+        HOME|ACTIONS_RUNNER_SVC) ;;
+        *TOKEN*|*SECRET*|*PASSWORD*|*PAT*|*KEY*)
+          finding "${plist} sets suspicious env key '${key}' — credentials do not belong in LaunchDaemons" ;;
+        *)
+          finding "${plist} sets unexpected env key '${key}' (expected only HOME/ACTIONS_RUNNER_SVC)" ;;
+      esac
+    done <<EOF
+${env_keys}
+EOF
+  done
+  shopt -u nullglob
+}
+
+run_audit() {
+  audit_runner_dirs
+  audit_plists
+
+  printf '\n'
+  if [[ "${FINDINGS}" -gt 0 ]]; then
+    printf '==> Audit: %d finding(s). Remove the persisted secrets and rotate them.\n' "${FINDINGS}"
+    printf '    Runner tokens should be minted on demand: %s registration --org ORG\n' "${PROG_NAME}"
+    return 1
+  fi
+  printf '==> Audit: no persisted tokens found.\n'
+  return 0
+}
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+main() {
+  parse_args "$@"
+  detect_platform
+  require_cmds
+
+  if [[ "${COMMAND}" == "audit" ]]; then
+    run_audit
+    return $?
+  fi
+
+  resolve_auth
+  write_curl_config "${AUTH_TOKEN}"
+
+  local kind path
+  if [[ "${COMMAND}" == "registration" ]]; then kind="registration-token"; else kind="remove-token"; fi
+  if [[ -n "${ORG}" ]]; then
+    path="/orgs/${ORG}/actions/runners/${kind}"
+  else
+    path="/repos/${REPO}/actions/runners/${kind}"
+  fi
+
+  log "Minting a ${COMMAND} token (${BACKEND} backend, expires ~1h)"
+  mint_token "${path}"
+}
+
+main "$@"
