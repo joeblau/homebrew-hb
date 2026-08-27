@@ -1,0 +1,705 @@
+#!/usr/bin/env bash
+#
+# runner-health — watchdog for GitHub Actions self-hosted runners on macOS
+#
+# Usage:
+#   runner-health --once [--org ORG | --repo OWNER/REPO] [options]
+#   runner-health [--interval SECONDS]            # watch mode (default)
+#
+# For every runner-N under /opt/github-runners it checks, each pass:
+#   1. launchd state — `launchctl print system/com.github.runner-N` must report
+#      the service loaded; its `state` and `last exit code` are inspected.
+#   2. Diag freshness — the newest _diag/*.log must be younger than
+#      --stale-minutes (default 15) while the service claims to be running,
+#      and the newest Runner_*.log must contain 'Listening for Jobs'.
+#   3. GitHub API (optional, needs --org/--repo + GITHUB_PAT) — the runner's
+#      status/busy fields; a runner busy longer than --busy-timeout-minutes
+#      (default 120) is flagged as stuck.
+#
+# Remediation:
+#   - stuck busy / stale diag while running  -> launchctl kickstart -k
+#   - offline / unregistered / not running   -> bootout + bootstrap
+#   - daemon AND plist both missing          -> no local fix; runner-setup must
+#                                               be re-run (alert only)
+#
+# Alerting: a structured log line is written to stdout for EVERY runner on
+# EVERY pass, and when ALERT_WEBHOOK_URL is set a Slack-compatible JSON payload
+# is POSTed once per incident (repeat alerts are suppressed until the runner
+# recovers). See docs/health-checks.md for a launchd StartInterval plist.
+#
+# Like runner-setup, sudo is used ONLY for launchctl system-domain operations
+# and /opt; it never starts runner processes itself and never sets
+# RUNNER_ALLOW_RUNASROOT. It may run as root (the intended LaunchDaemon
+# deployment) — in that case sudo is skipped entirely.
+
+set -euo pipefail
+
+# ----------------------------------------------------------------------------
+# Constants / globals
+# ----------------------------------------------------------------------------
+PROG_NAME="$(basename "$0")"
+RUNNER_ROOT="/opt/github-runners"
+LAUNCH_DAEMON_DIR="/Library/LaunchDaemons"
+GITHUB_API="https://api.github.com"
+DEFAULT_STALE_MINUTES=15
+DEFAULT_BUSY_TIMEOUT_MINUTES=120
+DEFAULT_INTERVAL=300
+
+STALE_MINUTES="${DEFAULT_STALE_MINUTES}"
+BUSY_TIMEOUT_MINUTES="${DEFAULT_BUSY_TIMEOUT_MINUTES}"
+INTERVAL="${DEFAULT_INTERVAL}"
+ONCE=0
+
+ORG=""
+REPO=""
+
+# State persisted across passes: busy-since timestamps and alert-suppression
+# markers. Lives next to the runners so it is shared no matter who invokes us
+# (root LaunchDaemon or a manual user run).
+STATE_DIR="${RUNNER_ROOT}/.health"
+
+SUDO=""               # "sudo" when non-root, empty when running as root
+HOST_LABEL=""         # sanitized machine name, used in alerts/log lines
+WORK_TMPDIR=""
+API_ENABLED=0         # 1 when this pass has a usable GitHub runners list
+API_JSON=""
+
+declare -a RUNNER_NAMES=()
+declare -a STATUS_NAME=()
+declare -a STATUS_RESULT=()
+
+# ----------------------------------------------------------------------------
+# Output helpers — progress goes to stderr; GITHUB_PAT / ALERT_WEBHOOK_URL are
+# NEVER interpolated into any output or command line.
+# ----------------------------------------------------------------------------
+log()  { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
+step() { printf '\033[1;32m  ->\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[1;33mWARN:\033[0m %s\n' "$*" >&2; }
+err()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; }
+
+usage() {
+  cat >&2 <<EOF
+${PROG_NAME} — health checks and alerting for GitHub Actions runners on macOS
+
+USAGE:
+  ${PROG_NAME} --once [--org ORG | --repo OWNER/REPO] [options]
+  ${PROG_NAME} [--interval SECONDS] [options]     # watch mode (default)
+
+OPTIONS:
+  --once                    Run a single check pass and exit (for launchd
+                            StartInterval timers and cron). Exit status is 0
+                            when every runner is healthy or was successfully
+                            remediated, 1 when any issue could not be fixed.
+  --interval SECONDS        Delay between passes in watch mode
+                            (default: ${DEFAULT_INTERVAL}).
+  --stale-minutes N         A running service whose newest _diag log is older
+                            than this is considered stale and is restarted
+                            (default: ${DEFAULT_STALE_MINUTES}).
+  --busy-timeout-minutes N  A runner the GitHub API reports as busy for longer
+                            than this is considered stuck and is restarted
+                            (default: ${DEFAULT_BUSY_TIMEOUT_MINUTES}). Requires
+                            --org/--repo + GITHUB_PAT; tracked across passes in
+                            ${STATE_DIR}.
+  --org ORG_NAME            Also query GET /orgs/ORG_NAME/actions/runners for
+                            online/offline/busy status of each runner.
+  --repo OWNER/REPO         Same, against GET /repos/OWNER/REPO/actions/runners.
+  -h, --help                Show this help and exit.
+
+ENVIRONMENT:
+  GITHUB_PAT                Personal access token for the API checks (read via a
+                            curl config file, never placed on a command line).
+                            Needs the org/repo 'Administration' (self-hosted
+                            runners) read scope. Without it, --org/--repo are
+                            ignored and only local checks run.
+  ALERT_WEBHOOK_URL         Slack-compatible incoming webhook. When set, a
+                            {"text": ...} JSON payload is POSTed once per
+                            incident; a structured log line is always written
+                            to stdout regardless.
+
+EXAMPLES:
+  ${PROG_NAME} --once
+  GITHUB_PAT=ghp_... ALERT_WEBHOOK_URL=https://hooks.slack.com/services/... \
+    ${PROG_NAME} --once --org acme
+  ${PROG_NAME} --repo acme/monorepo --interval 600
+
+SECURITY NOTE:
+  Both secrets come from the ENVIRONMENT ONLY and are passed to curl through a
+  0600 config file in a private temp dir, so they never appear in 'ps' output
+  or in logs. When deploying via a LaunchDaemon plist, 'chmod 600' the plist —
+  LaunchDaemon plists are world-readable by default and would expose them.
+
+  This script uses sudo (when not already root) ONLY for launchctl
+  system-domain operations and state under ${RUNNER_ROOT}; it never runs the
+  runner processes themselves and never sets RUNNER_ALLOW_RUNASROOT.
+EOF
+}
+
+# ----------------------------------------------------------------------------
+# Cleanup / signal traps
+# ----------------------------------------------------------------------------
+cleanup() {
+  local code=$?
+  if [[ -n "${WORK_TMPDIR}" && -d "${WORK_TMPDIR}" ]]; then
+    rm -rf "${WORK_TMPDIR}" 2>/dev/null || true
+  fi
+  return "${code}"
+}
+trap cleanup EXIT
+trap 'err "Interrupted."; exit 130' INT TERM
+
+# ----------------------------------------------------------------------------
+# Argument parsing
+# ----------------------------------------------------------------------------
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --once)      ONCE=1; shift ;;
+      --interval)
+        [[ $# -ge 2 ]] || { err "--interval requires a value"; usage; exit 2; }
+        INTERVAL="$2"; shift 2 ;;
+      --interval=*) INTERVAL="${1#*=}"; shift ;;
+      --stale-minutes)
+        [[ $# -ge 2 ]] || { err "--stale-minutes requires a value"; usage; exit 2; }
+        STALE_MINUTES="$2"; shift 2 ;;
+      --stale-minutes=*) STALE_MINUTES="${1#*=}"; shift ;;
+      --busy-timeout-minutes)
+        [[ $# -ge 2 ]] || { err "--busy-timeout-minutes requires a value"; usage; exit 2; }
+        BUSY_TIMEOUT_MINUTES="$2"; shift 2 ;;
+      --busy-timeout-minutes=*) BUSY_TIMEOUT_MINUTES="${1#*=}"; shift ;;
+      --org)
+        [[ $# -ge 2 ]] || { err "--org requires a value"; usage; exit 2; }
+        ORG="$2"; shift 2 ;;
+      --org=*)     ORG="${1#*=}"; shift ;;
+      --repo)
+        [[ $# -ge 2 ]] || { err "--repo requires a value"; usage; exit 2; }
+        REPO="$2"; shift 2 ;;
+      --repo=*)    REPO="${1#*=}"; shift ;;
+      -h|--help)   usage; exit 0 ;;
+      *)
+        err "Unknown argument: $1"
+        usage
+        exit 2 ;;
+    esac
+  done
+
+  if [[ -n "${ORG}" && -n "${REPO}" ]]; then
+    err "Choose only one of --org or --repo."
+    usage
+    exit 2
+  fi
+  if [[ -n "${REPO}" ]] && ! [[ "${REPO}" =~ ^[^/]+/[^/]+$ ]]; then
+    err "--repo must be in OWNER/REPO form (got: '${REPO}')"
+    exit 2
+  fi
+  if ! [[ "${STALE_MINUTES}" =~ ^[0-9]+$ ]] || [[ "${STALE_MINUTES}" -lt 1 ]]; then
+    err "--stale-minutes must be a positive integer (got: '${STALE_MINUTES}')"
+    exit 2
+  fi
+  if ! [[ "${BUSY_TIMEOUT_MINUTES}" =~ ^[0-9]+$ ]] || [[ "${BUSY_TIMEOUT_MINUTES}" -lt 1 ]]; then
+    err "--busy-timeout-minutes must be a positive integer (got: '${BUSY_TIMEOUT_MINUTES}')"
+    exit 2
+  fi
+  if ! [[ "${INTERVAL}" =~ ^[0-9]+$ ]] || [[ "${INTERVAL}" -lt 1 ]]; then
+    err "--interval must be a positive integer (got: '${INTERVAL}')"
+    exit 2
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# Environment detection (mirrors runner-setup / runner-cleanup)
+# ----------------------------------------------------------------------------
+detect_platform() {
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    err "This tool only supports macOS."
+    exit 1
+  fi
+}
+
+require_cmds() {
+  local missing=() c
+  for c in uname id sudo launchctl curl stat date sed grep tr hostname scutil mktemp ls rm cat; do
+    command -v "${c}" >/dev/null 2>&1 || missing+=("${c}")
+  done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    err "Required command(s) not found: ${missing[*]}"
+    exit 1
+  fi
+}
+
+# Sanitized machine name for alert text / structured log lines (same scheme as
+# runner-setup's runner-name prefix).
+detect_host() {
+  local h
+  h="$(scutil --get LocalHostName 2>/dev/null || true)"
+  [[ -n "${h}" ]] || h="$(hostname -s 2>/dev/null || true)"
+  [[ -n "${h}" ]] || h="$(uname -n 2>/dev/null | cut -d. -f1 || true)"
+  h="$(printf '%s' "${h}" | tr -c 'A-Za-z0-9' '-' | tr -s '-')"
+  h="${h#-}"; h="${h%-}"
+  HOST_LABEL="${h:-mac}"
+}
+
+# Unlike runner-setup, running as root is FINE here (it is the intended
+# LaunchDaemon deployment): this script never runs the runner processes, so the
+# runner's root-refusal is irrelevant. sudo is only used to reach the launchctl
+# system domain and /opt when we are NOT root.
+detect_privilege() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    SUDO=""
+    step "Running as root (e.g. from a LaunchDaemon); sudo not needed."
+  else
+    SUDO="sudo"
+  fi
+}
+
+ensure_sudo() {
+  [[ -z "${SUDO}" ]] && return 0
+  log "Requesting administrator privileges (needed for launchctl and ${RUNNER_ROOT})"
+  if ! sudo -v; then
+    err "Could not obtain sudo privileges."
+    exit 1
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# Small state-store helpers (${STATE_DIR}: busy-since + alert markers)
+# ----------------------------------------------------------------------------
+ensure_state_dir() {
+  [[ -d "${STATE_DIR}" ]] && return 0
+  mkdir -p "${STATE_DIR}" 2>/dev/null || ${SUDO} mkdir -p "${STATE_DIR}" || true
+}
+
+state_write() {
+  local file="$1" content="$2"
+  printf '%s' "${content}" > "${file}" 2>/dev/null \
+    || printf '%s' "${content}" | ${SUDO} tee "${file}" >/dev/null || true
+}
+
+state_read()   { cat "$1" 2>/dev/null || true; }
+state_remove() { rm -f "$1" 2>/dev/null || ${SUDO} rm -f "$1" 2>/dev/null || true; }
+
+record_status() {
+  STATUS_NAME+=("$1")
+  STATUS_RESULT+=("$2")
+}
+
+# ----------------------------------------------------------------------------
+# Structured log line (stdout) — one per runner per pass, always.
+# ----------------------------------------------------------------------------
+emit_log() {
+  # emit_log <runner> <event> <svc_state> <diag_age_min> <api_status> <busy> <action> <result>
+  printf 'ts="%s" host="%s" prog="%s" runner="%s" event="%s" svc_state="%s" diag_age_min=%s api_status="%s" busy=%s action="%s" result="%s"\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${HOST_LABEL}" "${PROG_NAME}" \
+    "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8"
+}
+
+# ----------------------------------------------------------------------------
+# Alerting — Slack-compatible webhook. Once per incident: a marker file under
+# STATE_DIR suppresses repeats until the runner is healthy again.
+# ----------------------------------------------------------------------------
+alert() {
+  local name="$1" text="$2"
+  local marker="${STATE_DIR}/${name}.alerted"
+  if [[ -f "${marker}" ]]; then
+    step "Alert for ${name} suppressed (already alerted; still unhealthy)."
+    return 0
+  fi
+  state_write "${marker}" "$(date +%s)"
+
+  if [[ -z "${ALERT_WEBHOOK_URL:-}" ]]; then
+    warn "ALERT_WEBHOOK_URL not set; alert for ${name} logged only."
+    return 0
+  fi
+
+  # Slack-compatible payload. The text is generated by us and kept free of
+  # double quotes/backslashes, so this stays valid JSON without an escaper.
+  local payload_file="${WORK_TMPDIR}/alert-${name}.json"
+  printf '{"text": "%s"}' "${text}" > "${payload_file}"
+
+  # Webhook URL goes through a 0600 curl config file, never the command line.
+  local cfg="${WORK_TMPDIR}/alert-${name}.curlrc"
+  {
+    printf 'url = "%s"\n' "${ALERT_WEBHOOK_URL}"
+    printf 'request = POST\n'
+    printf 'header = "Content-Type: application/json"\n'
+    printf 'data = "@%s"\n' "${payload_file}"
+    printf 'fail\nshow-error\nsilent\n'
+  } > "${cfg}"
+  chmod 600 "${cfg}"
+
+  if curl -K "${cfg}"; then
+    step "Alert sent to webhook for ${name}."
+  else
+    warn "Failed to POST alert webhook for ${name}."
+  fi
+  return 0
+}
+
+# ----------------------------------------------------------------------------
+# GitHub API (optional) — no jq; objects are split one-per-line and parsed
+# with grep/sed exactly like runner-setup parses the releases API.
+# ----------------------------------------------------------------------------
+api_fetch() {
+  API_ENABLED=0
+  API_JSON=""
+  [[ -n "${ORG}" || -n "${REPO}" ]] || return 0
+  if [[ -z "${GITHUB_PAT:-}" ]]; then
+    warn "--org/--repo given but GITHUB_PAT is not set; skipping GitHub API checks."
+    return 0
+  fi
+
+  local url
+  if [[ -n "${ORG}" ]]; then
+    url="${GITHUB_API}/orgs/${ORG}/actions/runners?per_page=100"
+  else
+    url="${GITHUB_API}/repos/${REPO}/actions/runners?per_page=100"
+  fi
+
+  # The PAT rides in a curl config file (0600, private tmpdir), NOT on the
+  # command line, so it never appears in `ps`.
+  local cfg="${WORK_TMPDIR}/github-api.curlrc"
+  {
+    printf 'url = "%s"\n' "${url}"
+    printf 'header = "Accept: application/vnd.github+json"\n'
+    printf 'header = "Authorization: Bearer %s"\n' "${GITHUB_PAT}"
+    printf 'header = "X-GitHub-Api-Version: 2022-11-28"\n'
+    printf 'fail\nshow-error\nsilent\nlocation\nretry = 3\n'
+  } > "${cfg}"
+  chmod 600 "${cfg}"
+
+  # Capture-then-check so set -e isn't masked inside command substitution.
+  local json
+  if ! json="$(curl -K "${cfg}")"; then
+    warn "GitHub API query failed; skipping API-based checks this pass."
+    return 0
+  fi
+  # One runner object per line so a single runner can be isolated with grep.
+  API_JSON="$(printf '%s' "${json}" | tr -d '\n' | sed 's/},{/}\n{/g')"
+  API_ENABLED=1
+  step "GitHub API reachable; online/busy checks enabled."
+}
+
+# Print "<status> <busy>" for a GitHub runner name, or nothing when absent.
+api_lookup() {
+  local runner_name="$1"
+  local line status busy
+  line="$(printf '%s\n' "${API_JSON}" \
+    | grep -E "\"name\"[[:space:]]*:[[:space:]]*\"${runner_name}\"" \
+    | head -n1 || true)"
+  [[ -n "${line}" ]] || return 1
+  status="$(printf '%s' "${line}" \
+    | sed -E 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/' || true)"
+  busy="$(printf '%s' "${line}" \
+    | sed -E 's/.*"busy"[[:space:]]*:[[:space:]]*(true|false).*/\1/' || true)"
+  printf '%s %s' "${status:-unknown}" "${busy:-false}"
+}
+
+# ----------------------------------------------------------------------------
+# Remediation — sudo only ever wraps launchctl system-domain operations.
+# ----------------------------------------------------------------------------
+bootout_system() {
+  local label="$1"
+  local _i
+  ${SUDO} launchctl bootout "system/${label}" 2>/dev/null || true
+  for _i in 1 2 3 4 5 6 7 8 9 10; do
+    ${SUDO} launchctl print "system/${label}" >/dev/null 2>&1 || return 0
+    sleep 1
+  done
+  return 0
+}
+
+# remediate <label> <plist> <action>: kickstart | bootstrap | rebootstrap.
+# Verifies the daemon is visible afterwards; returns non-zero if it is not.
+remediate() {
+  local label="$1" plist="$2" action="$3"
+  case "${action}" in
+    kickstart)
+      ${SUDO} launchctl kickstart -k "system/${label}" 2>/dev/null || return 1
+      ;;
+    bootstrap)
+      ${SUDO} launchctl bootstrap system "${plist}" 2>/dev/null || return 1
+      ${SUDO} launchctl enable "system/${label}" 2>/dev/null || true
+      ${SUDO} launchctl kickstart -k "system/${label}" 2>/dev/null || true
+      ;;
+    rebootstrap)
+      bootout_system "${label}"
+      ${SUDO} launchctl bootstrap system "${plist}" 2>/dev/null || return 1
+      ${SUDO} launchctl enable "system/${label}" 2>/dev/null || true
+      ${SUDO} launchctl kickstart -k "system/${label}" 2>/dev/null || true
+      ;;
+    *) return 1 ;;
+  esac
+  ${SUDO} launchctl print "system/${label}" >/dev/null 2>&1
+}
+
+# ----------------------------------------------------------------------------
+# Discover runner names (union of runner dirs + daemon plists, de-duplicated;
+# same sources and bash-3.2-safe pattern as runner-cleanup).
+# ----------------------------------------------------------------------------
+discover_runners() {
+  RUNNER_NAMES=()
+  local -a found=()
+  local d p lbl name
+
+  shopt -s nullglob
+  for d in "${RUNNER_ROOT}"/runner-*; do
+    [[ -d "${d}" ]] && found+=("$(basename "${d}")")
+  done
+  for p in "${LAUNCH_DAEMON_DIR}"/com.github.runner-*.plist; do
+    [[ -f "${p}" ]] || continue
+    lbl="$(basename "${p}" .plist)"   # com.github.runner-N
+    found+=("${lbl#com.github.}")
+  done
+  shopt -u nullglob
+
+  # De-duplicate while preserving order (bash 3.2: no associative arrays).
+  # Guard the count FIRST: on bash 3.2 expanding an EMPTY array as "${found[@]}"
+  # under `set -u` aborts, which would crash the "nothing to check" case.
+  local seen=" "
+  if [[ ${#found[@]} -gt 0 ]]; then
+    for name in "${found[@]}"; do
+      case "${seen}" in
+        *" ${name} "*) ;;
+        *) RUNNER_NAMES+=("${name}"); seen="${seen}${name} " ;;
+      esac
+    done
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# Check one runner. Called as `if ! check_one ...`, so `set -e` is INACTIVE
+# for the whole body — every consequential step checks its own status.
+# Returns non-zero when an issue could NOT be remediated.
+# ----------------------------------------------------------------------------
+check_one() {
+  local name="$1"
+  local dir="${RUNNER_ROOT}/${name}"
+  local label="com.github.${name}"
+  local plist="${LAUNCH_DAEMON_DIR}/${label}.plist"
+  local diag_dir="${dir}/_diag"
+
+  local issue="" action="none" result="ok"
+  local svc_state="unknown" diag_age_min=-1 api_status="n/a" busy="false"
+
+  # --- Runner directory gone but daemon/plist remains: orphaned install. ---
+  if [[ ! -d "${dir}" ]]; then
+    issue="dir_missing"
+    result="failed"
+    err "${name}: ${dir} is gone but a daemon/plist remains."
+    err "Run 'runner-cleanup --runner ${name#runner-}' to finish the teardown,"
+    err "or re-run runner-setup to reprovision it."
+    emit_log "${name}" "${issue}" "n/a" -1 "n/a" false "none" "${result}"
+    alert "${name}" "${PROG_NAME} on ${HOST_LABEL}: ${name} orphaned (dir missing) — run runner-cleanup or re-run runner-setup"
+    record_status "${name}" "FAILED (orphaned; dir missing)"
+    return 1
+  fi
+
+  # --- (1) launchd state -----------------------------------------------------
+  if ! ${SUDO} launchctl print "system/${label}" >/dev/null 2>&1; then
+    svc_state="not-loaded"
+    if [[ -f "${plist}" ]]; then
+      issue="daemon_not_loaded"
+      action="bootstrap"
+      step "${name}: daemon not loaded but ${plist} exists; bootstrapping."
+      if remediate "${label}" "${plist}" bootstrap; then
+        result="remediated"
+        svc_state="running"
+      else
+        result="failed"
+      fi
+    else
+      issue="daemon_missing"
+      result="failed"
+      err "${name}: no LaunchDaemon AND no plist — nothing local to restart."
+      err "Re-run runner-setup to reprovision ${name}."
+    fi
+  else
+    # `|| true` is REQUIRED with set -euo pipefail around every parse pipeline.
+    svc_state="$(${SUDO} launchctl print "system/${label}" 2>/dev/null \
+      | sed -n 's/^[[:space:]]*state = //p' | head -n1 || true)"
+    svc_state="${svc_state:-unknown}"
+    if [[ "${svc_state}" != "running" ]]; then
+      issue="service_not_running"
+      action="rebootstrap"
+      step "${name}: daemon loaded but state='${svc_state}'; bootout+bootstrap."
+      if remediate "${label}" "${plist}" rebootstrap; then
+        result="remediated"
+        svc_state="running"
+      else
+        result="failed"
+      fi
+    fi
+  fi
+
+  # --- (2) _diag freshness (only while the service claims to be running) ----
+  if [[ "${result}" == "ok" && "${svc_state}" == "running" ]]; then
+    if [[ -d "${diag_dir}" ]]; then
+      local newest_diag newest_runner_log mtime now
+      newest_diag="$(ls -t "${diag_dir}"/*.log 2>/dev/null | head -n1 || true)"
+      now="$(date +%s)"
+      if [[ -n "${newest_diag}" ]]; then
+        mtime="$(stat -f %m "${newest_diag}" 2>/dev/null || echo 0)"
+        diag_age_min=$(( (now - mtime) / 60 ))
+        if [[ "${diag_age_min}" -gt "${STALE_MINUTES}" ]]; then
+          issue="diag_stale"
+        fi
+      else
+        issue="diag_missing"
+      fi
+      # The newest Runner log must show the runner reached its idle loop.
+      # (Busy runners keep _diag fresh via Worker_*.log and pass the check.)
+      newest_runner_log="$(ls -t "${diag_dir}"/Runner_*.log 2>/dev/null | head -n1 || true)"
+      if [[ -z "${issue}" && -n "${newest_runner_log}" ]] \
+          && ! grep -q 'Listening for Jobs' "${newest_runner_log}" 2>/dev/null; then
+        issue="not_listening"
+      fi
+    else
+      issue="diag_missing"
+    fi
+    if [[ -n "${issue}" ]]; then
+      action="kickstart"
+      step "${name}: ${issue} (diag_age_min=${diag_age_min}); kickstart -k."
+      if remediate "${label}" "${plist}" kickstart; then
+        result="remediated"
+      else
+        result="failed"
+      fi
+    fi
+  fi
+
+  # --- (3) GitHub API status / stuck-busy (optional) -------------------------
+  if [[ "${result}" == "ok" && "${API_ENABLED}" -eq 1 && -f "${dir}/.runner" ]]; then
+    local runner_name lookup
+    runner_name="$(sed -n 's/.*"agentName"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+      "${dir}/.runner" 2>/dev/null | head -n1 || true)"
+    if [[ -n "${runner_name}" ]]; then
+      lookup="$(api_lookup "${runner_name}" || true)"
+      if [[ -z "${lookup}" ]]; then
+        api_status="missing"
+        issue="unregistered"
+        action="rebootstrap"
+        step "${name}: '${runner_name}' not in the GitHub runners list; bootout+bootstrap."
+      else
+        api_status="${lookup% *}"
+        busy="${lookup#* }"
+        if [[ "${api_status}" == "offline" ]]; then
+          issue="offline"
+          action="rebootstrap"
+          step "${name}: GitHub reports '${runner_name}' offline; bootout+bootstrap."
+        elif [[ "${busy}" == "true" ]]; then
+          # Stuck-busy needs a duration, which the API does not provide, so the
+          # first-seen-busy epoch is persisted across passes in STATE_DIR.
+          local busy_file="${STATE_DIR}/${name}.busy_since" since busy_age_min
+          since="$(state_read "${busy_file}")"
+          if [[ -z "${since}" ]]; then
+            state_write "${busy_file}" "$(date +%s)"
+          else
+            busy_age_min=$(( ($(date +%s) - since) / 60 ))
+            if [[ "${busy_age_min}" -gt "${BUSY_TIMEOUT_MINUTES}" ]]; then
+              issue="stuck_busy"
+              action="kickstart"
+              step "${name}: busy for ${busy_age_min} min (> ${BUSY_TIMEOUT_MINUTES}); kickstart -k."
+            fi
+          fi
+        else
+          state_remove "${STATE_DIR}/${name}.busy_since"
+        fi
+      fi
+      if [[ -n "${issue}" ]]; then
+        if remediate "${label}" "${plist}" "${action}"; then
+          result="remediated"
+        else
+          result="failed"
+        fi
+      fi
+    fi
+  fi
+
+  # --- Structured log + alert + status. A healthy runner clears the alert
+  #     marker so the NEXT incident alerts again. --------------------------
+  emit_log "${name}" "${issue:-check}" "${svc_state}" "${diag_age_min}" \
+    "${api_status}" "${busy}" "${action}" "${result}"
+
+  if [[ -n "${issue}" ]]; then
+    alert "${name}" \
+      "${PROG_NAME} on ${HOST_LABEL}: ${name} issue=${issue} action=${action} result=${result}"
+    if [[ "${result}" == "remediated" ]]; then
+      record_status "${name}" "${issue} -> ${action} (remediated)"
+      return 0
+    fi
+    record_status "${name}" "FAILED (${issue}; ${action} did not fix it)"
+    return 1
+  fi
+
+  state_remove "${STATE_DIR}/${name}.alerted"
+  record_status "${name}" "OK"
+  return 0
+}
+
+# ----------------------------------------------------------------------------
+# One check pass over every runner. Returns non-zero if any issue could not
+# be remediated.
+# ----------------------------------------------------------------------------
+run_pass() {
+  local overall=0 name
+  STATUS_NAME=()
+  STATUS_RESULT=()
+
+  discover_runners
+  if [[ ${#RUNNER_NAMES[@]} -eq 0 ]]; then
+    log "No runners found under ${RUNNER_ROOT}; nothing to check."
+    return 0
+  fi
+
+  ensure_state_dir
+  api_fetch
+
+  local i
+  printf '\n'
+  printf '==> Health pass %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  for name in "${RUNNER_NAMES[@]}"; do
+    if ! check_one "${name}"; then
+      overall=1
+    fi
+  done
+
+  printf '  %-12s %s\n' "RUNNER" "STATUS"
+  printf '  %-12s %s\n' "------" "------"
+  for i in "${!STATUS_NAME[@]}"; do
+    printf '  %-12s %s\n' "${STATUS_NAME[$i]}" "${STATUS_RESULT[$i]}"
+  done
+  printf '\n'
+  return "${overall}"
+}
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+main() {
+  parse_args "$@"
+  detect_platform
+  require_cmds
+  detect_host
+  detect_privilege
+  ensure_sudo
+
+  WORK_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/runner-health.XXXXXX")"
+
+  if [[ "${ONCE}" -eq 1 ]]; then
+    run_pass
+    exit $?
+  fi
+
+  if [[ -n "${SUDO}" ]]; then
+    warn "Watch mode as a non-root user: the sudo timestamp may expire between"
+    warn "passes. Prefer a root LaunchDaemon running '${PROG_NAME} --once' on a"
+    warn "StartInterval timer (see docs/health-checks.md)."
+  fi
+  log "Watch mode: checking every ${INTERVAL}s (Ctrl-C to stop)."
+  while true; do
+    if [[ -n "${SUDO}" ]]; then sudo -v 2>/dev/null || true; fi
+    run_pass || true
+    sleep "${INTERVAL}"
+  done
+}
+
+main "$@"
