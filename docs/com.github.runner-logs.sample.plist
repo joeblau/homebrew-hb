@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Sample LaunchDaemon for runner-logs (ship mode, HTTP sink), StartInterval-driven.
+
+  Install (adjust paths — `brew --prefix` may differ on Intel Macs):
+    sudo cp docs/com.github.runner-logs.sample.plist \
+      /Library/LaunchDaemons/com.github.runner-logs.plist
+    sudo chown root:wheel /Library/LaunchDaemons/com.github.runner-logs.plist
+    sudo chmod 644 /Library/LaunchDaemons/com.github.runner-logs.plist
+    sudo launchctl bootstrap system /Library/LaunchDaemons/com.github.runner-logs.plist
+
+  The service runs as root ONLY so it can read every runner's _diag logs
+  regardless of ownership — runner-logs never starts/stops runners and never
+  sets RUNNER_ALLOW_RUNASROOT. Ship mode itself calls no sudo.
+
+  SECURITY: prefer LOG_HTTP_TOKEN in the keychain-backed file referenced from
+  your environment over embedding it here; if you must embed it, this plist is
+  root:wheel 0644 — consider `chmod 600`. The token is passed to curl via a
+  0600 config file, so it never appears in `ps`.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.github.runner-logs</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/runner-logs</string>
+    <string>ship</string>
+    <string>--sink</string>
+    <string>http</string>
+    <string>--once</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>LOG_HTTP_ENDPOINT</key>
+    <string>https://logs.example.com:8080/runner-logs</string>
+    <key>LOG_HTTP_TOKEN</key>
+    <string>REPLACE_ME</string>
+    <key>HOME</key>
+    <string>/var/root</string>
+  </dict>
+  <key>StartInterval</key>
+  <integer>30</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/var/log/runner-logs.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/runner-logs.stderr.log</string>
+</dict>
+</plist>

@@ -1,0 +1,641 @@
+#!/usr/bin/env bash
+#
+# runner-logs — ship GitHub Actions self-hosted runner logs + metrics to a
+# central aggregator on macOS.
+#
+# Usage:
+#   runner-logs ship [--sink file|http] [--output-dir DIR] [--interval SEC]
+#   runner-logs metrics [--interval SEC] [--once]
+#
+# ship:    tails every runner's _diag/*.log (Runner_*.log, Worker_*.log, plus
+#          the runner-stdout.log / runner-stderr.log written by the LaunchDaemon
+#          plist) under /opt/github-runners and forwards new lines as JSON
+#          (one object per line) to a pluggable sink. File offsets are tracked
+#          in a state file so restarts resume where they left off instead of
+#          re-shipping everything. Runs read-only against /opt — no sudo.
+#
+# metrics: emits one JSON line per runner per interval with online status
+#          (launchctl + newest diag 'Listening for Jobs'), the last job result
+#          (Worker 'completed with result' lines), disk usage on the runner
+#          volume, and — when GITHUB_PAT is set — queue depth from the GitHub
+#          API. Uses sudo only for `launchctl print system/...`.
+#
+# The script never runs any runner process and never sets
+# RUNNER_ALLOW_RUNASROOT; it only READS runner state. Secrets (bearer token,
+# GITHUB_PAT) come from env vars and are passed to curl via a 0600 config
+# file, never on the command line where `ps` could expose them.
+
+set -euo pipefail
+
+# ----------------------------------------------------------------------------
+# Constants / globals
+# ----------------------------------------------------------------------------
+PROG_NAME="$(basename "$0")"
+RUNNER_ROOT="/opt/github-runners"
+GITHUB_API="https://api.github.com"
+
+MODE=""                          # ship | metrics
+SINK="file"                      # file | http
+OUTPUT_DIR=""                    # default resolved after arg parse
+INTERVAL=""                      # default depends on MODE
+ONCE=0
+STATE_FILE=""                    # default resolved after arg parse
+BATCH_SIZE=500                   # max JSON lines per HTTP POST
+ENDPOINT=""                      # default: LOG_HTTP_ENDPOINT env
+
+HOST_LABEL=""
+WORK_TMPDIR=""
+CURL_AUTH_CONFIG=""              # 0600 curl -K file holding the bearer header
+SHIP_OK=1                        # 0 when any sink write failed this pass
+BATCH=""
+BATCH_COUNT=0
+
+# ----------------------------------------------------------------------------
+# Output helpers — progress goes to stderr; secrets are NEVER interpolated.
+# ----------------------------------------------------------------------------
+log()  { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
+step() { printf '\033[1;32m  ->\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[1;33mWARN:\033[0m %s\n' "$*" >&2; }
+err()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; }
+
+usage() {
+  cat >&2 <<EOF
+${PROG_NAME} — ship runner logs and metrics to a central aggregator (macOS)
+
+USAGE:
+  ${PROG_NAME} [ship] [--sink file|http] [--output-dir DIR] [--interval SEC] [--once]
+  ${PROG_NAME} metrics [--interval SEC] [--once]
+
+MODES:
+  ship (default)   Tail ${RUNNER_ROOT}/runner-*/_diag/*.log (Runner_*,
+                   Worker_*, runner-stdout.log, runner-stderr.log) and forward
+                   new lines as JSON-lines to the chosen sink. Per-file byte
+                   offsets are persisted in a state file, so a restart resumes
+                   where it stopped; rotated/truncated files are detected via
+                   inode+size and re-read from the top.
+  metrics          Emit one JSON line per runner per interval to stdout:
+                   runner name, online status (launchctl + newest diag
+                   'Listening for Jobs'), last job result (Worker 'completed
+                   with result' lines), disk free/used on the runner volume,
+                   and queue depth when GITHUB_PAT is set.
+
+SINKS (ship mode):
+  --sink file      Append JSON lines to OUTPUT_DIR/runner-logs-YYYYMMDD.jsonl
+                   (default; zero dependencies).
+  --sink http      POST newline-delimited JSON batches to LOG_HTTP_ENDPOINT
+                   (e.g. a Fluent Bit / Logstash / Vector HTTP input feeding
+                   Elasticsearch _bulk or Loki). Auth: LOG_HTTP_TOKEN env var
+                   sent as a Bearer header via a 0600 curl config file.
+
+OPTIONS:
+  --sink file|http  Ship sink (default: file)
+  --output-dir DIR  Directory for the file sink (default: ~/Library/Logs/github-runners)
+  --state-file PATH Offset state file (default: ~/.runner-logs/offsets.tsv)
+  --endpoint URL    HTTP sink endpoint (default: LOG_HTTP_ENDPOINT env)
+  --batch-size N    Max JSON lines per HTTP POST (default: ${BATCH_SIZE})
+  --interval SEC    Seconds between passes (default: 10 ship / 60 metrics)
+  --once            Run a single pass and exit (for cron/launchd/manual runs)
+  -h, --help        Show this help and exit
+
+ENVIRONMENT:
+  LOG_HTTP_ENDPOINT  Target URL for --sink http (required for that sink)
+  LOG_HTTP_TOKEN     Bearer token for the HTTP sink (never logged, never in ps)
+  GITHUB_PAT         PAT (actions:read) enabling queue metrics in metrics mode
+  GITHUB_QUEUE_REPO  OWNER/REPO override for queue metrics (default: derived
+                     from a repo-scoped runner's .runner gitHubUrl)
+
+EXAMPLES:
+  ${PROG_NAME} ship --once
+  ${PROG_NAME} ship --sink http --interval 15
+  LOG_HTTP_ENDPOINT=https://logs.example.com:8080 LOG_HTTP_TOKEN=... ${PROG_NAME} ship
+  ${PROG_NAME} metrics --once
+  GITHUB_PAT=ghp_... GITHUB_QUEUE_REPO=acme/monorepo ${PROG_NAME} metrics --once
+
+  Emit a synthetic 'job' event for every Worker completion line — each such
+  shipped line also carries job_name / job_result / job_duration_s so
+  dashboards can graph success/failure rate and job duration directly.
+  See docs/log-aggregation.md for the launchd plist and sample queries.
+
+SECURITY NOTE:
+  Secrets come from env vars only. LOG_HTTP_TOKEN and GITHUB_PAT are handed to
+  curl through a temporary 0600 config file (curl -K), so they never appear in
+  'ps' output or in this script's logs. Ship mode needs NO sudo (runner logs
+  are user-readable); metrics mode uses sudo only for
+  'launchctl print system/...'. This script never starts or stops runners.
+EOF
+}
+
+# ----------------------------------------------------------------------------
+# Cleanup / signal traps
+# ----------------------------------------------------------------------------
+cleanup() {
+  local code=$?
+  if [[ -n "${CURL_AUTH_CONFIG}" && -f "${CURL_AUTH_CONFIG}" ]]; then
+    rm -f "${CURL_AUTH_CONFIG}" 2>/dev/null || true
+  fi
+  if [[ -n "${WORK_TMPDIR}" && -d "${WORK_TMPDIR}" ]]; then
+    rm -rf "${WORK_TMPDIR}" 2>/dev/null || true
+  fi
+  return "${code}"
+}
+trap cleanup EXIT
+trap 'err "Interrupted."; exit 130' INT TERM
+
+# ----------------------------------------------------------------------------
+# Argument parsing
+# ----------------------------------------------------------------------------
+parse_args() {
+  # Optional leading mode word; default is ship.
+  if [[ $# -gt 0 ]]; then
+    case "$1" in
+      ship|metrics) MODE="$1"; shift ;;
+    esac
+  fi
+  [[ -n "${MODE}" ]] || MODE="ship"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --sink)
+        [[ $# -ge 2 ]] || { err "--sink requires a value"; usage; exit 2; }
+        SINK="$2"; shift 2 ;;
+      --sink=*)    SINK="${1#*=}"; shift ;;
+      --output-dir)
+        [[ $# -ge 2 ]] || { err "--output-dir requires a value"; usage; exit 2; }
+        OUTPUT_DIR="$2"; shift 2 ;;
+      --output-dir=*) OUTPUT_DIR="${1#*=}"; shift ;;
+      --state-file)
+        [[ $# -ge 2 ]] || { err "--state-file requires a value"; usage; exit 2; }
+        STATE_FILE="$2"; shift 2 ;;
+      --state-file=*) STATE_FILE="${1#*=}"; shift ;;
+      --endpoint)
+        [[ $# -ge 2 ]] || { err "--endpoint requires a value"; usage; exit 2; }
+        ENDPOINT="$2"; shift 2 ;;
+      --endpoint=*) ENDPOINT="${1#*=}"; shift ;;
+      --batch-size)
+        [[ $# -ge 2 ]] || { err "--batch-size requires a value"; usage; exit 2; }
+        BATCH_SIZE="$2"; shift 2 ;;
+      --batch-size=*) BATCH_SIZE="${1#*=}"; shift ;;
+      --interval)
+        [[ $# -ge 2 ]] || { err "--interval requires a value"; usage; exit 2; }
+        INTERVAL="$2"; shift 2 ;;
+      --interval=*) INTERVAL="${1#*=}"; shift ;;
+      --once)      ONCE=1; shift ;;
+      -h|--help)   usage; exit 0 ;;
+      *)
+        err "Unknown argument: $1"
+        usage
+        exit 2 ;;
+    esac
+  done
+
+  case "${SINK}" in
+    file|http) ;;
+    *) err "--sink must be 'file' or 'http' (got: '${SINK}')"; exit 2 ;;
+  esac
+
+  [[ -n "${OUTPUT_DIR}" ]] || OUTPUT_DIR="${HOME}/Library/Logs/github-runners"
+  [[ -n "${STATE_FILE}" ]] || STATE_FILE="${HOME}/.runner-logs/offsets.tsv"
+  [[ -n "${ENDPOINT}" ]] || ENDPOINT="${LOG_HTTP_ENDPOINT:-}"
+  if [[ -z "${INTERVAL}" ]]; then
+    if [[ "${MODE}" == "metrics" ]]; then INTERVAL=60; else INTERVAL=10; fi
+  fi
+  if ! [[ "${INTERVAL}" =~ ^[0-9]+$ ]] || [[ "${INTERVAL}" -lt 1 ]]; then
+    err "--interval must be a positive integer (got: '${INTERVAL}')"
+    exit 2
+  fi
+  if ! [[ "${BATCH_SIZE}" =~ ^[0-9]+$ ]] || [[ "${BATCH_SIZE}" -lt 1 ]]; then
+    err "--batch-size must be a positive integer (got: '${BATCH_SIZE}')"
+    exit 2
+  fi
+  if [[ "${MODE}" == "ship" && "${SINK}" == "http" && -z "${ENDPOINT}" ]]; then
+    err "--sink http requires LOG_HTTP_ENDPOINT (or --endpoint)."
+    exit 2
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# Environment detection
+# ----------------------------------------------------------------------------
+detect_platform() {
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    err "This tool only supports macOS."
+    exit 1
+  fi
+}
+
+require_cmds() {
+  local missing=() c
+  local cmds="sed grep awk cut tail stat date basename uname mktemp tr ls"
+  if [[ "${MODE}" == "metrics" ]]; then
+    cmds="${cmds} sudo launchctl df head sleep"
+  fi
+  if [[ "${SINK}" == "http" && "${MODE}" == "ship" ]] \
+      || [[ "${MODE}" == "metrics" && -n "${GITHUB_PAT:-}" ]]; then
+    cmds="${cmds} curl"
+  fi
+  for c in ${cmds}; do
+    command -v "${c}" >/dev/null 2>&1 || missing+=("${c}")
+  done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    err "Required command(s) not found: ${missing[*]}"
+    exit 1
+  fi
+}
+
+# Sanitized machine name, mirroring runner-setup's detect_host.
+detect_host() {
+  local h
+  h="$(scutil --get LocalHostName 2>/dev/null || true)"
+  [[ -n "${h}" ]] || h="$(hostname -s 2>/dev/null || true)"
+  [[ -n "${h}" ]] || h="$(uname -n 2>/dev/null | cut -d. -f1 || true)"
+  h="$(printf '%s' "${h}" | tr -c 'A-Za-z0-9' '-' | tr -s '-')"
+  h="${h#-}"; h="${h%-}"
+  HOST_LABEL="${h:-mac}"
+}
+
+iso_now() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
+
+# Escape a raw log line for embedding in a JSON string: backslashes, double
+# quotes, literal tabs; strip carriage returns. (Other control characters are
+# rare in runner diag output and passed through.)
+json_escape() {
+  printf '%s' "$1" \
+    | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/\\t/g' \
+    | tr -d '\r'
+}
+
+# Build a 0600 curl config file carrying the Authorization header so the
+# bearer token never appears in `ps` (curl -K reads headers from a file).
+make_curl_auth_config() {
+  local token="$1"
+  [[ -z "${CURL_AUTH_CONFIG}" ]] || return 0
+  WORK_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/runner-logs.XXXXXX")"
+  CURL_AUTH_CONFIG="${WORK_TMPDIR}/curl-auth.conf"
+  printf 'header = "Authorization: Bearer %s"\n' "${token}" > "${CURL_AUTH_CONFIG}"
+  chmod 600 "${CURL_AUTH_CONFIG}"
+}
+
+# ----------------------------------------------------------------------------
+# SHIP mode
+# ----------------------------------------------------------------------------
+
+# Print the stored "inode<TAB>offset" for a log path, or nothing.
+state_lookup() {
+  local path="$1"
+  [[ -f "${STATE_FILE}" ]] || return 0
+  awk -F '\t' -v p="${path}" '$1 == p { print $2 "\t" $3; exit }' \
+    "${STATE_FILE}" 2>/dev/null || true
+}
+
+# Extra JSON fields for Worker completion lines: job name, result, and a
+# duration derived from the Worker_YYYYMMDD-HHMMSS-utc.log filename (the job
+# start, UTC) to now. Prints e.g. `,"job_name":"build","job_result":"Succeeded"`
+# or nothing for non-completion lines, so dashboards get first-class fields.
+job_fields() {
+  local base="$1" line="$2"
+  case "${base}" in
+    Worker_*.log) ;;
+    *) return 0 ;;
+  esac
+  [[ "${line}" == *"completed with result"* ]] || return 0
+
+  local job result stamp epoch duration="" out=""
+  job="$(printf '%s' "${line}" \
+    | sed -n "s/.*Job '\([^']*\)'.*/\1/p" | head -n1 || true)"
+  if [[ -z "${job}" ]]; then
+    job="$(printf '%s' "${line}" \
+      | sed -n 's/.*Job \([^ ]*\) completed.*/\1/p' | head -n1 || true)"
+  fi
+  result="$(printf '%s' "${line}" \
+    | sed -n 's/.*completed with result:[[:space:]]*\([A-Za-z]*\).*/\1/p' \
+    | head -n1 || true)"
+
+  stamp="$(printf '%s' "${base}" \
+    | sed -n 's/^Worker_\([0-9]\{8\}-[0-9]\{6\}\)-utc\.log/\1/p' | head -n1 || true)"
+  if [[ -n "${stamp}" ]]; then
+    epoch="$(date -j -u -f '%Y%m%d-%H%M%S' "${stamp}" '+%s' 2>/dev/null || true)"
+    if [[ -n "${epoch}" ]]; then
+      duration=$(( $(date -u '+%s') - epoch ))
+    fi
+  fi
+
+  [[ -z "${job}" ]]    || out="${out},\"job_name\":\"$(json_escape "${job}")\""
+  [[ -z "${result}" ]] || out="${out},\"job_result\":\"$(json_escape "${result}")\""
+  [[ -z "${duration}" ]] || out="${out},\"job_duration_s\":${duration}"
+  printf '%s' "${out}"
+}
+
+emit_line() {
+  local json="$1"
+  case "${SINK}" in
+    file)
+      if ! printf '%s\n' "${json}" >> "${OUTPUT_DIR}/runner-logs-$(date -u '+%Y%m%d').jsonl"; then
+        SHIP_OK=0
+      fi
+      ;;
+    http)
+      BATCH="${BATCH}${json}"$'\n'
+      BATCH_COUNT=$((BATCH_COUNT + 1))
+      if [[ "${BATCH_COUNT}" -ge "${BATCH_SIZE}" ]]; then
+        flush_batch
+      fi
+      ;;
+  esac
+}
+
+flush_batch() {
+  [[ "${BATCH_COUNT}" -gt 0 ]] || return 0
+  local rc=0
+  if [[ -n "${CURL_AUTH_CONFIG}" ]]; then
+    printf '%s' "${BATCH}" | curl -fsS -o /dev/null \
+      --connect-timeout 5 --max-time 30 \
+      -K "${CURL_AUTH_CONFIG}" \
+      -H 'Content-Type: application/x-ndjson' \
+      --data-binary @- "${ENDPOINT}" || rc=$?
+  else
+    printf '%s' "${BATCH}" | curl -fsS -o /dev/null \
+      --connect-timeout 5 --max-time 30 \
+      -H 'Content-Type: application/x-ndjson' \
+      --data-binary @- "${ENDPOINT}" || rc=$?
+  fi
+  if [[ "${rc}" -ne 0 ]]; then
+    warn "HTTP sink POST failed (curl rc=${rc}); batch will be re-sent next pass."
+    SHIP_OK=0
+  fi
+  BATCH=""
+  BATCH_COUNT=0
+}
+
+# Ship new bytes of one file, starting at 1-based byte offset $4.
+ship_chunk() {
+  local runner="$1" base="$2" file="$3" from="$4"
+  local line
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ -n "${line}" ]] || continue
+    emit_line "{\"ts\":\"$(iso_now)\",\"host\":\"${HOST_LABEL}\",\"runner\":\"${runner}\",\"source\":\"${base}\",\"line\":\"$(json_escape "${line}")\"$(job_fields "${base}" "${line}")}"
+  done < <(tail -c "+${from}" "${file}" 2>/dev/null || true)
+}
+
+ship_pass() {
+  local state_dir tmp_state
+  state_dir="$(dirname "${STATE_FILE}")"
+  mkdir -p "${state_dir}"
+  tmp_state="$(mktemp "${state_dir}/.offsets.XXXXXX")"
+  SHIP_OK=1
+
+  local d f runner base size inode start stored s_inode s_offset
+  shopt -s nullglob
+  for d in "${RUNNER_ROOT}"/runner-*; do
+    [[ -d "${d}/_diag" ]] || continue
+    runner="$(basename "${d}")"
+    for f in "${d}/_diag"/*.log; do
+      [[ -f "${f}" ]] || continue
+      base="$(basename "${f}")"
+      stored="$(state_lookup "${f}")"
+
+      # Unreadable (different owner): keep the old offset so nothing is
+      # skipped, and retry next pass instead of reshipping from byte 0.
+      if [[ ! -r "${f}" ]]; then
+        warn "Not readable, skipping this pass: ${f}"
+        if [[ -n "${stored}" ]]; then
+          printf '%s\t%s\n' "${f}" "${stored}" >> "${tmp_state}"
+        fi
+        continue
+      fi
+
+      size="$(stat -f %z "${f}")"
+      inode="$(stat -f %i "${f}")"
+
+      # Resume from the stored offset only when the file is the same inode
+      # and did not shrink; otherwise it was rotated/truncated -> re-read.
+      start=0
+      if [[ -n "${stored}" ]]; then
+        s_inode="$(printf '%s' "${stored}" | cut -f1)"
+        s_offset="$(printf '%s' "${stored}" | cut -f2)"
+        if [[ "${s_inode}" == "${inode}" && "${s_offset}" -le "${size}" ]]; then
+          start="${s_offset}"
+        fi
+      fi
+
+      if [[ "${size}" -gt "${start}" ]]; then
+        ship_chunk "${runner}" "${base}" "${f}" "$((start + 1))"
+      fi
+      printf '%s\t%s\t%s\n' "${f}" "${inode}" "${size}" >> "${tmp_state}"
+    done
+  done
+  shopt -u nullglob
+
+  flush_batch
+  # Only commit offsets when every sink write succeeded (at-least-once:
+  # a failed pass re-ships those lines rather than losing them).
+  if [[ "${SHIP_OK}" -eq 1 ]]; then
+    mv "${tmp_state}" "${STATE_FILE}"
+  else
+    rm -f "${tmp_state}"
+    warn "Sink failure: offsets NOT advanced; lines will be re-sent next pass."
+  fi
+}
+
+run_ship() {
+  if [[ "${SINK}" == "http" && -n "${LOG_HTTP_TOKEN:-}" ]]; then
+    make_curl_auth_config "${LOG_HTTP_TOKEN}"
+  fi
+  if [[ "${SINK}" == "file" ]]; then
+    mkdir -p "${OUTPUT_DIR}"
+    step "File sink: ${OUTPUT_DIR}/runner-logs-YYYYMMDD.jsonl"
+  else
+    step "HTTP sink: ${ENDPOINT} (batch ${BATCH_SIZE})"
+  fi
+  log "Shipping runner logs from ${RUNNER_ROOT}/runner-*/_diag (interval ${INTERVAL}s)"
+  while :; do
+    ship_pass
+    [[ "${ONCE}" -eq 1 ]] && break
+    sleep "${INTERVAL}"
+  done
+  if [[ "${SHIP_OK}" -eq 1 ]]; then
+    log "Ship pass complete."
+  else
+    err "Ship pass finished with sink errors (see above)."
+    return 1
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# METRICS mode
+# ----------------------------------------------------------------------------
+
+# Queue depth from the GitHub API. Prints "queued in_progress"; empty on
+# failure. The PAT travels via the 0600 curl config file, never argv.
+queue_counts() {
+  local slug="$1"
+  local queued="" in_progress="" body
+  body="$(curl -fsS --connect-timeout 5 --max-time 20 \
+    -K "${CURL_AUTH_CONFIG}" \
+    -H 'Accept: application/vnd.github+json' \
+    "${GITHUB_API}/repos/${slug}/actions/runs?status=queued&per_page=1" \
+    2>/dev/null || true)"
+  queued="$(printf '%s' "${body}" \
+    | grep -m1 '"total_count"' \
+    | sed -E 's/[^0-9]*([0-9]+).*/\1/' || true)"
+  body="$(curl -fsS --connect-timeout 5 --max-time 20 \
+    -K "${CURL_AUTH_CONFIG}" \
+    -H 'Accept: application/vnd.github+json' \
+    "${GITHUB_API}/repos/${slug}/actions/runs?status=in_progress&per_page=1" \
+    2>/dev/null || true)"
+  in_progress="$(printf '%s' "${body}" \
+    | grep -m1 '"total_count"' \
+    | sed -E 's/[^0-9]*([0-9]+).*/\1/' || true)"
+  printf '%s %s' "${queued}" "${in_progress}"
+}
+
+metrics_one() {
+  local dir="$1"
+  local name; name="$(basename "${dir}")"
+  local label="com.github.${name}"
+  local diag="${dir}/_diag"
+
+  # GitHub-visible runner name from .runner (agentName), parsed without jq.
+  local runner_name=""
+  if [[ -f "${dir}/.runner" ]]; then
+    runner_name="$(sed -n 's/.*"agentName"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+      "${dir}/.runner" 2>/dev/null | head -n1 || true)"
+  fi
+  [[ -n "${runner_name}" ]] || runner_name="${name}"
+
+  # launchd state (sudo only for the system domain).
+  local daemon_loaded=0
+  if sudo launchctl print "system/${label}" >/dev/null 2>&1; then
+    daemon_loaded=1
+  fi
+
+  # Busy/idle from the newest Runner diag log's last marker line.
+  local status="offline" newest_runner="" marker=""
+  if [[ -d "${diag}" ]]; then
+    newest_runner="$(ls -t "${diag}"/Runner_*.log 2>/dev/null | head -n1 || true)"
+  fi
+  if [[ -n "${newest_runner}" ]]; then
+    marker="$(tail -n 300 "${newest_runner}" 2>/dev/null \
+      | grep -E 'Listening for Jobs|Running job' | tail -n1 || true)"
+  fi
+  if [[ "${daemon_loaded}" -eq 1 ]]; then
+    case "${marker}" in
+      *"Running job"*)        status="busy" ;;
+      *"Listening for Jobs"*) status="idle" ;;
+      *)                      status="unknown" ;;
+    esac
+  fi
+
+  # Last job result from the newest Worker diag log.
+  local last_job_result="" last_job_name="" newest_worker="" wline=""
+  if [[ -d "${diag}" ]]; then
+    newest_worker="$(ls -t "${diag}"/Worker_*.log 2>/dev/null | head -n1 || true)"
+  fi
+  if [[ -n "${newest_worker}" ]]; then
+    wline="$(grep 'completed with result' "${newest_worker}" 2>/dev/null \
+      | tail -n1 || true)"
+  fi
+  if [[ -n "${wline}" ]]; then
+    last_job_result="$(printf '%s' "${wline}" \
+      | sed -n 's/.*completed with result:[[:space:]]*\([A-Za-z]*\).*/\1/p' \
+      | head -n1 || true)"
+    last_job_name="$(printf '%s' "${wline}" \
+      | sed -n "s/.*Job '\([^']*\)'.*/\1/p" | head -n1 || true)"
+  fi
+
+  # Disk usage on the runner volume.
+  local df_target="${RUNNER_ROOT}"
+  [[ -d "${df_target}" ]] || df_target="/"
+  local disk_total="" disk_used="" disk_avail="" disk_pct=""
+  local dfline
+  dfline="$(df -k "${df_target}" 2>/dev/null | awk 'NR==2 {print $2, $3, $4, $5}' || true)"
+  if [[ -n "${dfline}" ]]; then
+    disk_total="$(printf '%s' "${dfline}" | awk '{print $1}')"
+    disk_used="$(printf '%s' "${dfline}" | awk '{print $2}')"
+    disk_avail="$(printf '%s' "${dfline}" | awk '{print $3}')"
+    disk_pct="$(printf '%s' "${dfline}" | awk '{gsub(/%/,"",$4); print $4}')"
+  fi
+
+  # Queue metrics (opt-in via GITHUB_PAT). Repo slug: GITHUB_QUEUE_REPO,
+  # else a repo-scoped runner's gitHubUrl; org-scoped runners are skipped.
+  local queue_json="" slug="${GITHUB_QUEUE_REPO:-}"
+  if [[ -n "${GITHUB_PAT:-}" ]]; then
+    if [[ -z "${slug}" && -f "${dir}/.runner" ]]; then
+      local gh_url path
+      gh_url="$(sed -n 's/.*"gitHubUrl"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+        "${dir}/.runner" 2>/dev/null | head -n1 || true)"
+      path="${gh_url#*://}"; path="${path#*/}"; path="${path%/}"
+      if [[ "${path}" == */* ]]; then
+        slug="${path}"
+      fi
+    fi
+    if [[ -n "${slug}" ]]; then
+      local counts q ip
+      counts="$(queue_counts "${slug}")"
+      q="$(printf '%s' "${counts}" | awk '{print $1}')"
+      ip="$(printf '%s' "${counts}" | awk '{print $2}')"
+      [[ -z "${q}" ]]  || queue_json="${queue_json},\"queue_queued\":${q}"
+      [[ -z "${ip}" ]] || queue_json="${queue_json},\"queue_in_progress\":${ip}"
+    fi
+  fi
+
+  # Optional fields as fragments; absent keys stay absent (not null).
+  local extra=""
+  [[ -z "${last_job_name}" ]]   || extra="${extra},\"last_job_name\":\"$(json_escape "${last_job_name}")\""
+  [[ -z "${last_job_result}" ]] || extra="${extra},\"last_job_result\":\"$(json_escape "${last_job_result}")\""
+  [[ -z "${disk_total}" ]]      || extra="${extra},\"disk_total_kb\":${disk_total}"
+  [[ -z "${disk_used}" ]]       || extra="${extra},\"disk_used_kb\":${disk_used}"
+  [[ -z "${disk_avail}" ]]      || extra="${extra},\"disk_avail_kb\":${disk_avail}"
+  [[ -z "${disk_pct}" ]]        || extra="${extra},\"disk_used_pct\":${disk_pct}"
+  extra="${extra}${queue_json}"
+
+  printf '{"ts":"%s","host":"%s","runner":"%s","runner_name":"%s","daemon_loaded":%s,"status":"%s"%s}\n' \
+    "$(iso_now)" "${HOST_LABEL}" "${name}" "$(json_escape "${runner_name}")" \
+    "$([[ "${daemon_loaded}" -eq 1 ]] && echo true || echo false)" \
+    "${status}" "${extra}"
+}
+
+run_metrics() {
+  # Queue metrics need the PAT in the curl config file (not in ps).
+  if [[ -n "${GITHUB_PAT:-}" ]]; then
+    make_curl_auth_config "${GITHUB_PAT}"
+  fi
+  # metrics reads the system launchd domain; prime sudo once up front so
+  # prompts don't interleave with JSON on stdout.
+  log "Requesting administrator privileges (needed for launchctl print system/...)"
+  if ! sudo -v; then
+    err "Could not obtain sudo privileges."
+    exit 1
+  fi
+  log "Emitting runner metrics to stdout (interval ${INTERVAL}s)"
+  while :; do
+    local d found=0
+    shopt -s nullglob
+    for d in "${RUNNER_ROOT}"/runner-*; do
+      [[ -d "${d}" ]] || continue
+      found=1
+      metrics_one "${d}"
+    done
+    shopt -u nullglob
+    if [[ "${found}" -eq 0 ]]; then
+      warn "No runners found under ${RUNNER_ROOT}."
+    fi
+    [[ "${ONCE}" -eq 1 ]] && break
+    sleep "${INTERVAL}"
+  done
+}
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+main() {
+  parse_args "$@"
+  detect_platform
+  require_cmds
+  detect_host
+  case "${MODE}" in
+    ship)    run_ship ;;
+    metrics) run_metrics ;;
+  esac
+}
+
+main "$@"
