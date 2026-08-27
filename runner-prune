@@ -1,0 +1,366 @@
+#!/usr/bin/env bash
+#
+# runner-prune — reclaim disk between GitHub Actions jobs on macOS runners
+#
+# Usage:
+#   runner-prune [--runners-dir DIR] [--min-free-gb N] [--dry-run]
+#
+# Designed to run automatically AFTER EVERY JOB via the runner's job hook
+# (ACTIONS_RUNNER_HOOK_JOB_COMPLETED, runner >= 2.296) or on a schedule via
+# launchd. It:
+#   1. purges each ${RUNNERS_DIR}/runner-N/_work directory (job checkouts,
+#      build output, tool caches staged per job),
+#   2. clears common tool caches in the invoking user's home (Homebrew, npm,
+#      yarn, pip, gradle, maven) — each guarded, so a missing dir is fine,
+#   3. OPTIONALLY prunes Docker (docker system prune -af --volumes) — only when
+#      docker is installed AND RUNNER_PRUNE_DOCKER=1,
+#   4. REFUSES (exit 75) when free disk is still below --min-free-gb after
+#      cleanup, so an operator/scheduler can block new jobs.
+#
+# Like runner-setup, it runs as the INVOKING (non-root) user and never sets
+# RUNNER_ALLOW_RUNASROOT. sudo is used ONLY as a non-interactive fallback for
+# root-owned files a job left behind under /opt.
+
+set -euo pipefail
+
+# ----------------------------------------------------------------------------
+# Constants / globals
+# ----------------------------------------------------------------------------
+PROG_NAME="$(basename "$0")"
+RUNNERS_DIR="/opt/github-runners"
+DEFAULT_MIN_FREE_GB=20
+EXIT_LOW_DISK=75        # distinctive refusal code: free space below threshold
+
+MIN_FREE_GB="${DEFAULT_MIN_FREE_GB}"
+DRY_RUN=0
+
+REAL_USER=""
+REAL_HOME=""
+
+# ----------------------------------------------------------------------------
+# Output helpers — progress to stderr, every line timestamped so hook output
+# captured under _diag can be correlated with job times.
+# ----------------------------------------------------------------------------
+ts()   { date '+%Y-%m-%d %H:%M:%S'; }
+log()  { printf '\033[1;34m==>\033[0m [%s] %s\n' "$(ts)" "$*" >&2; }
+step() { printf '\033[1;32m  ->\033[0m [%s] %s\n' "$(ts)" "$*" >&2; }
+warn() { printf '\033[1;33mWARN:\033[0m [%s] %s\n' "$(ts)" "$*" >&2; }
+err()  { printf '\033[1;31mERROR:\033[0m [%s] %s\n' "$(ts)" "$*" >&2; }
+
+usage() {
+  cat >&2 <<EOF
+${PROG_NAME} — reclaim disk between GitHub Actions jobs on macOS runners
+
+USAGE:
+  ${PROG_NAME} [--runners-dir DIR] [--min-free-gb N] [--dry-run]
+
+OPTIONS:
+  --runners-dir DIR   Root holding runner-N directories (default: ${RUNNERS_DIR}).
+  --min-free-gb N     Minimum free disk space, in GiB, required AFTER cleanup
+                      (default: ${DEFAULT_MIN_FREE_GB}). When free space on the volume
+                      holding the runners is still below this after pruning,
+                      the script refuses with exit code ${EXIT_LOW_DISK} and prints a
+                      clear message — wire that code into your scheduler to
+                      block new jobs until an operator intervenes.
+  --dry-run           Log what WOULD be removed (with sizes); delete nothing.
+  -h, --help          Show this help and exit.
+
+ENVIRONMENT:
+  RUNNER_PRUNE_DOCKER Set to 1 to also run 'docker system prune -af --volumes'.
+                      Ignored when docker is not installed. Default: off.
+
+EXAMPLES:
+  ${PROG_NAME}                          # post-job cleanup, 20 GiB floor
+  ${PROG_NAME} --min-free-gb 50         # stricter floor
+  ${PROG_NAME} --dry-run                # report sizes without deleting
+  RUNNER_PRUNE_DOCKER=1 ${PROG_NAME}    # also reclaim Docker images/volumes
+
+EXIT CODES:
+  0    Cleanup done; free space is at or above the threshold.
+  1    An operation failed (see the log).
+  2    Usage error (bad arguments).
+  ${EXIT_LOW_DISK}   Free disk is below --min-free-gb AFTER cleanup — refuse new jobs.
+
+POST-JOB HOOK:
+  Point ACTIONS_RUNNER_HOOK_JOB_COMPLETED (runner >= 2.296) at a wrapper that
+  execs this script; the runner captures hook output in the job log and under
+  _diag. See docs/disk-cleanup.md for the hook and launchd wiring.
+
+SECURITY NOTE:
+  This script deletes build output and caches; it never touches runner
+  registration files (.runner/.credentials) and never runs as root. It uses
+  sudo ONLY as a non-interactive fallback for root-owned files a job left
+  under ${RUNNERS_DIR}. No secrets are read or logged.
+EOF
+}
+
+# ----------------------------------------------------------------------------
+# Argument parsing
+# ----------------------------------------------------------------------------
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --runners-dir)
+        [[ $# -ge 2 ]] || { err "--runners-dir requires a value"; usage; exit 2; }
+        RUNNERS_DIR="$2"; shift 2 ;;
+      --runners-dir=*) RUNNERS_DIR="${1#*=}"; shift ;;
+      --min-free-gb)
+        [[ $# -ge 2 ]] || { err "--min-free-gb requires a value"; usage; exit 2; }
+        MIN_FREE_GB="$2"; shift 2 ;;
+      --min-free-gb=*) MIN_FREE_GB="${1#*=}"; shift ;;
+      --dry-run)       DRY_RUN=1; shift ;;
+      -h|--help)       usage; exit 0 ;;
+      *)
+        err "Unknown argument: $1"
+        usage
+        exit 2 ;;
+    esac
+  done
+
+  # Strip ALL trailing slashes so globbing/paths below stay clean.
+  while [[ "${RUNNERS_DIR}" == */ && "${RUNNERS_DIR}" != "/" ]]; do
+    RUNNERS_DIR="${RUNNERS_DIR%/}"
+  done
+
+  if ! [[ "${MIN_FREE_GB}" =~ ^[0-9]+$ ]] || [[ "${MIN_FREE_GB}" -lt 1 ]]; then
+    err "--min-free-gb must be a positive integer (got: '${MIN_FREE_GB}')"
+    exit 2
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# Environment detection (mirrors runner-setup / runner-cleanup)
+# ----------------------------------------------------------------------------
+detect_platform() {
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    err "This tool only supports macOS."
+    exit 1
+  fi
+}
+
+require_cmds() {
+  local missing=() c
+  for c in uname id df awk du rm mkdir date; do
+    command -v "${c}" >/dev/null 2>&1 || missing+=("${c}")
+  done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    err "Required command(s) not found: ${missing[*]}"
+    exit 1
+  fi
+}
+
+detect_user() {
+  # Resolve the real invoking user; never operate as root.
+  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+    REAL_USER="${SUDO_USER}"
+  else
+    REAL_USER="$(whoami)"
+  fi
+  if [[ "${REAL_USER}" == "root" ]]; then
+    err "Refusing to prune as root. Run this as the user that owns the runners;"
+    err "it uses sudo only internally (non-interactively) for /opt leftovers."
+    exit 1
+  fi
+  # `|| true`: dscl exits non-zero for a non-local (e.g. MDM/AD) user record,
+  # and with `pipefail` that would abort the whole script before the fallback.
+  REAL_HOME="$(dscl . -read "/Users/${REAL_USER}" NFSHomeDirectory 2>/dev/null \
+    | awk '{print $2}' || true)"
+  [[ -n "${REAL_HOME}" ]] || REAL_HOME="/Users/${REAL_USER}"
+  step "Pruning as ${REAL_USER} (home ${REAL_HOME})"
+}
+
+# ----------------------------------------------------------------------------
+# Free-space helpers
+# ----------------------------------------------------------------------------
+# Free space (in 1K blocks) on the volume holding the runners dir.
+free_kb() {
+  local target="${RUNNERS_DIR}"
+  [[ -d "${target}" ]] || target="/"
+  df -kP "${target}" | awk 'NR==2 {print $4}'
+}
+
+# Human-readable GiB for a 1K-block count (integer, awk-formatted).
+gb_of() {
+  awk -v kb="$1" 'BEGIN { printf "%.1f", kb / 1048576 }'
+}
+
+report_free() {
+  local label="$1"
+  local avail_kb
+  # Capture-then-check so set -e isn't masked inside command substitution.
+  if ! avail_kb="$(free_kb)"; then
+    err "Could not determine free disk space (df failed)."
+    exit 1
+  fi
+  step "Free disk (${label}): $(gb_of "${avail_kb}") GiB available"
+}
+
+# ----------------------------------------------------------------------------
+# Deletion helpers. kb_of and remove_path are tolerant of unreadable entries.
+# ----------------------------------------------------------------------------
+kb_of() {
+  local target="$1"
+  # The trailing `|| true` is REQUIRED: du exits non-zero on permission errors
+  # (job may have left root-owned files), and with `set -euo pipefail` a plain
+  # assignment whose pipeline fails would abort the script before we can log.
+  du -sk "${target}" 2>/dev/null | awk '{print $1}' || true
+}
+
+remove_path() {
+  local target="$1"
+  local desc="$2"
+
+  if [[ ! -e "${target}" && ! -L "${target}" ]]; then
+    step "Not present, skipping: ${target}"
+    return 0
+  fi
+
+  local size_kb
+  size_kb="$(kb_of "${target}")"
+
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log "dry-run: would remove ${desc}: ${target} ($(gb_of "${size_kb:-0}") GiB)"
+    return 0
+  fi
+
+  # Try as the invoking user first. runner-setup chowns everything under
+  # /opt/github-runners to the real user, so this normally succeeds and no
+  # sudo (and no password prompt inside a headless hook) is needed. Fall back
+  # to NON-INTERACTIVE sudo only for root-owned files a job left behind.
+  if rm -rf "${target}" 2>/dev/null; then
+    step "Removed ${desc}: ${target} ($(gb_of "${size_kb:-0}") GiB)"
+  elif sudo -n rm -rf "${target}" 2>/dev/null; then
+    warn "Removed ${desc} with sudo (job left root-owned files): ${target}"
+  else
+    err "Could not remove ${desc}: ${target} (permission denied)"
+    return 1
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# 1) Purge each runner's _work directory.
+# ----------------------------------------------------------------------------
+purge_work_dirs() {
+  log "Purging runner _work directories under ${RUNNERS_DIR}"
+  local work rc=0
+  shopt -s nullglob
+  for work in "${RUNNERS_DIR}"/runner-*/_work; do
+    [[ -d "${work}" ]] || continue
+    if ! remove_path "${work}" "work dir"; then
+      rc=1
+      continue
+    fi
+    # Recreate the dir empty: the runner expects to be able to cd into it.
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+      mkdir -p "${work}" 2>/dev/null || sudo -n mkdir -p "${work}" 2>/dev/null || true
+    fi
+  done
+  shopt -u nullglob
+  return "${rc}"
+}
+
+# ----------------------------------------------------------------------------
+# 2) Clear common tool caches in the invoking user's home. Each entry is
+#    guarded, so a missing dir (toolchain not used here) is fine.
+# ----------------------------------------------------------------------------
+purge_caches() {
+  log "Clearing tool caches under ${REAL_HOME}"
+  local rel rc=0
+  for rel in \
+    "Library/Caches/Homebrew" \
+    "Library/Caches/pip" \
+    "Library/Caches/Yarn" \
+    "Library/Caches/org.swift.swiftpm" \
+    ".npm" \
+    ".yarn/cache" \
+    ".cache/pip" \
+    ".gradle/caches" \
+    ".m2/repository" \
+  ; do
+    if ! remove_path "${REAL_HOME}/${rel}" "cache"; then
+      rc=1
+    fi
+  done
+  return "${rc}"
+}
+
+# ----------------------------------------------------------------------------
+# 3) Optional Docker prune — only when docker is installed AND opted in.
+# ----------------------------------------------------------------------------
+prune_docker() {
+  if [[ "${RUNNER_PRUNE_DOCKER:-0}" != "1" ]]; then
+    step "Docker prune disabled (set RUNNER_PRUNE_DOCKER=1 to enable); skipping."
+    return 0
+  fi
+  if ! command -v docker >/dev/null 2>&1; then
+    warn "RUNNER_PRUNE_DOCKER=1 but docker is not installed; skipping."
+    return 0
+  fi
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log "dry-run: would run: docker system prune -af --volumes"
+    return 0
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    warn "Docker daemon not reachable; skipping docker prune."
+    return 0
+  fi
+  log "Pruning Docker (docker system prune -af --volumes)"
+  if ! docker system prune -af --volumes; then
+    warn "docker system prune failed; continuing."
+  fi
+  return 0
+}
+
+# ----------------------------------------------------------------------------
+# 4) Enforce the minimum free-disk threshold AFTER cleanup.
+# ----------------------------------------------------------------------------
+enforce_min_free() {
+  local avail_kb need_kb
+  if ! avail_kb="$(free_kb)"; then
+    err "Could not determine free disk space (df failed)."
+    exit 1
+  fi
+  need_kb=$(( MIN_FREE_GB * 1048576 ))
+
+  step "Free disk (after): $(gb_of "${avail_kb}") GiB available, minimum ${MIN_FREE_GB} GiB required"
+  if (( avail_kb < need_kb )); then
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      warn "Free disk is BELOW ${MIN_FREE_GB} GiB (dry-run: not refusing, would exit ${EXIT_LOW_DISK})."
+      return 0
+    fi
+    err "REFUSING NEW WORK: free disk is below ${MIN_FREE_GB} GiB after cleanup"
+    err "($(gb_of "${avail_kb}") GiB available on the runner volume)."
+    err "Block new jobs on this runner until an operator frees space or raises"
+    err "the machine's disk. Exiting with code ${EXIT_LOW_DISK}."
+    exit "${EXIT_LOW_DISK}"
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+main() {
+  parse_args "$@"
+  detect_platform
+  require_cmds
+  detect_user
+
+  log "Starting disk prune (runners dir: ${RUNNERS_DIR}, min free: ${MIN_FREE_GB} GiB$( (( DRY_RUN )) && printf ', DRY RUN' ))"
+  report_free "before"
+
+  local rc=0
+  purge_work_dirs || rc=1
+  purge_caches    || rc=1
+  prune_docker    || rc=1
+
+  enforce_min_free
+
+  if [[ "${rc}" -ne 0 ]]; then
+    err "Some paths could not be removed. See the log above."
+  else
+    log "Prune complete."
+  fi
+  return "${rc}"
+}
+
+main "$@"
