@@ -16,17 +16,22 @@ runner-upgrade rollback --runner 2  # restore runner-2.prev over runner-2
 
 `run` is **canary-first**:
 
-1. The first selected runner (runner-1) is quiesced — its system daemon
-   `com.github.runner-1` is booted out.
-2. The new tarball is downloaded and SHA-256 verified exactly like
+1. The new tarball is downloaded and SHA-256 verified exactly like
    `runner-setup` does (same releases API, same `<!-- BEGIN SHA osx-* -->`
    marker parsing, same `shasum` verification).
+2. The first selected runner (runner-1) is stopped via its system daemon
+   `com.github.runner-1`. If the daemon remains loaded, the script stops before
+   changing any installation files. Run upgrades after draining active jobs;
+   booting out a service is not an idle-job check.
 3. The old install is moved aside to `runner-1.prev`, the new binaries are
-   extracted, and `.runner` / `.credentials*` / `.path` / `.env` / `_work`
-   are carried over from the previous install.
-4. The existing LaunchDaemon is re-bootstrapped and health is verified by
-   waiting (up to 120 s) for the newest `_diag/Runner_*.log` to print
-   `Listening for Jobs`.
+   extracted, and registration/migration files, `.path`, `.env`, `.service`,
+   `.github_pat`, and `_work` are carried over. The PAT is required by the
+   ephemeral supervisor; its file permissions are preserved.
+4. Before bootstrapping the existing LaunchDaemon, the script prepares
+   `_diag/runner-stdout.log`, `_diag/runner-stderr.log`, and the executable
+   service wrapper. Health is verified by waiting (up to 120 s) for a fresh
+   `_diag/Runner_*.log` to print `Listening for Jobs`. It does not immediately
+   kill/restart the new process with `kickstart -k`.
 5. If **any** of that fails, `runner-1.prev` is restored automatically and
    the remaining runners are left untouched.
 6. Only after a healthy canary are the remaining runners rolled the same way.
@@ -112,6 +117,42 @@ runner-upgrade rollback --runner 2      # one runner
 runner-upgrade rollback --all           # every runner that has a .prev
 ```
 
-Rollback boots out the daemon, swaps `runner-N.prev` back into place,
-re-bootstraps, and health-checks the same way. Once you are satisfied with an
-upgrade, delete the `.prev` directories to reclaim disk.
+Rollback confirms the daemon has stopped, moves the current `_work` back into
+`runner-N.prev`, then restores the old installation. If both directories
+contain `_work`, it refuses to overwrite either one. Startup diagnostics are
+retained under `/opt/github-runners/.upgrade-diagnostics/` before the failed
+installation is removed. Prior-version diagnostics are archived before
+restarting the restored version, so an old `Listening for Jobs` line cannot
+make a failed rollback look healthy. Unconfirmed rollback health returns an
+error; read the recovery status rather than assuming rollback succeeded.
+
+Once you are satisfied with an upgrade, remove the `.prev` directories to
+reclaim space. Apply your log retention policy to `.upgrade-diagnostics/`
+after exporting any needed evidence; the helper does not expire those logs.
+
+## Startup timeout after an upgrade
+
+A verified download followed by a readiness timeout means the new service
+was not confirmed ready. It does not indicate a failed SHA-256 check.
+The official runner archive deliberately omits `_diag` during
+[packaging](https://github.com/actions/runner/blob/v2.337.0/src/dev.sh#L165).
+The previous upgrader did not recreate the directory even though our
+LaunchDaemons place stdout/stderr inside it. It also omitted the ephemeral
+PAT and deleted failed-install logs/workspace during rollback. These paths
+now have regression coverage with an archive fixture lacking `_diag`.
+
+For a failed attempt with the corrected helper, inspect the printed archived
+diagnostics path, the current runner's `_diag`, and `upgrade.log`. Let recovery
+finish before starting another upgrade. Logs retained by the older helper
+may only describe the restored version because it removed the failed install.
+These startup and rollback fixes are included in tooling release **v1.8.0**.
+Update the helper before retrying, after any existing rollback has finished:
+
+```sh
+brew update
+brew upgrade joeblau/hb/runner-setup
+```
+
+Then run `runner-upgrade run --all` after confirming the runners are idle, and
+use `runner-upgrade check --all` to verify their installed binary versions.
+The Homebrew tooling version and GitHub's `actions/runner` version are separate.
