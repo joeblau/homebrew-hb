@@ -256,7 +256,7 @@ detect_arch() {
 require_cmds() {
   local missing=()
   local c
-  for c in curl tar uname id sudo launchctl dscl shasum tr grep sed awk ls date sleep; do
+  for c in curl tar uname id sudo launchctl dscl shasum tr grep sed awk ls date sleep mkdir mktemp chmod touch mv; do
     command -v "${c}" >/dev/null 2>&1 || missing+=("${c}")
   done
   if [[ ${#missing[@]} -gt 0 ]]; then
@@ -345,7 +345,10 @@ resolve_latest_release() {
 # download/shasum logic as runner-setup.
 # ----------------------------------------------------------------------------
 download_tarball() {
-  WORK_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/runner-upgrade.XXXXXX")"
+  local staging_root="${TMPDIR:-/tmp}"
+  [[ "${EUID}" -ne 0 ]] || staging_root=/tmp
+  WORK_TMPDIR="$(mktemp -d "${staging_root}/runner-upgrade.XXXXXX")"
+  sudo chown "${REAL_USER}:${REAL_GROUP}" "${WORK_TMPDIR}"
   TARBALL_PATH="${WORK_TMPDIR}/${TARBALL_NAME}"
 
   log "Downloading runner ${RUNNER_VERSION} (osx-${ARCH_TAG})"
@@ -396,10 +399,7 @@ discover_runners() {
     for d in "${RUNNER_ROOT}"/runner-*; do
       [[ -d "${d}" ]] || continue
       name="$(basename "${d}")"
-      case "${name}" in
-        *.prev) continue ;;   # rollback backup, not a live runner
-        *) found+=("${name}") ;;
-      esac
+      [[ "${name}" =~ ^runner-[0-9]+$ ]] && found+=("${name}")
     done
     shopt -u nullglob
   fi
@@ -433,7 +433,8 @@ bootout_system() {
     sudo launchctl print "system/${label}" >/dev/null 2>&1 || return 0
     sleep 1
   done
-  return 0
+  err "Timed out stopping system/${label}; refusing to modify its live installation."
+  return 1
 }
 
 # ----------------------------------------------------------------------------
@@ -452,10 +453,9 @@ installed_version() {
 }
 
 # ----------------------------------------------------------------------------
-# Health check: wait until the NEWEST _diag/Runner_*.log under ${dir} contains
-# 'Listening for Jobs' (bounded by HEALTH_TIMEOUT). The fresh install dir has
-# no _diag from the old version — the old logs moved away with runner-N.prev —
-# so any Runner_*.log found here belongs to the new process.
+# Health check: bootstrap_daemon rotates prior diagnostics before starting, so
+# any Runner_*.log in this directory belongs to the new launch. This also keeps
+# rollback from accepting a historical ready line in the restored backup.
 # ----------------------------------------------------------------------------
 wait_for_listening() {
   local dir="$1"
@@ -469,6 +469,25 @@ wait_for_listening() {
     waited=$((waited + 3))
   done
   return 1
+}
+
+# Keep startup evidence outside the installation before it is replaced or its
+# log directory reset. Archives are private and are never included in runner
+# discovery. Do not erase the failure evidence during automatic rollback.
+archive_diagnostics() {
+  local name="$1" dir="$2" archive_root="${RUNNER_ROOT}/.upgrade-diagnostics" archive
+  [[ -d "${dir}/_diag" ]] || return 0
+  if ! as_user mkdir -p "${archive_root}" || ! as_user chmod 700 "${archive_root}"; then
+    err "Could not prepare the diagnostics archive; refusing to discard logs."
+    return 1
+  fi
+  archive="$(as_user mktemp -d "${archive_root}/${name}-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")" || return 1
+  if ! as_user mv "${dir}/_diag" "${archive}/_diag"; then
+    err "Could not preserve diagnostics from ${dir}; logs remain in place."
+    return 1
+  fi
+  step "Preserved diagnostics: ${archive}/_diag"
+  log_event "${PROG_NAME} diagnostics ${name} saved=${archive}/_diag"
 }
 
 # ----------------------------------------------------------------------------
@@ -486,18 +505,34 @@ bootstrap_daemon() {
     err "Was this runner provisioned by runner-setup? Cannot bootstrap."
     return 1
   fi
+  local dir="${RUNNER_ROOT}/${name}"
+  if [[ ! -f "${dir}/bin/runsvc.sh" ]]; then
+    err "Service entrypoint missing: ${dir}/bin/runsvc.sh"
+    return 1
+  fi
+  bootout_system "${label}" || return 1
+  archive_diagnostics "${name}" "${dir}" || return 1
+  # The official release archive omits _diag. launchd opens the plist's output
+  # paths BEFORE executing the runner, so the service cannot create them itself.
+  if ! { as_user mkdir -p "${dir}/_diag" \
+      && as_user chmod u+x "${dir}/bin/runsvc.sh" \
+      && as_user touch "${dir}/_diag/runner-stdout.log" "${dir}/_diag/runner-stderr.log"; }; then
+    err "Could not prepare service executable and log paths for ${name}."
+    return 1
+  fi
   step "Bootstrapping system/${label}"
-  bootout_system "${label}"
+  sudo launchctl enable "system/${label}" 2>/dev/null || true
   if ! sudo launchctl bootstrap system "${plist}"; then
-    # Retry once after a brief settle — covers the async-teardown race.
+    # Retry once only after confirming a partially loaded service is stopped.
+    bootout_system "${label}" || return 1
     sleep 2
     if ! sudo launchctl bootstrap system "${plist}"; then
       err "launchctl bootstrap failed for ${name}."
       return 1
     fi
   fi
-  sudo launchctl enable "system/${label}" 2>/dev/null || true
-  sudo launchctl kickstart -k "system/${label}" 2>/dev/null || true
+  # RunAtLoad starts the freshly bootstrapped service. kickstart -k would kill
+  # that listener immediately and risk a conflicting GitHub session on restart.
   return 0
 }
 
@@ -521,9 +556,30 @@ rollback_runner() {
   log_event "${PROG_NAME} rollback ${name} start"
 
   # Quiesce before touching the install dir.
-  bootout_system "com.github.${name}"
+  if ! bootout_system "com.github.${name}"; then
+    record_status "${name}" "FAILED (rollback: service still loaded)"
+    return 1
+  fi
 
   if [[ -d "${dir}" ]]; then
+    # Upgrade moved _work out of .prev. Put it back before deleting the new
+    # install, including for an operator rollback after a successful upgrade.
+    if [[ -e "${dir}/_work" || -L "${dir}/_work" ]]; then
+      if [[ -e "${prev}/_work" || -L "${prev}/_work" ]]; then
+        err "Both installations contain _work; refusing to overwrite either workspace."
+        record_status "${name}" "FAILED (rollback: workspace conflict)"
+        return 1
+      fi
+      if ! as_user mv "${dir}/_work" "${prev}/_work"; then
+        err "Could not restore _work to ${prev}; both installations are retained."
+        record_status "${name}" "FAILED (rollback: preserve _work)"
+        return 1
+      fi
+    fi
+    if ! archive_diagnostics "${name}" "${dir}"; then
+      record_status "${name}" "FAILED (rollback: preserve diagnostics)"
+      return 1
+    fi
     step "Removing failed install ${dir}"
     if ! sudo rm -rf "${dir}"; then
       err "Could not remove ${dir}; manual intervention required."
@@ -557,6 +613,7 @@ rollback_runner() {
     warn "${name} rolled back but no 'Listening for Jobs' within ${HEALTH_TIMEOUT}s."
     record_status "${name}" "ROLLED BACK (unconfirmed)"
     log_event "${PROG_NAME} rollback ${name} unconfirmed"
+    return 1
   fi
   return 0
 }
@@ -589,7 +646,10 @@ upgrade_runner() {
 
   # --- Quiesce: boot the daemon out so no job is mid-flight on old code. ----
   step "Booting out system/${label}"
-  bootout_system "${label}"
+  if ! bootout_system "${label}"; then
+    record_status "${name}" "FAILED (service still loaded)"
+    return 1
+  fi
 
   # --- Move the old install aside (kept for rollback), extract the new. -----
   step "Moving ${dir} aside to ${prev}"
@@ -617,7 +677,7 @@ upgrade_runner() {
   # .prev on purpose: fresh logs make the health check unambiguous.
   step "Preserving registration state and _work"
   local f
-  for f in .runner .credentials .credentials_rsaparams .path .env; do
+  for f in .runner .runner_migrated .credentials .credentials_migrated .credentials_rsaparams .path .env .github_pat .service; do
     if [[ -f "${prev}/${f}" ]]; then
       if ! as_user cp -a "${prev}/${f}" "${dir}/${f}"; then
         err "Could not preserve ${f} for ${name}; rolling back."
@@ -790,10 +850,10 @@ cmd_run() {
   local canary="${RUNNER_NAMES[0]}"
   log "Canary: upgrading ${canary} first"
   if ! upgrade_runner "${canary}"; then
-    err "Canary ${canary} FAILED and was rolled back. Remaining runners untouched."
+    err "Canary ${canary} FAILED. See recovery status above; remaining runners untouched."
     log_event "${PROG_NAME} run aborted canary=${canary} FAILED"
     print_summary
-    err "Investigate ${RUNNER_ROOT}/${canary}/_diag/ before retrying."
+    err "Inspect ${RUNNER_ROOT}/.upgrade-diagnostics/ and ${RUNNER_ROOT}/${canary}/_diag/ before retrying."
     exit 1
   fi
   log "Canary ${canary} healthy on ${RUNNER_VERSION}; rolling remaining runners."
@@ -803,14 +863,14 @@ cmd_run() {
   for ((i = 1; i < ${#RUNNER_NAMES[@]}; i++)); do
     if ! upgrade_runner "${RUNNER_NAMES[$i]}"; then
       overall_rc=1
-      warn "${RUNNER_NAMES[$i]} failed (rolled back); continuing with remaining runners."
+      warn "${RUNNER_NAMES[$i]} failed; check its recovery status above. Continuing with remaining runners."
     fi
   done
 
   log_event "${PROG_NAME} run done latest=${RUNNER_VERSION} rc=${overall_rc}"
   print_summary
   if [[ "${overall_rc}" -ne 0 ]]; then
-    err "One or more runners failed to upgrade (each was rolled back). See above."
+    err "One or more runners failed to upgrade. See each runner’s recovery status above."
   else
     log "All selected runners upgraded to ${RUNNER_VERSION}."
     log "Previous installs kept as runner-N.prev; remove them once satisfied,"

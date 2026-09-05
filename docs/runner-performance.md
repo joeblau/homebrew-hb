@@ -40,11 +40,11 @@ so this review does not establish speedup numbers or optimal fleet sizing.
   runner service trigger backoff. New runner plists include Homebrew in PATH
   for headless supervisor startup. See [ephemeral runners](ephemeral-runners.md).
 
-These changes are in the working source. The Homebrew formula's stable URL
-still points to the published v1.7.0 archive. Shipping them through `brew
-upgrade` requires a new release and its actual archive checksum. Existing
-installed services do not change just because files in this checkout change;
-apply configuration changes during a drained maintenance window.
+These changes are included in tooling release **v1.8.0**, along with the
+[startup and rollback fixes](auto-upgrades.md) for `runner-upgrade`. Install
+with `brew update` followed by `brew upgrade joeblau/hb/runner-setup`. Updating
+the helper scripts does not itself upgrade GitHub's runner binaries or rewrite
+existing service configuration; perform those steps after draining active jobs.
 
 ## Capability map
 
