@@ -440,6 +440,10 @@ run_cycle() {
 main() {
   parse_args "$@"
   detect_platform
+  # Older installed plists may predate runner-setup's explicit Homebrew PATH.
+  # Find formula dependencies even before config.sh loads .path, while keeping
+  # the operator's existing tool precedence intact.
+  export PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}:/opt/homebrew/bin:/usr/local/bin"
   require_cmds
   detect_user
   check_runner_dir

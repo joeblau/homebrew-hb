@@ -116,3 +116,7 @@ The supervisor retains `.env` and `.path` so configured job hooks and tool
 paths survive re-registration. `runner-setup` passes the runner name explicitly,
 and manually launched supervisors pin their initial identity in memory, so
 GitHub deleting `.runner` does not change the next registration's host prefix.
+
+At supervisor startup, the standard Homebrew binary directories are appended
+to PATH so older installed LaunchDaemon plists can find the formula-provided
+`jq` dependency before `.path` is loaded. Existing PATH entries keep priority.
