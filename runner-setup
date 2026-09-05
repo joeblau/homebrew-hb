@@ -419,39 +419,70 @@ resolve_latest_release() {
 # Download + cache the tarball once (shared across all runners)
 # ----------------------------------------------------------------------------
 download_tarball() {
-  WORK_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/runner-setup.XXXXXX")"
   TARBALL_PATH="${WORK_TMPDIR}/${TARBALL_NAME}"
 
-  log "Downloading runner ${RUNNER_VERSION} (osx-${ARCH_TAG})"
-  if ! curl -fL --retry 3 --retry-delay 2 --proto '=https' --tlsv1.2 \
-      -o "${TARBALL_PATH}" "${DOWNLOAD_URL}"; then
-    err "Download failed: ${DOWNLOAD_URL}"
-    exit 1
+  local cache_dir="${REAL_HOME}/Library/Caches/github-actions-runner"
+  local cached="${cache_dir}/${TARBALL_NAME}" got="" cache_hit=0
+  # Revalidate against the currently published digest on EVERY reuse. A warm
+  # local cache avoids re-downloading the same archive for each autoscale tick.
+  if [[ -f "${cached}" && ! -L "${cached}" ]]; then
+    got="$(shasum -a 256 "${cached}" | awk '{print $1}')"
+    if [[ "${got}" == "${EXPECTED_SHA}" ]]; then
+      cp "${cached}" "${TARBALL_PATH}"
+      cache_hit=1
+      step "Reusing cached runner archive: ${TARBALL_NAME}"
+    else
+      warn "Cached archive checksum mismatch; downloading a fresh copy."
+    fi
+  fi
+  if [[ ! -f "${TARBALL_PATH}" ]]; then
+    log "Downloading runner ${RUNNER_VERSION} (osx-${ARCH_TAG})"
+    if ! curl -fL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 1200 \
+        --proto '=https' --tlsv1.2 -o "${TARBALL_PATH}" "${DOWNLOAD_URL}"; then
+      err "Download failed: ${DOWNLOAD_URL}"; exit 1
+    fi
   fi
 
-  # Sanity check the archive is a valid gzip tar before we touch /opt.
-  if ! tar -tzf "${TARBALL_PATH}" >/dev/null 2>&1; then
-    err "Downloaded file is not a valid tar.gz archive: ${TARBALL_PATH}"
-    exit 1
-  fi
-
-  # Verify checksum against the published digest. EXPECTED_SHA is guaranteed
-  # non-empty here (resolve_latest_release exits if it could not be obtained),
-  # so verification is mandatory, not best-effort.
-  local got
+  # Check the actual staged bytes before inspecting/extracting the archive.
   got="$(shasum -a 256 "${TARBALL_PATH}" | awk '{print $1}')"
   if [[ "${got}" != "${EXPECTED_SHA}" ]]; then
-    err "SHA256 mismatch for ${TARBALL_NAME}"
-    err "  expected: ${EXPECTED_SHA}"
-    err "  actual:   ${got}"
-    exit 1
+    err "SHA256 mismatch for ${TARBALL_NAME}"; exit 1
+  fi
+  if ! tar -tzf "${TARBALL_PATH}" >/dev/null 2>&1; then
+    err "Downloaded file is not a valid tar.gz archive: ${TARBALL_PATH}"; exit 1
   fi
   step "SHA256 verified (${got})"
+
+  # Atomic publication: parallel setup processes never consume a partial copy.
+  if [[ "${cache_hit}" -eq 1 ]]; then
+    : # Existing verified cache is already published; avoid another full write.
+  elif as_user mkdir -p "${cache_dir}" \
+      && as_user cp "${TARBALL_PATH}" "${cached}.$$" \
+      && as_user mv -f "${cached}.$$" "${cached}"; then
+    step "Runner archive cached for subsequent provisioning."
+  else
+    warn "Could not persist the archive cache; this provision can continue."
+    as_user rm -f "${cached}.$$" 2>/dev/null || true
+  fi
 
   # macOS may quarantine downloaded archives; clear it so binaries run.
   xattr -c "${TARBALL_PATH}" 2>/dev/null || true
 
   step "Downloaded and validated: ${TARBALL_PATH}"
+}
+
+# Avoid both the release API and the archive download on a no-op setup rerun.
+# One archive is shared by every runner requiring binaries in this invocation.
+prepare_runner_archive() {
+  local i
+  for ((i = 1; i <= RUNNERS; i++)); do
+    if [[ ! -x "${RUNNER_ROOT}/runner-${i}/config.sh" || ! -f "${RUNNER_ROOT}/runner-${i}/bin/runsvc.sh" ]]; then
+      resolve_latest_release
+      download_tarball
+      return 0
+    fi
+  done
+  step "All requested runner binaries are present; skipping release download."
 }
 
 # ----------------------------------------------------------------------------
@@ -533,7 +564,10 @@ configure_runner() {
     local existing_url
     existing_url="$(sed -n 's/.*"gitHubUrl"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
       "${dir}/.runner" 2>/dev/null | head -n1 || true)"
-    if [[ "${existing_url}" == "${RUNNER_URL}" ]]; then
+    # GitHub owner/repo names are case-insensitive. Avoid restarting a loaded
+    # runner merely because the requested scope differs in casing/trailing '/'.
+    while [[ "${existing_url}" == */ ]]; do existing_url="${existing_url%/}"; done
+    if [[ "$(printf '%s' "${existing_url}" | tr '[:upper:]' '[:lower:]')" == "$(printf '%s' "${RUNNER_URL}" | tr '[:upper:]' '[:lower:]')" ]]; then
       step "${name} already configured as '${runner_name}' for ${RUNNER_URL} and loaded — skipping."
       record_status "${name}" "skipped (already loaded as '${runner_name}')"
       return 0
@@ -564,11 +598,11 @@ configure_runner() {
   fi
 
   # --- Extract runner files as the real user. ------------------------------
-  if [[ -x "${dir}/config.sh" ]]; then
+  if [[ -x "${dir}/config.sh" && -f "${dir}/bin/runsvc.sh" ]]; then
     step "Runner binaries already present; reusing."
   else
     step "Extracting runner files"
-    as_user tar -xzf "${TARBALL_PATH}" -C "${dir}"
+    as_user tar -xzf "${TARBALL_PATH}" -C "${dir}" || return 1
   fi
   # Ensure ownership is the real user after extraction (belt-and-suspenders).
   sudo chown -R "${REAL_USER}:${REAL_GROUP}" "${dir}"
@@ -682,6 +716,8 @@ configure_runner() {
       program_args=("${program}" --dir "${dir}" --url "${RUNNER_URL}" --labels "${LABELS}")
     fi
 
+    program_args+=(--name "${runner_name}")
+
     # The supervisor needs a GitHub PAT to mint fresh registration tokens on
     # every cycle. The plist must NOT contain it (plists are world-readable),
     # so store it as a mode-600 file owned by the runner user; GITHUB_PAT from
@@ -730,6 +766,8 @@ ${args_xml}  </array>
   <dict>
     <key>HOME</key>
     <string>${REAL_HOME}</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>ACTIONS_RUNNER_SVC</key>
     <string>1</string>
   </dict>
@@ -831,8 +869,13 @@ main() {
   detect_arch
   detect_host
   ensure_sudo
-  resolve_latest_release
-  download_tarball
+  local staging_root="${TMPDIR:-/tmp}"
+  [[ "${EUID}" -ne 0 ]] || staging_root=/tmp
+  WORK_TMPDIR="$(mktemp -d "${staging_root}/runner-setup.XXXXXX")"
+  # When invoked through sudo, extraction/cache writes still run as REAL_USER.
+  # That user must be able to traverse the private staging directory.
+  sudo chown "${REAL_USER}:${REAL_GROUP}" "${WORK_TMPDIR}"
+  prepare_runner_archive
   prepare_root_dir
 
   log "Provisioning ${RUNNERS} runner(s) under ${RUNNER_ROOT}"

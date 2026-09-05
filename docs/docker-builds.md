@@ -1,233 +1,237 @@
 # Fast Docker image builds on macOS runners
 
-Docker Desktop on macOS builds every image inside a Linux VM. Each build pays
-for the VM's CPU throttling, memory cap, and (for bind-mounted contexts) the
-`osxfs`/`virtiofs` file-sharing layer — on multi-stage builds this routinely
-costs 3–10× versus native Linux. Commercial runner vendors (e.g. Blacksmith)
-advertise ~40× faster Docker builds largely by moving builds onto bare-metal
-Linux builders.
+`runner-docker-builder` provisions a persistent BuildKit builder on a remote
+Linux Docker host or in a local Colima VM. Keeping its layers and dependency
+cache mounts warm avoids repeated downloads and compilation. Actual speed
+also depends on CPU, storage, architecture, network distance, and workload;
+this repository has no measured speedup against Docker Desktop or Blacksmith.
 
-`runner-docker-builder` (at the repo root) wires the docker buildx CLI on your
-macOS self-hosted runners to a faster builder, without changing any workflow
-YAML: once a builder is the default for the runner user, plain `docker build`
-and `docker/build-push-action` use it automatically.
+Run setup once as the runner's service user, between jobs. Use the same
+`HOME` and `DOCKER_CONFIG` in setup and workflows. The helper installs missing
+Docker tooling with Homebrew and links its Buildx plugin into
+`${DOCKER_CONFIG:-$HOME/.docker}/cli-plugins` when necessary, following the
+[Colima installation instructions](https://colima.run/docs/installation/).
 
-## Options
+## Remote Linux builder
 
-### Option A — remote Linux builder (recommended)
-
-Build on any reachable Linux machine over SSH via the buildx `remote` driver.
-Builds run on native Linux — no VM layer at all. Any always-on Linux box (an
-old PC, a cloud VM, a spare mini) works; it only needs Docker and SSH access
-from the runner user.
-
-Prerequisites:
-
-- A Linux host with Docker installed; the remote user can run `docker`
-  (member of the `docker` group).
-- SSH key auth from the runner's macOS user to the remote user
-  (`ssh user@linux-builder` must succeed non-interactively).
-
-Setup (run as the same non-root user the runner daemons run as):
+The remote host needs a running Linux Docker daemon and noninteractive SSH
+access from the runner user. Configure the host key and an SSH key or agent
+available to that service account; interactive shell access alone does not
+establish access for a LaunchDaemon.
 
 ```sh
 runner-docker-builder setup-remote --host ssh://ci@linux-builder.internal
-
-# or via env var, and pin target platforms:
-BUILDER_SSH_HOST=ssh://ci@10.0.0.5 runner-docker-builder setup-remote \
-    --platform linux/amd64,linux/arm64
+# Docker also handles SSH ports and SSH config aliases:
+runner-docker-builder setup-remote --host ssh://ci@linux-builder.internal:2222
 ```
 
-This creates (or verifies) a buildx builder named `runner-remote` with the
-`remote` driver, installs the buildx CLI plugin via Homebrew if missing, and
-sets `runner-remote` as the default builder for the user.
+The helper verifies the remote Docker daemon, creates `runner-remote` with
+the `docker-container` driver at that exact endpoint, boots it, and selects
+it for Buildx. A matching existing builder and its volume are reused. The
+`remote` driver is for an independently managed **BuildKit daemon**, not an
+ordinary Docker daemon accessed over SSH. See Docker's
+[driver reference](https://docs.docker.com/build/builders/drivers/remote/) and
+[builder creation reference](https://docs.docker.com/reference/cli/docker/buildx/create/).
 
-### Option B — local colima VM (no remote machine available)
+Prefer a nearby host with fast SSD storage and the CPU architecture of your
+build target. A cloud VM is supported; the helper does not turn it into
+bare metal or eliminate that host's virtualization overhead.
 
-[colima](https://github.com/abiosoft/colima) runs a lightweight Lima VM —
-less overhead than Docker Desktop, and free of its licensing terms. Slower
-than native remote Linux, but fully local:
+## Local Colima builder
 
 ```sh
-runner-docker-builder setup-colima                  # defaults: 4 cpu, 8 GiB, 60 GiB
+runner-docker-builder setup-colima                  # 4 CPUs, 8 GiB RAM, 60 GiB disk
 runner-docker-builder setup-colima --cpu 6 --mem 12 --disk 100
 ```
 
-This installs `colima`, the `docker` CLI, and `docker-buildx` via Homebrew,
-starts the VM, and creates a `docker-container`-driver buildx builder named
-`runner-colima` set as default. The `docker-container` driver (unlike the
-plain `docker` driver) supports full cache export and multi-platform builds.
+This starts Colima's `default` profile using Docker and binds
+`runner-colima` explicitly to the `colima` Docker context, even if Desktop
+or another context was previously active. Newly created Apple Silicon
+profiles on macOS 13+ use Apple's VZ framework and VirtioFS mounts. Existing
+profiles keep their VM and mount type. See
+[Colima configuration](https://colima.run/docs/configuration/).
 
-### Revert / inspect
-
-```sh
-runner-docker-builder use-desktop   # back to Docker Desktop's desktop-linux builder
-runner-docker-builder status        # show active context, builders, and mode
-```
-
-## Layer caching
-
-A fast builder only stays fast if layers are reused. Wire a shared cache into
-`docker/build-push-action` so layers survive across runner hosts and reboots.
-
-### Registry cache (simplest — works today)
-
-Push cache metadata to a tag in the same registry you already push to:
-
-```yaml
-cache-from: type=registry,ref=ghcr.io/OWNER/REPO:buildcache
-cache-to:   type=registry,ref=ghcr.io/OWNER/REPO:buildcache,mode=max
-```
-
-`mode=max` exports cache for every stage of a multi-stage build (default
-`mode=min` only exports the final image's layers). Registry auth reuses the
-`docker/login-action` credentials already in the workflow.
-
-### S3 cache backend (optional companion)
-
-If you deploy the shared cache backend from the companion issue — see
-**docs/cache-backend.md** — point buildx at it with the `s3` cache driver.
-Keep credentials in environment variables / CI secrets, never in the YAML:
+An already running VM keeps its current CPU/memory/disk allocation. To resize,
+stop Colima between jobs and rerun setup with the desired resource flags.
+Leave enough host RAM and CPU for concurrent native macOS jobs. Colima disk
+size can increase; shrinking an existing disk is unsupported.
 
 ```sh
-# runner environment (e.g. exported in the LaunchDaemon env or job env)
-export ACTIONS_CACHE_S3_BUCKET="actions-cache"
-export ACTIONS_CACHE_S3_ENDPOINT="https://cache.internal:9000"   # any S3 API
-export ACTIONS_CACHE_S3_REGION="us-east-1"
-# AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY come from CI secrets
+runner-docker-builder status
+runner-docker-builder use-desktop
 ```
 
-```yaml
-cache-from: type=s3,bucket=${{ env.ACTIONS_CACHE_S3_BUCKET }},region=${{ env.ACTIONS_CACHE_S3_REGION }},endpoint_url=${{ env.ACTIONS_CACHE_S3_ENDPOINT }},name=app-image
-cache-to:   type=s3,bucket=${{ env.ACTIONS_CACHE_S3_BUCKET }},region=${{ env.ACTIONS_CACHE_S3_REGION }},endpoint_url=${{ env.ACTIONS_CACHE_S3_ENDPOINT }},name=app-image,mode=max
+`use-desktop` verifies and selects Docker Desktop's `desktop-linux` context
+and builder. It reports an error if Desktop is unavailable.
+
+## Explicit workflow selection
+
+Use `--builder runner-remote` (or `runner-colima`) for predictable routing:
+
+```sh
+docker buildx build --builder runner-remote --push -t ghcr.io/OWNER/IMAGE:TAG .
+# To import a single-platform image into the client's current Docker daemon:
+docker buildx build --builder runner-remote --load -t app:test .
 ```
 
-The env hook names above are deliberately generic — any S3-compatible service
-works; see docs/cache-backend.md for the concrete backend deployment.
+`--load` needs a reachable Docker daemon on the client side; `--push` exports
+directly to the registry. Without either output, the result stays in the
+builder's cache. Plain `docker build` uses the Docker Engine's default
+builder unless you pass `--builder` or set `BUILDX_BUILDER`; selecting a
+Buildx builder does not transparently reroute all Docker commands. See
+[Docker's builder selection rules](https://docs.docker.com/build/builders/).
 
-### Inline cache (for plain `docker build` consumers)
-
-If some consumers only `docker pull` and build with the classic builder, also
-embed inline metadata so the pulled image itself acts as a cache source:
-
-```yaml
-cache-from: type=registry,ref=ghcr.io/OWNER/REPO:latest
-build-args: BUILDKIT_INLINE_CACHE=1
-```
-
-`cache-inline` (via `cache-to: type=inline`) writes cache metadata into the
-image config; it only caches the final stage, so prefer `mode=max` registry
-or S3 cache for multi-stage builds.
-
-## Drop-in workflow
-
-Works unchanged on the macOS self-hosted runners after
-`runner-docker-builder setup-remote ...` — the named builder is already the
-user's default, so `docker/setup-buildx-action` picks it up via `driver-opts`
-or you can pin it explicitly:
+For a provisioned persistent builder, pass the
+[`build-push-action` builder input](https://github.com/docker/build-push-action)
+and omit `setup-buildx-action`. Its default behavior creates a separate
+builder and removes it after the job. The example publishes trusted `main`
+branch builds and serializes writers to the shared image/cache tags:
 
 ```yaml
 name: build
-on: [push]
-
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+  packages: write
+concurrency:
+  group: docker-main-${{ github.repository }}
+  cancel-in-progress: false
 jobs:
   docker:
-    runs-on: [self-hosted, macos]
+    runs-on: [self-hosted, macOS]
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: docker/setup-buildx-action@v3
-        with:
-          # builder name created by runner-docker-builder; omit to use the
-          # runner user's current default (already runner-remote).
-          buildx-version: latest
-
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@v6
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
+          builder: runner-remote
           context: .
           push: true
           tags: ghcr.io/${{ github.repository }}:latest
-          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache
-          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache,mode=max
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache-main
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache-main,mode=max
+          provenance: mode=min
+          sbom: true
 ```
 
-For a one-off explicit remote endpoint (no pre-provisioned builder):
+Use a lowercase registry path if your GitHub owner/repository contains
+uppercase characters. SBOM generation adds work; measure its cost separately
+from image compilation. These current action majors use Node 24; update the
+self-hosted Actions runner to a compatible release before using them.
+
+For a temporary, job-managed builder, use
+[`setup-buildx-action`](https://github.com/docker/setup-buildx-action) with an
+explicit Docker endpoint and pass its output to the build action:
 
 ```yaml
-      - uses: docker/setup-buildx-action@v3
-        with:
-          driver: remote
-          endpoint: ssh://ci@linux-builder.internal
+- uses: docker/setup-buildx-action@v4
+  id: buildx
+  with:
+    driver: docker-container
+    endpoint: ssh://ci@linux-builder.internal
+- uses: docker/build-push-action@v7
+  with:
+    builder: ${{ steps.buildx.outputs.name }}
+    context: .
+    push: true
+    tags: ghcr.io/${{ github.repository }}:latest
+    cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache-main
 ```
 
-## Measuring the baseline (required before/after comparison)
+That job-managed option needs registry login and SSH authentication too.
+Use the persistent helper for warm cache mounts across jobs. Do not run setup,
+remove builders, or change global Docker configuration during concurrent jobs.
 
-Run this repeatable benchmark on the same Mac, once with Docker Desktop as
-the default builder and once against the remote builder. Use a representative
-multi-stage Dockerfile; this sample exercises dependency caching and a
-compile stage:
+## Cache and architecture tuning
 
-```dockerfile
-# Dockerfile.bench
-FROM golang:1.22 AS deps
-WORKDIR /app
-COPY go.mod go.sum ./
-RUN go mod download
+Registry cache is the supported shared-cache example. `mode=max` exports
+intermediate stages as well as final-stage layers. Use separate writable
+cache references for each image, branch, and architecture where appropriate,
+and import both branch and main caches. Concurrent exporters to the same
+reference overwrite it, so serialize writers or give them distinct refs.
+[Docker cache backends](https://docs.docker.com/build/cache/backends/) documents
+multiple imports, modes, and driver requirements.
 
-FROM deps AS build
-COPY . .
-RUN go build -o /bin/app ./...
+Use a small `.dockerignore`, copy dependency manifests before frequently
+changed source, and add `RUN --mount=type=cache` to expensive package/compiler
+steps. Those cache mounts live on the BuildKit worker; registry layer export
+does not make their contents portable across unrelated workers. Persistent
+builder volumes and registry cache complement one another. See
+[cache optimization](https://docs.docker.com/build/cache/optimize/) and
+[BuildKit cache mounts](https://docs.docker.com/reference/dockerfile/#run---mounttypecache).
 
-FROM gcr.io/distroless/static
-COPY --from=build /bin/app /bin/app
-ENTRYPOINT ["/bin/app"]
-```
+S3 is **not a supported default here**: Docker's backend overview marks it
+unreleased and its dedicated page marks it experimental. Using it requires
+verifying support in your exact BuildKit image and arranging credentials
+where the BuildKit daemon runs; merely exporting AWS variables on the Mac
+or deploying the companion Actions cache service does not configure a remote
+BuildKit container. See the [S3 backend documentation](https://docs.docker.com/build/cache/backends/s3/).
 
-Methodology — identical machine, identical source tree, warm daemon:
+For multi-platform images, prefer native nodes or Dockerfile cross-compilation
+before emulation. `setup-remote --platform linux/amd64,linux/arm64` advertises
+platforms at creation; it does not install QEMU or add native capacity. On an
+existing builder that option leaves its platform configuration unchanged.
+Check `docker buildx inspect --bootstrap runner-remote`, then select targets
+with the build's `--platform` flag. For native clusters, manage a separate
+multi-node builder using `docker buildx create --append`. See
+[Docker multi-platform builds](https://docs.docker.com/build/building/multi-platform/).
+
+BuildKit supports registry mirrors, garbage collection, and maximum
+parallelism through a daemon configuration file. Set those for the builder's
+actual CPU/RAM, disk capacity, and registry access before creating it; the
+helper honors Buildx's standard `buildkitd.default.toml` lookup. Keep cache
+space bounded without pruning every job. See
+[BuildKit configuration](https://docs.docker.com/build/buildkit/toml-configuration/).
+
+## Existing builder migration and maintenance
+
+The helper refuses to replace a builder if its driver/endpoint differs from
+the expected configuration. Inspect it first with `docker buildx inspect
+runner-remote`. For the old incorrect `remote` driver, remove only the obsolete
+registration during a maintenance window, then rerun setup. For a
+`docker-container` builder that must be recreated on the **same host**,
+`docker buildx rm --keep-state NAME` preserves its state volume; reuse the
+same builder/node name. It does not transfer volumes to a new host. See
+[Docker's cache persistence instructions](https://docs.docker.com/build/builders/drivers/docker-container/).
+
+Track `docker buildx du --builder runner-remote`, available disk, BuildKit
+version, and job queue time. Preserve the cache during planned upgrades,
+verify a representative build afterward, and schedule maintenance while jobs
+are drained. The helper does not automatically upgrade an existing BuildKit
+container, prune caches, or start Colima at boot.
+
+## Measure before and after
+
+Use a representative Dockerfile, fixed source/base image digests, the same
+target platform, and the same output destination for each builder. Record
+CPU/memory limits, concurrency, BuildKit version, network transfer, cache
+import/export, and total job time.
 
 ```sh
-# 1. Record the active builder
-runner-docker-builder status
-
-# 2. Cold build (no cache at all — measures raw build throughput)
-docker buildx build --no-cache --pull -f Dockerfile.bench -t bench:run .
-
-# 3. Warm build, no source changes (measures local layer-cache hit)
-time docker buildx build -f Dockerfile.bench -t bench:run .
-
-# 4. Warm build with a one-line source change (measures incremental rebuild)
-time docker buildx build -f Dockerfile.bench -t bench:run .
-
-# 5. Repeat 2–4 after switching builders:
-runner-docker-builder use-desktop      # baseline: Docker Desktop
-runner-docker-builder setup-remote --host ssh://ci@linux-builder.internal
+# Substitute desktop-linux, runner-colima, and runner-remote in separate runs.
+# --output avoids differences in image loading; replace with the same --push
+# destination in each run when measuring end-to-end registry publication.
+time docker buildx build --builder runner-remote --no-cache \
+  --progress plain --output type=cacheonly .
+time docker buildx build --builder runner-remote \
+  --progress plain --output type=cacheonly .
+# Make a small source-only change, then repeat the warm command.
 ```
 
-Record results in this table (add it to your PR or ops notes):
+`--no-cache` bypasses instruction-layer reuse; it does not erase downloaded
+base images or persistent cache mounts. Use disposable builders for a truly
+empty-cache comparison, without pruning production builders. Repeat each
+case several times, compare medians, and separately measure the first build
+after restoring registry cache on a fresh worker.
 
-| Builder        | Cold build (s) | Warm, no change (s) | Warm, 1-line change (s) | Speedup vs Desktop |
-|----------------|----------------|---------------------|--------------------------|--------------------|
-| Docker Desktop |                |                     |                          | 1.0×               |
-| runner-remote  |                |                     |                          |                    |
-| runner-colima  |                |                     |                          |                    |
-
-Expect the cold-build column to show the largest gap (native Linux CPU/IO vs
-the Desktop VM) and the warm columns to converge toward the cache backend's
-latency — which is why the layer caching section matters on the remote path:
-without a shared cache, a fresh remote builder starts cold.
-
-## Notes
-
-- Everything runs as the invoking non-root user; `runner-docker-builder`
-  never uses sudo and stores all state in `~/.docker` and `~/.colima`.
-- The remote builder's layers live on the Linux host — size its disk for the
-  cache you intend to keep, and prune on a schedule (`docker buildx prune`).
-- Multi-arch (`--platform linux/amd64,linux/arm64`) offloads emulation to
-  QEMU on the Linux builder; install `qemu-user-static`/`binfmt` there if you
-  need foreign-arch stages.
+| Builder | Layers bypassed (s) | Warm, unchanged (s) | Warm, source change (s) | Full job (s) |
+| --- | --- | --- | --- | --- |
+| Docker Desktop | | | | |
+| runner-remote | | | | |
+| runner-colima | | | | |

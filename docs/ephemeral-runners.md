@@ -1,10 +1,10 @@
 # Ephemeral self-hosted runners
 
 Ephemeral runners are GitHub Actions self-hosted runners that pick up **exactly
-one job** and are then automatically removed by GitHub. Each job starts on a
-pristine machine image (or, here, a pristine runner directory), which is the
-recommended hardening for running untrusted CI: no leftover build artifacts,
-credentials, or processes can leak from one job into the next.
+one job** and are then automatically removed by GitHub. This supervisor resets the workspace and registration between jobs. The
+host, user home, package caches, processes, and credentials outside `_work`
+remain shared. It is intended for trusted workloads; a disposable VM or host
+is needed to reset those resources for untrusted jobs.
 
 The GitHub Actions runner supports this natively via `config.sh --ephemeral`:
 the runner unregisters itself and exits as soon as its one job completes. What
@@ -23,7 +23,7 @@ launchd (system/com.github.runner-N, KeepAlive, ThrottleInterval=10)
        loop:
          1. read name/url from .runner (previous registration's identity)
          2. POST /orgs/ORG/actions/runners/registration-token  (fresh token, GITHUB_PAT)
-         3. wipe _work/ and .runner/.credentials*/.env/.path
+         3. wipe _work/ and .runner/.credentials* (keep operator .env/.path)
          4. config.sh --unattended --ephemeral --replace (same name/labels/url)
          5. bin/runsvc.sh in the foreground  →  runs ONE job  →  exits
          → loop again
@@ -36,7 +36,7 @@ launchd (system/com.github.runner-N, KeepAlive, ThrottleInterval=10)
 - **One job per registration.** Because every cycle registers with
   `--ephemeral`, GitHub removes the runner from the Runners list the moment its
   job finishes; the supervisor immediately mints a fresh registration.
-- **Failure handling.** A failed token fetch or `config.sh` run retries with
+- **Failure handling.** A failed token fetch, cleanup, `config.sh`, or runner service retries with
   exponential backoff (10s → 20s → 40s … capped at 300s). After 5 consecutive
   failures the supervisor exits non-zero, and launchd's `KeepAlive` +
   `ThrottleInterval` restarts it — the daemon self-heals without crash-looping.
@@ -65,7 +65,8 @@ The PAT reaches the supervisor in one of two ways (env wins):
 2. `GITHUB_PAT` in the supervisor's own environment (e.g. when running it
    manually for testing).
 
-The PAT is used only in an `Authorization: Bearer` header and is never logged.
+The PAT is passed through curl's standard-input configuration as an
+`Authorization: Bearer` header; it is never logged or included in curl argv.
 The short-lived registration token is passed to `config.sh` as an argument
 (`config.sh` has no env alternative), so it is briefly visible in `ps` to other
 local users — the same trade-off `runner-setup` already makes.
@@ -110,3 +111,12 @@ Enterprise), `--max-failures` — see `runner-ephemeral --help`.
   logs intentionally persist so failures remain diagnosable.
 - A `--url` scope with a path deeper than `OWNER/REPO` cannot be mapped to an
   API endpoint — use `--org`/`--repo` (and `--api-url` for GHE) in that case.
+
+The supervisor retains `.env` and `.path` so configured job hooks and tool
+paths survive re-registration. `runner-setup` passes the runner name explicitly,
+and manually launched supervisors pin their initial identity in memory, so
+GitHub deleting `.runner` does not change the next registration's host prefix.
+
+At supervisor startup, the standard Homebrew binary directories are appended
+to PATH so older installed LaunchDaemon plists can find the formula-provided
+`jq` dependency before `.path` is loaded. Existing PATH entries keep priority.

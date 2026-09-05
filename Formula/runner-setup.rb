@@ -9,6 +9,7 @@ class RunnerSetup < Formula
   license "MIT"
 
   depends_on :macos
+  depends_on "jq"
 
   def install
     bin.install %w[
