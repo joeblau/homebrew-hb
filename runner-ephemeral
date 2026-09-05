@@ -396,9 +396,19 @@ run_cycle() {
   # config.sh re-creates .runner/.credentials; --ephemeral makes GitHub remove
   # the runner automatically after it completes ONE job. --replace overwrites
   # any stale same-name registration left by an interrupted previous cycle.
-  local config_rc=0
+  local config_rc=0 saved_path=""
+  # Upstream config.sh runs env.sh, which rewrites .path from its environment.
+  # Carry the existing toolchain PATH into config, not just through wipe_state.
+  if [[ -f "${DIR}/.path" ]]; then
+    if ! saved_path="$(cat "${DIR}/.path")"; then
+      FETCHED_TOKEN=""
+      warn "Could not read the saved toolchain PATH; refusing re-registration."
+      return 1
+    fi
+  fi
   (
     cd "${DIR}" || exit 1
+    [[ -z "${saved_path}" ]] || export PATH="${saved_path}"
     ./config.sh \
       --unattended \
       --ephemeral \

@@ -138,6 +138,32 @@ printf '%s' "$RUNNER_NAME"
         for name in (".runner", ".credentials", ".credentials_rsaparams", "_work"):
             self.assertFalse((self.root / name).exists())
 
+    def test_reregistration_preserves_tool_path_when_config_rewrites_it(self):
+        (self.root / "bin").mkdir()
+        tool_dir = self.root / "custom-tools"
+        tool_dir.mkdir()
+        tool = tool_dir / "custom-compiler"
+        tool.write_text("#!/bin/bash\nexit 0\n")
+        tool.chmod(0o755)
+        saved_path = f"{tool_dir}:/usr/bin:/bin"
+        (self.root / ".path").write_text(saved_path + "\n")
+        scripts = {
+            "config.sh": 'echo "$PATH" > .path\ntouch .runner',
+            "bin/runsvc.sh": 'export PATH="$(cat .path)"\ncommand -v custom-compiler > resolved-compiler',
+        }
+        for name, code in scripts.items():
+            path = self.root / name
+            path.write_text("#!/bin/bash\n" + code + "\n")
+            path.chmod(0o755)
+        result = self.shell("runner-ephemeral", '''
+DIR="$TEST_ROOT"; RUNNER_URL=https://github.com/acme
+fetch_registration_token() { FETCHED_TOKEN=secret; }
+if ! run_cycle; then exit 99; fi
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.root / ".path").read_text().strip(), saved_path)
+        self.assertEqual((self.root / "resolved-compiler").read_text().strip(), str(tool))
+
     def test_ephemeral_cleanup_failure_prevents_registration(self):
         result = self.shell("runner-ephemeral", '''
 DIR="$TEST_ROOT"; RUNNER_URL=https://github.com/acme
