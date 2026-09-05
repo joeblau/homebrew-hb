@@ -5,21 +5,9 @@
 # Usage:
 #   runner-prune [--runners-dir DIR] [--min-free-gb N] [--dry-run]
 #
-# Designed to run automatically AFTER EVERY JOB via the runner's job hook
-# (ACTIONS_RUNNER_HOOK_JOB_COMPLETED, runner >= 2.296) or on a schedule via
-# launchd. It:
-#   1. purges each ${RUNNERS_DIR}/runner-N/_work directory (job checkouts,
-#      build output, tool caches staged per job),
-#   2. clears common tool caches in the invoking user's home (Homebrew, npm,
-#      yarn, pip, gradle, maven) — each guarded, so a missing dir is fine,
-#   3. OPTIONALLY prunes Docker (docker system prune -af --volumes) — only when
-#      docker is installed AND RUNNER_PRUNE_DOCKER=1,
-#   4. REFUSES (exit 75) when free disk is still below --min-free-gb after
-#      cleanup, so an operator/scheduler can block new jobs.
-#
-# Like runner-setup, it runs as the INVOKING (non-root) user and never sets
-# RUNNER_ALLOW_RUNASROOT. sudo is used ONLY as a non-interactive fallback for
-# root-owned files a job left behind under /opt.
+# Job hooks clean only their own runner's checkouts. Tool/download caches stay
+# warm by default. Fleet-wide cleanup and shared-cache eviction require an
+# explicit offline maintenance window; neither is safe while jobs are running.
 
 set -euo pipefail
 
@@ -33,6 +21,10 @@ EXIT_LOW_DISK=75        # distinctive refusal code: free space below threshold
 
 MIN_FREE_GB="${DEFAULT_MIN_FREE_GB}"
 DRY_RUN=0
+RUNNER_DIR=""
+ALL_RUNNERS=0
+OFFLINE=0
+PURGE_CACHES=0
 
 REAL_USER=""
 REAL_HOME=""
@@ -52,45 +44,39 @@ usage() {
 ${PROG_NAME} — reclaim disk between GitHub Actions jobs on macOS runners
 
 USAGE:
-  ${PROG_NAME} [--runners-dir DIR] [--min-free-gb N] [--dry-run]
+  ${PROG_NAME} [--runner-dir DIR] [--min-free-gb N] [--dry-run]
+  ${PROG_NAME} --all --offline [--purge-caches] [--dry-run]
 
 OPTIONS:
-  --runners-dir DIR   Root holding runner-N directories (default: ${RUNNERS_DIR}).
-  --min-free-gb N     Minimum free disk space, in GiB, required AFTER cleanup
-                      (default: ${DEFAULT_MIN_FREE_GB}). When free space on the volume
-                      holding the runners is still below this after pruning,
-                      the script refuses with exit code ${EXIT_LOW_DISK} and prints a
-                      clear message — wire that code into your scheduler to
-                      block new jobs until an operator intervenes.
-  --dry-run           Log what WOULD be removed (with sizes); delete nothing.
-  -h, --help          Show this help and exit.
+  --runner-dir DIR   Clean one runner's checkouts, preserving _tool, _actions,
+                      and _temp. In job hooks, inferred from RUNNER_TEMP.
+  --runners-dir DIR  Fleet root (default: ${RUNNERS_DIR}).
+  --all              Clean all runner checkouts; requires --offline.
+  --offline          Confirm every runner and other cache consumer is stopped.
+  --purge-caches     Also evict shared package caches; requires --all --offline.
+  --min-free-gb N    Free-space floor in GiB (default: ${DEFAULT_MIN_FREE_GB}).
+  --dry-run          Report paths/sizes; delete nothing.
+  -h, --help         Show this help and exit.
 
 ENVIRONMENT:
-  RUNNER_PRUNE_DOCKER Set to 1 to also run 'docker system prune -af --volumes'.
-                      Ignored when docker is not installed. Default: off.
+  RUNNER_TEMP         Identifies the active runner inside a job hook.
+  RUNNER_PRUNE_DOCKER  Set to 1 for Docker system prune -af --volumes;
+                       requires --all --offline, never allowed in a job hook.
 
 EXAMPLES:
-  ${PROG_NAME}                          # post-job cleanup, 20 GiB floor
-  ${PROG_NAME} --min-free-gb 50         # stricter floor
-  ${PROG_NAME} --dry-run                # report sizes without deleting
-  RUNNER_PRUNE_DOCKER=1 ${PROG_NAME}    # also reclaim Docker images/volumes
+  ${PROG_NAME}                       # scoped post-job hook via RUNNER_TEMP
+  ${PROG_NAME} --runner-dir /opt/github-runners/runner-1 --dry-run
+  ${PROG_NAME} --all --offline --purge-caches
 
 EXIT CODES:
-  0    Cleanup done; free space is at or above the threshold.
-  1    An operation failed (see the log).
-  2    Usage error (bad arguments).
-  ${EXIT_LOW_DISK}   Free disk is below --min-free-gb AFTER cleanup — refuse new jobs.
+  0    Cleanup complete (or dry-run).
+  1    Operation failed or unsafe path.
+  2    Usage error or missing maintenance acknowledgement.
+  ${EXIT_LOW_DISK}   Free disk below the floor. This exit alone does not stop the runner.
 
-POST-JOB HOOK:
-  Point ACTIONS_RUNNER_HOOK_JOB_COMPLETED (runner >= 2.296) at a wrapper that
-  execs this script; the runner captures hook output in the job log and under
-  _diag. See docs/disk-cleanup.md for the hook and launchd wiring.
+Run as the non-root runner owner. Schedule shared-cache eviction only after
+stopping all runners and other cache consumers. See docs/disk-cleanup.md.
 
-SECURITY NOTE:
-  This script deletes build output and caches; it never touches runner
-  registration files (.runner/.credentials) and never runs as root. It uses
-  sudo ONLY as a non-interactive fallback for root-owned files a job left
-  under ${RUNNERS_DIR}. No secrets are read or logged.
 EOF
 }
 
@@ -104,6 +90,13 @@ parse_args() {
         [[ $# -ge 2 ]] || { err "--runners-dir requires a value"; usage; exit 2; }
         RUNNERS_DIR="$2"; shift 2 ;;
       --runners-dir=*) RUNNERS_DIR="${1#*=}"; shift ;;
+      --runner-dir)
+        [[ $# -ge 2 ]] || { err "--runner-dir requires a value"; exit 2; }
+        RUNNER_DIR="$2"; shift 2 ;;
+      --runner-dir=*) RUNNER_DIR="${1#*=}"; shift ;;
+      --all) ALL_RUNNERS=1; shift ;;
+      --offline) OFFLINE=1; shift ;;
+      --purge-caches) PURGE_CACHES=1; shift ;;
       --min-free-gb)
         [[ $# -ge 2 ]] || { err "--min-free-gb requires a value"; usage; exit 2; }
         MIN_FREE_GB="$2"; shift 2 ;;
@@ -126,6 +119,21 @@ parse_args() {
     err "--min-free-gb must be a positive integer (got: '${MIN_FREE_GB}')"
     exit 2
   fi
+  if [[ "${ALL_RUNNERS}" -eq 1 && -n "${RUNNER_DIR}" ]]; then
+    err "Choose --runner-dir or --all, not both."; exit 2
+  fi
+  if [[ "${ALL_RUNNERS}" -eq 1 || "${PURGE_CACHES}" -eq 1 || "${RUNNER_PRUNE_DOCKER:-0}" == 1 ]]; then
+    if [[ "${ALL_RUNNERS}" -ne 1 || "${OFFLINE}" -ne 1 || "${GITHUB_ACTIONS:-false}" == true || -n "${RUNNER_TEMP:-}" ]]; then
+      err "Fleet/shared-cache cleanup requires --all --offline outside a job hook."; exit 2
+    fi
+  fi
+  if [[ "${ALL_RUNNERS}" -eq 0 && -z "${RUNNER_DIR}" ]]; then
+    case "${RUNNER_TEMP:-}" in
+      */_work/_temp) RUNNER_DIR="${RUNNER_TEMP%/_work/_temp}" ;;
+      *) err "Specify --runner-dir, or --all --offline; hooks supply RUNNER_TEMP."; exit 2 ;;
+    esac
+  fi
+
 }
 
 # ----------------------------------------------------------------------------
@@ -176,7 +184,7 @@ detect_user() {
 free_kb() {
   local target="${RUNNERS_DIR}"
   [[ -d "${target}" ]] || target="/"
-  df -kP "${target}" | awk 'NR==2 {print $4}'
+  df -kP "${target}" | awk 'NR==2 && $4 ~ /^[0-9]+$/ {print $4; ok=1} END {if (!ok) exit 1}'
 }
 
 # Human-readable GiB for a 1K-block count (integer, awk-formatted).
@@ -238,24 +246,55 @@ remove_path() {
 }
 
 # ----------------------------------------------------------------------------
-# 1) Purge each runner's _work directory.
+# 1) Clean checkouts only. Never evict a neighbor's workspace from a job hook.
 # ----------------------------------------------------------------------------
-purge_work_dirs() {
-  log "Purging runner _work directories under ${RUNNERS_DIR}"
-  local work rc=0
-  shopt -s nullglob
-  for work in "${RUNNERS_DIR}"/runner-*/_work; do
-    [[ -d "${work}" ]] || continue
-    if ! remove_path "${work}" "work dir"; then
-      rc=1
-      continue
-    fi
-    # Recreate the dir empty: the runner expects to be able to cd into it.
-    if [[ "${DRY_RUN}" -eq 0 ]]; then
-      mkdir -p "${work}" 2>/dev/null || sudo -n mkdir -p "${work}" 2>/dev/null || true
-    fi
+canonical_runner_path() {
+  local dir="${1%/}" parent base
+  [[ ! -L "${dir}" ]] || { err "Refusing symlinked runner: ${dir}"; return 1; }
+  base="${dir##*/}"
+  parent="${dir%/*}"
+  [[ "${parent}" != "${dir}" ]] || parent=.
+  parent="$(cd "${parent}" && pwd -P)" || return 1
+  printf '%s/%s' "${parent}" "${base}"
+}
+
+validate_runner_dir() {
+  local dir="$1" base="${1##*/}"
+  if [[ "${dir%/*}" != "${RUNNERS_DIR}" || ! "${base}" =~ ^runner-[0-9]+$ || -L "${dir}" || ! -d "${dir}" ]]; then
+    err "Unsafe runner directory: ${dir}"; return 1
+  fi
+  if [[ -L "${dir}/_work" ]]; then
+    err "Refusing symlinked work directory: ${dir}/_work"; return 1
+  fi
+}
+
+purge_one_work_dir() {
+  local dir="$1" entry base rc=0
+  validate_runner_dir "${dir}" || return 1
+  [[ -d "${dir}/_work" ]] || return 0
+  shopt -s nullglob dotglob
+  for entry in "${dir}/_work"/*; do
+    base="${entry##*/}"
+    case "${base}" in
+      _tool|_actions|_temp|_PipelineMapping) continue ;;
+    esac
+    remove_path "${entry}" "checkout/build output" || rc=1
   done
-  shopt -u nullglob
+  shopt -u nullglob dotglob
+  return "${rc}"
+}
+
+purge_work_dirs() {
+  local dir rc=0
+  if [[ "${ALL_RUNNERS}" -eq 1 ]]; then
+    shopt -s nullglob
+    for dir in "${RUNNERS_DIR}"/runner-*; do
+      purge_one_work_dir "${dir}" || rc=1
+    done
+    shopt -u nullglob
+  else
+    purge_one_work_dir "${RUNNER_DIR}" || rc=1
+  fi
   return "${rc}"
 }
 
@@ -264,6 +303,10 @@ purge_work_dirs() {
 #    guarded, so a missing dir (toolchain not used here) is fine.
 # ----------------------------------------------------------------------------
 purge_caches() {
+  if [[ "${PURGE_CACHES}" -ne 1 ]]; then
+    step "Keeping package caches warm (offline eviction: --all --offline --purge-caches)."
+    return 0
+  fi
   log "Clearing tool caches under ${REAL_HOME}"
   local rel rc=0
   for rel in \
@@ -328,7 +371,7 @@ enforce_min_free() {
       warn "Free disk is BELOW ${MIN_FREE_GB} GiB (dry-run: not refusing, would exit ${EXIT_LOW_DISK})."
       return 0
     fi
-    err "REFUSING NEW WORK: free disk is below ${MIN_FREE_GB} GiB after cleanup"
+    err "LOW DISK: free disk is below ${MIN_FREE_GB} GiB after cleanup"
     err "($(gb_of "${avail_kb}") GiB available on the runner volume)."
     err "Block new jobs on this runner until an operator frees space or raises"
     err "the machine's disk. Exiting with code ${EXIT_LOW_DISK}."
@@ -344,6 +387,23 @@ main() {
   detect_platform
   require_cmds
   detect_user
+  if [[ ! -d "${RUNNERS_DIR}" || -L "${RUNNERS_DIR}" ]]; then
+    err "Runner root must be an existing directory, not a symlink: ${RUNNERS_DIR}"; exit 1
+  fi
+  RUNNERS_DIR="$(cd "${RUNNERS_DIR}" && pwd -P)"
+  if [[ "${ALL_RUNNERS}" -eq 0 ]]; then
+    RUNNER_DIR="$(canonical_runner_path "${RUNNER_DIR}")" || exit 1
+    validate_runner_dir "${RUNNER_DIR}" || exit 1
+    if [[ -n "${RUNNER_TEMP:-}" ]]; then
+      local hook_runner=""
+      case "${RUNNER_TEMP}" in
+        */_work/_temp) hook_runner="$(canonical_runner_path "${RUNNER_TEMP%/_work/_temp}")" || exit 1 ;;
+      esac
+      if [[ "${hook_runner}" != "${RUNNER_DIR}" ]]; then
+        err "--runner-dir must identify this job's runner (RUNNER_TEMP)."; exit 1
+      fi
+    fi
+  fi
 
   log "Starting disk prune (runners dir: ${RUNNERS_DIR}, min free: ${MIN_FREE_GB} GiB$( (( DRY_RUN )) && printf ', DRY RUN' ))"
   report_free "before"

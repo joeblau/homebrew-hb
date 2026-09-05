@@ -206,7 +206,7 @@ detect_user() {
 require_cmds() {
   local missing=()
   local c
-  for c in curl sed grep uname id whoami sleep rm mkdir basename; do
+  for c in curl jq sed grep uname id whoami sleep rm mkdir basename; do
     command -v "${c}" >/dev/null 2>&1 || missing+=("${c}")
   done
   if [[ ${#missing[@]} -gt 0 ]]; then
@@ -251,7 +251,7 @@ resolve_pat() {
 
 # ----------------------------------------------------------------------------
 # Resolve the registration URL and the registration-token API endpoint from
-# the chosen scope (no jq dependency anywhere in this script).
+# the chosen scope.
 # ----------------------------------------------------------------------------
 resolve_scope() {
   if [[ -n "${ORG}" ]]; then
@@ -313,9 +313,9 @@ trap shutdown TERM INT
 fetch_registration_token() {
   local json token
   # Capture-then-check so set -e isn't masked inside command substitution.
-  if ! json="$(curl -fsSL --retry 3 --retry-delay 2 \
-      -X POST \
-      -H "Authorization: Bearer ${GITHUB_PAT_VALUE}" \
+  if ! json="$(printf 'header = "Authorization: Bearer %s"\n' "${GITHUB_PAT_VALUE}" \
+      | curl --config - -fsSL --retry 3 --retry-delay 2 \
+      --connect-timeout 15 --max-time 60 -X POST \
       -H 'Accept: application/vnd.github+json' \
       -H 'X-GitHub-Api-Version: 2022-11-28' \
       "${API_ENDPOINT}")"; then
@@ -323,14 +323,8 @@ fetch_registration_token() {
     return 1
   fi
 
-  # The trailing `|| true` is REQUIRED (see runner-setup): with pipefail a
-  # no-match grep would abort before the explicit emptiness check.
-  token="$(printf '%s\n' "${json}" \
-    | grep -m1 '"token"' \
-    | sed -E 's/.*"token"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' || true)"
-  if [[ -z "${token}" ]]; then
+  if ! token="$(printf '%s' "${json}" | jq -er '.token | select(type == "string" and length > 0)')"; then
     warn "Could not parse a registration token from the API response."
-    warn "Check that the PAT has admin:org (org) or repo (repo) scope."
     return 1
   fi
   FETCHED_TOKEN="${token}"
@@ -352,21 +346,27 @@ read_saved_identity() {
       "${DIR}/.runner" 2>/dev/null | head -n1 || true)"
   fi
   # Precedence: --name CLI arg > previous registration's agentName > dir name.
-  # Recomputed EVERY cycle (NAME_ARG never mutates) so a runner provisioned
-  # under one name keeps the .runner-recorded identity forever after.
-  RUNNER_NAME="${NAME_ARG:-${SAVED_NAME}}"
-  [[ -n "${RUNNER_NAME}" ]] || RUNNER_NAME="$(basename "${DIR}")"
+  # Resolve once, then retain the identity if GitHub removes .runner.
+  # Pin the resolved identity for this supervisor's lifetime: GitHub can remove
+  # .runner after a successful ephemeral job, so the next cycle cannot reread it.
+  if [[ -z "${NAME_ARG}" ]]; then
+    NAME_ARG="${SAVED_NAME:-$(basename "${DIR}")}"
+  fi
+  RUNNER_NAME="${NAME_ARG}"
   [[ -n "${SAVED_URL}" ]] && RUNNER_URL="${SAVED_URL}"
+  return 0
 }
 
 # ----------------------------------------------------------------------------
 # Wipe job output and registration residue so every cycle starts from a
-# pristine runner directory (binaries and _diag logs are kept).
+# reset workspace (binaries, operator configuration, and _diag logs are kept).
 # ----------------------------------------------------------------------------
 wipe_state() {
-  rm -rf "${DIR}/_work"
+  rm -rf "${DIR}/_work" || return 1
   rm -f "${DIR}/.runner" "${DIR}/.credentials" \
-        "${DIR}/.credentials_rsaparams" "${DIR}/.env" "${DIR}/.path"
+        "${DIR}/.credentials_rsaparams" || return 1
+  # .env/.path are operator service/toolchain configuration. Retain job hooks
+  # and PATH across cycles; these files are not job registration credentials.
 }
 
 # ----------------------------------------------------------------------------
@@ -386,7 +386,11 @@ run_cycle() {
   fi
   step "Fresh registration token obtained (not logged)."
 
-  wipe_state
+  if ! wipe_state; then
+    FETCHED_TOKEN=""
+    warn "Could not clean the previous job; refusing re-registration."
+    return 1
+  fi
   step "Wiped _work and registration residue."
 
   # config.sh re-creates .runner/.credentials; --ephemeral makes GitHub remove
@@ -394,7 +398,7 @@ run_cycle() {
   # any stale same-name registration left by an interrupted previous cycle.
   local config_rc=0
   (
-    cd "${DIR}"
+    cd "${DIR}" || exit 1
     ./config.sh \
       --unattended \
       --ephemeral \
@@ -418,14 +422,16 @@ run_cycle() {
   # forward signals to the child.
   local run_rc=0
   (
-    cd "${DIR}"
+    cd "${DIR}" || exit 1
     ACTIONS_RUNNER_SVC=1 exec ./bin/runsvc.sh
   ) &
   CHILD_PID=$!
   wait "${CHILD_PID}" && run_rc=0 || run_rc=$?
   CHILD_PID=""
   log "Runner '${RUNNER_NAME}' exited (rc=${run_rc}); job complete or service stopped."
-  return 0
+  # A failed listener must back off too, otherwise a crash can continuously
+  # re-register and hammer the API. Job failures normally still exit the service 0.
+  [[ "${run_rc}" -eq 0 ]]
 }
 
 # ----------------------------------------------------------------------------

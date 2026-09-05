@@ -6,7 +6,7 @@
 # Usage:
 #   runner-autoscale (--org ORG | --repo OWNER/REPO) [--daemon] [--interval N]
 #
-# Polls the GitHub API for queued workflow runs in the registration scope, then
+# Polls matching queued jobs in explicitly selected repositories, then
 # scales the LOCAL fleet by invoking runner-setup (scale up) / runner-cleanup
 # (scale down). It never provisions runners directly: every scale-up mints a
 # fresh registration token via the API and hands it to runner-setup through
@@ -41,7 +41,9 @@ ORG=""
 REPO=""
 SCOPE_API=""                # /orgs/ORG or /repos/OWNER/REPO
 SCOPE_SLUG=""
+declare -a QUEUE_REPOS=()
 DAEMON=0
+EPHEMERAL=0
 INTERVAL="${DEFAULT_INTERVAL}"
 MIN_RUNNERS="${DEFAULT_MIN}"
 MAX_RUNNERS="${DEFAULT_MAX}"
@@ -76,30 +78,37 @@ ${PROG_NAME} — queue-aware autoscaling for GitHub Actions runners on macOS
 USAGE:
   ${PROG_NAME} (--org ORG | --repo OWNER/REPO) [options]
 
-Polls the GitHub API for queued workflow runs in the scope, then scales the
+Polls matching queued jobs in queued and in-progress runs, then scales the
 LOCAL runner fleet by invoking runner-setup (up) and runner-cleanup (down).
 Runs ONE scaling tick by default — pair it with a launchd StartInterval
 service — or loops forever with --daemon.
 
 SCOPE (choose exactly ONE — it must match the runner-setup registration):
-  --org ORG_NAME        Organization runners (polls /orgs/ORG/actions/runs).
-  --repo OWNER/REPO     Repository runners (polls /repos/OWNER/REPO/actions/runs).
+  --org ORG_NAME        Organization registration; requires --queue-repo.
+  --repo OWNER/REPO     Repository registration and queue source.
+  --queue-repo OWNER/REPO
+                        Repository to watch for --org; repeat for each repo.
 
 REQUIRED (environment):
   GITHUB_PAT            Personal access token used to read the queue and to
                         mint runner registration/removal tokens. Needs 'repo'
-                        for --repo scopes or 'admin:org' for --org scopes.
+                        for private queue repositories, plus 'admin:org' for
+                        --org registration. Fine-grained tokens need Actions
+                        read on every watched repository and runner-management
+                        write permission for the registration scope.
                         GITHUB_PAT_FILE (path to a file holding the token) is
                         accepted instead — preferred for launchd services, so
                         the token never appears in a plist.
 
 OPTIONS:
   --daemon              Loop forever instead of running a single tick.
+  --ephemeral           Provision new runners with the one-job supervisor;
+                        use the same mode as the initial fleet.
   --interval N          Seconds between ticks in --daemon mode (default: ${DEFAULT_INTERVAL}).
   --min N               Never scale below N runners (default: ${DEFAULT_MIN}).
   --max N               Never scale above N runners (default: ${DEFAULT_MAX}).
   --scale-up-threshold N
-                        Scale up while queued runs > N (default: ${DEFAULT_SCALE_UP_THRESHOLD}).
+                        Scale up at N matching queued jobs (default: ${DEFAULT_SCALE_UP_THRESHOLD}).
   --cooldown-minutes N  Scale down only after N minutes with an empty queue
                         and no busy runner (default: ${DEFAULT_COOLDOWN_MINUTES}).
   --labels CSV          Labels for newly provisioned runners; should match the
@@ -110,24 +119,17 @@ OPTIONS:
   -h, --help            Show this help and exit.
 
 EXAMPLES:
-  GITHUB_PAT=github_pat_... ${PROG_NAME} --org acme
+  GITHUB_PAT=github_pat_... ${PROG_NAME} --org acme --queue-repo acme/monorepo
   GITHUB_PAT=github_pat_... ${PROG_NAME} --repo acme/monorepo --daemon --interval 120 --max 6
-  GITHUB_PAT_FILE=/etc/github-runner-pat ${PROG_NAME} --org acme --max 8
+  GITHUB_PAT_FILE=/etc/github-runner-pat ${PROG_NAME} --org acme --queue-repo acme/monorepo --max 8
 
 SCALING MODEL:
-  scale UP   queue depth > threshold AND runners < max
-             -> mint registration token via API, then
-                RUNNER_TOKEN=... runner-setup SCOPE --runners current+1
-             (runner-setup skips already-configured runners, so only the new
-             highest-numbered runner is actually configured; registration
-             tokens are single-scope and fetched fresh for EVERY provision).
-  scale DOWN queue empty, no local runner busy, idle longer than the cooldown,
-             AND runners > min
-             -> mint removal token via API, then
-                RUNNER_REMOVE_TOKEN=... runner-cleanup --runner HIGHEST --yes
-  Every decision (timestamp, queue depth, action, reason) is appended to the
-  decision log, and a lockfile under ${STATE_DIR} guarantees only one scale
-  operation is in flight at a time.
+  scale UP   runners < min OR matching queued jobs >= threshold, with room
+             below max. Provision one runner, filling the first numbering gap.
+  scale DOWN queue empty, every local runner confirmed online and idle by its
+             exact registered name, cooldown elapsed, AND runners > min.
+  API failures, malformed JSON, incomplete pagination, or mixed local scopes
+  block the tick. Each decision is logged; one host-level lock serializes it.
 
 SECURITY NOTE:
   GITHUB_PAT is never placed on a command line: curl reads the Authorization
@@ -169,6 +171,11 @@ parse_args() {
         [[ $# -ge 2 ]] || { err "--repo requires a value"; usage; exit 2; }
         REPO="$2"; shift 2 ;;
       --repo=*)    REPO="${1#*=}"; shift ;;
+      --queue-repo)
+        [[ $# -ge 2 ]] || { err "--queue-repo requires a value"; exit 2; }
+        QUEUE_REPOS+=("$2"); shift 2 ;;
+      --queue-repo=*) QUEUE_REPOS+=("${1#*=}"); shift ;;
+      --ephemeral) EPHEMERAL=1; shift ;;
       --daemon)    DAEMON=1; shift ;;
       --interval)
         [[ $# -ge 2 ]] || { err "--interval requires a value"; usage; exit 2; }
@@ -225,6 +232,10 @@ parse_args() {
       exit 2
     fi
   done
+  if [[ "${SCALE_UP_THRESHOLD}" -lt 1 ]]; then
+    err "--scale-up-threshold must be at least 1 queued job."
+    exit 2
+  fi
   if [[ "${INTERVAL}" -lt 1 ]]; then
     err "--interval must be at least 1 second."
     exit 2
@@ -235,16 +246,37 @@ parse_args() {
   fi
 
   if [[ -n "${ORG}" ]]; then
+    if ! [[ "${ORG}" =~ ^[A-Za-z0-9_.-]+$ ]] || [[ ${#QUEUE_REPOS[@]} -eq 0 ]]; then
+      err "--org needs a valid organization and at least one --queue-repo OWNER/REPO."
+      exit 2
+    fi
     SCOPE_API="/orgs/${ORG}"
     SCOPE_SLUG="${ORG}"
   else
-    if ! [[ "${REPO}" =~ ^[^/]+/[^/]+$ ]]; then
+    if ! [[ "${REPO}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
       err "--repo must be in OWNER/REPO form (got: '${REPO}')"
       exit 2
     fi
+    if [[ ${#QUEUE_REPOS[@]} -gt 0 ]]; then
+      err "--queue-repo is only supported with --org; --repo watches itself."
+      exit 2
+    fi
+    QUEUE_REPOS=("${REPO}")
     SCOPE_API="/repos/${REPO}"
     SCOPE_SLUG="${REPO//\//-}"
   fi
+
+  local queue_repo
+  for queue_repo in "${QUEUE_REPOS[@]}"; do
+    if ! [[ "${queue_repo}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+      err "Invalid --queue-repo: ${queue_repo}"
+      exit 2
+    fi
+    if [[ -n "${ORG}" && "$(printf '%s' "${queue_repo%%/*}" | tr '[:upper:]' '[:lower:]')" != "$(printf '%s' "${ORG}" | tr '[:upper:]' '[:lower:]')" ]]; then
+      err "--queue-repo must belong to --org ${ORG}."
+      exit 2
+    fi
+  done
 
   STATE_FILE="${STATE_DIR}/state"
   LOCK_DIR="${STATE_DIR}/lock"
@@ -264,7 +296,7 @@ detect_platform() {
 require_cmds() {
   local missing=()
   local c
-  for c in curl sed grep tr sort tail head date stat mkdir rm mktemp chmod basename uname; do
+  for c in curl jq sed grep tr sort tail head date stat mkdir rm mktemp chmod basename uname wc touch sleep; do
     command -v "${c}" >/dev/null 2>&1 || missing+=("${c}")
   done
   if [[ ${#missing[@]} -gt 0 ]]; then
@@ -365,7 +397,7 @@ log_decision() {
 }
 
 # ----------------------------------------------------------------------------
-# GitHub API (no jq). The PAT goes into a 0600 curl config file in a private
+# GitHub API (structured JSON with jq). The PAT goes into a 0600 curl config file in a private
 # tmpdir so it never appears in `ps` output; only the (secret-free) URL is on
 # the curl command line.
 # ----------------------------------------------------------------------------
@@ -379,6 +411,8 @@ api_request() {
     printf 'location\n'
     printf 'retry = 3\n'
     printf 'retry-delay = 2\n'
+    printf 'connect-timeout = 10\n'
+    printf 'max-time = 60\n'
     printf 'header = "Accept: application/vnd.github+json"\n'
     printf 'header = "X-GitHub-Api-Version: 2022-11-28"\n'
     printf 'header = "Authorization: Bearer %s"\n' "${GITHUB_PAT}"
@@ -388,23 +422,71 @@ api_request() {
   curl -K "${cfg}" "${API_BASE}${endpoint}"
 }
 
-# Queued workflow runs in the scope -> prints the integer queue depth.
+# Read every page. Truncated/malformed responses must never look like an empty
+# queue. Workflow run searches are capped by GitHub at 1,000 results.
+api_list() {
+  local endpoint="$1" field="$2" page=1 json count total seen=0 separator='?'
+  local accumulated='[]' items
+  [[ "${endpoint}" != *'?'* ]] || separator='&'
+  while [[ "${page}" -le 100 ]]; do
+    json="$(api_request GET "${endpoint}${separator}per_page=100&page=${page}")" || return 1
+    if ! printf '%s' "${json}" | jq -e --arg field "${field}" '
+      (.total_count | type == "number" and . >= 0 and . <= 1000000000 and floor == .) and
+      (.[ $field ] | type == "array")' >/dev/null; then
+      warn "Malformed ${field} API response."
+      return 1
+    fi
+    total="$(printf '%s' "${json}" | jq -r '.total_count')"
+    if [[ "${field}" == workflow_runs && "${total}" -gt 1000 ]]; then
+      warn "Workflow search exceeds GitHub’s 1,000-result limit; refusing incomplete observation."
+      return 1
+    fi
+    items="$(printf '%s' "${json}" | jq -c --arg field "${field}" '.[$field]')"
+    count="$(printf '%s' "${items}" | jq 'length')"
+    accumulated="$(printf '%s\n%s\n' "${accumulated}" "${items}" | jq -cs 'add')" || return 1
+    seen=$((seen + count))
+    if [[ "${seen}" -ge "${total}" ]]; then
+      printf '%s' "${accumulated}"
+      return 0
+    fi
+    if [[ "${count}" -eq 0 ]]; then
+      warn "Incomplete ${field} pagination."
+      return 1
+    fi
+    page=$((page + 1))
+  done
+  warn "Pagination safety limit reached for ${field}."
+  return 1
+}
+
 fetch_queue_depth() {
-  local json depth
-  if ! json="$(api_request GET "${SCOPE_API}/actions/runs?status=queued&per_page=100")"; then
-    warn "Failed to query queued workflow runs for ${SCOPE_SLUG}."
-    return 1
-  fi
-  # The trailing `|| true` is REQUIRED under set -e/pipefail (see runner-setup):
-  # a no-match sed must not abort before the explicit emptiness check.
-  depth="$(printf '%s\n' "${json}" \
-    | sed -n 's/.*"total_count"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
-    | head -n1 || true)"
-  if [[ -z "${depth}" ]]; then
-    warn "Could not parse total_count from the queued-runs API response."
-    return 1
-  fi
-  printf '%s' "${depth}"
+  local repo status runs run_ids run_id jobs labels arch ids='[]'
+  case "$(uname -m)" in arm64|aarch64) arch=arm64 ;; *) arch=x64 ;; esac
+  labels="$(jq -cn --arg csv "${LABELS},self-hosted,macos,${arch}" '$csv | split(",") | map(ascii_downcase) | unique')"
+  for repo in $(printf '%s\n' "${QUEUE_REPOS[@]}" | sort -u); do
+    run_ids='[]'
+    # Matrix siblings can remain queued while their workflow is in progress.
+    for status in queued in_progress; do
+      runs="$(api_list "/repos/${repo}/actions/runs?status=${status}" workflow_runs)" || return 1
+      if ! printf '%s' "${runs}" | jq -e 'all(.[]; .id | type == "number" and . > 0 and . <= 9007199254740991 and floor == .)' >/dev/null; then return 1; fi
+      run_ids="$(printf '%s\n%s\n' "${run_ids}" "${runs}" | jq -cs '.[0] + (.[1] | map(.id)) | unique')" || return 1
+    done
+    while IFS= read -r run_id; do
+      [[ -n "${run_id}" ]] || continue
+      jobs="$(api_list "/repos/${repo}/actions/runs/${run_id}/jobs?filter=latest" jobs)" || return 1
+      if ! printf '%s' "${jobs}" | jq -e 'all(.[]; (.id | type == "number" and . > 0 and . <= 9007199254740991 and floor == .) and (.status | type == "string") and (.labels | type == "array") and all(.labels[]; type == "string"))' >/dev/null; then
+        warn "Malformed jobs API response."
+        return 1
+      fi
+      ids="$(printf '%s\n%s\n' "${ids}" "${jobs}" | jq -cs --argjson available "${labels}" '
+        .[0] + [.[1][] | select(.status == "queued") |
+        select((.labels | length) > 0) |
+        select(((.labels | map(ascii_downcase)) - $available | length) == 0) | .id] | unique')" || return 1
+    done <<EOF
+$(printf '%s' "${run_ids}" | jq -r '.[]')
+EOF
+  done
+  printf '%s' "${ids}" | jq 'length'
 }
 
 # Mint a fresh token: kind is "registration-token" (scale up) or "remove-token"
@@ -417,9 +499,7 @@ fetch_token() {
     warn "Failed to mint ${kind} for ${SCOPE_SLUG}."
     return 1
   fi
-  token="$(printf '%s\n' "${json}" \
-    | sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-    | head -n1 || true)"
+  token="$(printf '%s' "${json}" | jq -er '.token | select(type == "string" and length > 0)' 2>/dev/null || true)"
   if [[ -z "${token}" ]]; then
     warn "Could not parse ${kind} from the API response."
     return 1
@@ -450,27 +530,40 @@ highest_runner_index() {
   list_runner_indices | sort -n | tail -n1
 }
 
-# Returns 0 if ANY local runner is busy according to the API runner list.
-# Local runners register as [HOST-]runner-N (see runner-setup), so match the
-# trailing index inside the quoted name; the closing quote keeps runner-1 from
-# matching runner-10. The API returns compact JSON, so split runner objects
-# onto their own lines before matching.
-any_runner_busy() {
-  local json="$1"
-  local objects idx line
-  objects="$(printf '%s' "${json}" | sed 's/},{/}\n{/g')"
+# Exact registration identity avoids confusing other hosts' runner-N names.
+# Every local directory must be registered in this controller's scope.
+validate_fleet() {
+  local idx expected="https://github.com/${ORG:-${REPO}}"
   while IFS= read -r idx; do
     [[ -n "${idx}" ]] || continue
-    line="$(printf '%s\n' "${objects}" \
-      | grep -E "\"name\"[[:space:]]*:[[:space:]]*\"([^\"]*-)?runner-${idx}\"" \
-      | head -n1 || true)"
-    if printf '%s' "${line}" | grep -qE '"busy"[[:space:]]*:[[:space:]]*true'; then
-      return 0
+    if ! jq -e --arg url "${expected}" --argjson ephemeral "${EPHEMERAL}" '
+      (.agentName | type == "string" and length > 0) and
+      ((.ephemeral // false) == ($ephemeral == 1)) and
+      ((.gitHubUrl | ascii_downcase | rtrimstr("/")) == ($url | ascii_downcase))' \
+      "${RUNNER_ROOT}/runner-${idx}/.runner" >/dev/null 2>&1; then
+      warn "runner-${idx} has missing/invalid registration, another scope, or a different ephemeral mode; refusing to scale."
+      return 1
     fi
   done <<EOF
 $(list_runner_indices)
 EOF
-  return 1
+}
+
+# Return success ONLY if every exact local identity is online and idle.
+# Missing runners (including ephemeral re-registration gaps) remain unknown.
+all_runners_idle() {
+  local json="$1" idx name
+  while IFS= read -r idx; do
+    [[ -n "${idx}" ]] || continue
+    name="$(jq -er '.agentName | select(type == "string" and length > 0)' "${RUNNER_ROOT}/runner-${idx}/.runner")" || return 1
+    if ! printf '%s' "${json}" | jq -e --arg name "${name}" '
+      [.[] | select(.name == $name)] | length == 1 and
+      (.[0].busy == false) and (.[0].status == "online")' >/dev/null; then
+      return 1
+    fi
+  done <<EOF
+$(list_runner_indices)
+EOF
 }
 
 # ----------------------------------------------------------------------------
@@ -492,14 +585,17 @@ save_idle_since() {
 # ----------------------------------------------------------------------------
 do_scale_up() {
   local depth="$1" current="$2"
-  local next=$((current + 1))
+  local next=1
+  # runner-setup fills 1..N: stop at the first missing index so gaps do not
+  # accidentally provision multiple runners or repeatedly target an old one.
+  while [[ -d "${RUNNER_ROOT}/runner-${next}" ]]; do next=$((next + 1)); done
   local token
   if ! token="$(fetch_token registration-token)"; then
     log_decision "${depth}" "${current}" "error" "scale-up aborted: could not mint a registration token"
     return 1
   fi
   log_decision "${depth}" "${current}" "scale-up" \
-    "queue depth ${depth} > threshold ${SCALE_UP_THRESHOLD} and runners < max; provisioning runner-${next} via runner-setup"
+    "minimum capacity or queued-job threshold requires one runner; provisioning runner-${next} via runner-setup"
 
   local -a scope_args=()
   if [[ -n "${ORG}" ]]; then
@@ -507,10 +603,11 @@ do_scale_up() {
   else
     scope_args=(--repo "${REPO}")
   fi
+  [[ "${EPHEMERAL}" -eq 0 ]] || scope_args+=(--ephemeral)
   # runner-setup provisions 1..N and skips already-configured runners, so
-  # asking for current+1 configures exactly one new runner. The token travels
+  # targeting the first missing index configures one new runner. The token travels
   # via the environment — never a ps-visible argument.
-  if ! RUNNER_TOKEN="${token}" "${RUNNER_SETUP_BIN}" \
+  if ! GITHUB_PAT="${GITHUB_PAT}" RUNNER_TOKEN="${token}" "${RUNNER_SETUP_BIN}" \
       "${scope_args[@]}" --runners "${next}" --labels "${LABELS}"; then
     log_decision "${depth}" "${current}" "error" "runner-setup failed while scaling to ${next} runner(s)"
     return 1
@@ -556,7 +653,12 @@ run_tick() {
     return 0
   fi
 
-  local depth current now idle_since busy=0
+  local depth current now idle_since busy=0 rc=0
+  if ! validate_fleet; then
+    log_decision "?" "$(count_runners)" "error" "local fleet registration is incomplete or mixed-scope"
+    release_lock
+    return 1
+  fi
   if ! depth="$(fetch_queue_depth)"; then
     log_decision "?" "$(count_runners)" "error" "could not fetch queue depth from the GitHub API"
     release_lock
@@ -572,8 +674,8 @@ run_tick() {
     busy=1
   else
     local rjson=""
-    if rjson="$(api_request GET "${SCOPE_API}/actions/runners?per_page=100")"; then
-      any_runner_busy "${rjson}" && busy=1
+    if rjson="$(api_list "${SCOPE_API}/actions/runners" runners)"; then
+      all_runners_idle "${rjson}" || busy=1
     else
       warn "Could not fetch the runner list; assuming runners are busy."
       busy=1
@@ -587,18 +689,19 @@ run_tick() {
   fi
   save_idle_since "${idle_since}"
 
-  if [[ "${depth}" -gt "${SCALE_UP_THRESHOLD}" && "${current}" -lt "${MAX_RUNNERS}" ]]; then
-    do_scale_up "${depth}" "${current}"
+  if [[ "${current}" -lt "${MAX_RUNNERS}" ]] &&
+      { [[ "${current}" -lt "${MIN_RUNNERS}" ]] || [[ "${depth}" -ge "${SCALE_UP_THRESHOLD}" ]]; }; then
+    do_scale_up "${depth}" "${current}" || rc=$?
   elif [[ "${depth}" -eq 0 && "${busy}" -eq 0 && "${current}" -gt "${MIN_RUNNERS}" \
       && "${idle_since}" -gt 0 && $((now - idle_since)) -ge $((COOLDOWN_MINUTES * 60)) ]]; then
-    do_scale_down "${depth}" "${current}"
+    do_scale_down "${depth}" "${current}" || rc=$?
   else
     log_decision "${depth}" "${current}" "none" \
       "within bounds (busy=${busy}, idle_since=${idle_since}, threshold=${SCALE_UP_THRESHOLD}, cooldown=${COOLDOWN_MINUTES}m)"
   fi
 
   release_lock
-  return 0
+  return "${rc}"
 }
 
 # ----------------------------------------------------------------------------
@@ -625,4 +728,4 @@ main() {
   fi
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# runner-cache — fast local actions/cache backend for GitHub Actions self-hosted
+# runner-cache — local S3 dependency cache for GitHub Actions self-hosted
 # runners on macOS.
 #
 # Usage:
@@ -83,7 +83,7 @@ err()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; }
 
 usage() {
   cat >&2 <<EOF
-${PROG_NAME} — local S3 cache backend for actions/cache on macOS runners
+${PROG_NAME} — local S3 dependency cache for macOS runners
 
 USAGE:
   ${PROG_NAME} <command> [options]
@@ -95,13 +95,12 @@ COMMANDS:
   start         Bootstrap/kickstart the LaunchDaemon (must be installed).
   stop          Boot out the LaunchDaemon (plist stays installed).
   status        Show daemon, health, buckets, and disk usage (no secrets).
-  env           Print the ACTIONS_CACHE_URL / ACTIONS_RESULTS_URL /
-                ACTIONS_CACHE_SERVICE_V2 configuration for a scope, plus the
-                exact LaunchDaemon + workflow wiring to use it.
-  metrics       Scrape MinIO's Prometheus endpoint and report basic
-                hit/miss counters.
+  env           Print non-secret S3 settings and an explicit S3 cache action
+                workflow example. MinIO does not implement actions/cache.
+  metrics       Scrape MinIO's Prometheus endpoint and report S3 request,
+                error, and transfer counters (not cache hit rates).
   uninstall     Boot out + remove the daemon and delete ${CACHE_ROOT}
-                (asks for confirmation; --keep-data preserves cached blobs).
+                (asks for confirmation; --keep-data preserves data + credentials).
   -h, --help    Show this help and exit.
 
 SCOPE (install/env — choose exactly ONE):
@@ -114,7 +113,7 @@ OPTIONS:
   --raw                 (metrics) Dump the raw Prometheus exposition instead
                         of the parsed summary.
   -y, --yes             (uninstall) Do not prompt for confirmation.
-  --keep-data           (uninstall) Keep ${CACHE_ROOT}/data (cached blobs).
+  --keep-data           (uninstall) Keep data/ and config/ for a usable reinstall.
 
 EXAMPLES:
   ${PROG_NAME} install --repo acme/monorepo
@@ -124,20 +123,18 @@ EXAMPLES:
   ${PROG_NAME} uninstall --yes --keep-data
 
 HOW IT PLUGS IN:
-  'env' prints ACTIONS_CACHE_URL / ACTIONS_RESULTS_URL / ACTIONS_CACHE_SERVICE_V2.
-  These MUST be set on the runner SERVICE process — i.e. in the
-  EnvironmentVariables dict of the runner LaunchDaemon that runner-setup wrote
-  (${LAUNCH_DAEMON_DIR}/com.github.runner-N.plist) — then the daemon
-  restarted. Setting them per-job in a workflow does NOT work: the runner
-  process reads them at startup, before any job begins.
+  MinIO speaks S3, not GitHub's cache protocol. Use the explicit S3 action
+  shown by 'env'. Do not redirect ACTIONS_CACHE_URL or ACTIONS_RESULTS_URL
+  to MinIO, or modify ACTIONS_CACHE_SERVICE_V2 / ACTIONS_RUNTIME_TOKEN.
+  Standard actions/cache and setup-* built-in caches continue using GitHub.
 
-SECURITY NOTE:
-  MinIO runs as the invoking (non-root) user; sudo is used only for /opt and
-  ${LAUNCH_DAEMON_DIR}. Root and per-scope credentials are generated at
-  install, written to ${CACHE_ROOT}/config/*.env with mode 0600, and are never
-  printed, never placed in the plist (644, world-readable), and never put on a
-  command line where avoidable. Rotate by deleting the scope file and
-  re-running install.
+CREDENTIALS:
+  MinIO runs as the invoking (non-root) user, bound to 127.0.0.1. Root and
+  per-scope credentials are stored in 0600 files under ${CACHE_ROOT}/config.
+  'env' prints secret names and paths, never credential values. Upload only
+  the scope keypair to GitHub Actions secrets; see docs/cache-backend.md.
+  Bucket policies separate S3 clients, not jobs running as the same macOS user.
+
 EOF
 }
 
@@ -227,7 +224,7 @@ as_user() {
 # the (world-readable) plist.
 write_secret_file() {
   local dest="$1"
-  as_user bash -c 'umask 077; cat > "$1"' _ "${dest}"
+  as_user bash -c 'umask 077; cat > "$1" && chmod 600 "$1"' _ "${dest}"
 }
 
 # ----------------------------------------------------------------------------
@@ -245,7 +242,7 @@ ensure_brew() {
 ensure_minio() {
   if ! command -v minio >/dev/null 2>&1; then
     log "MinIO server not found; installing via Homebrew (minio/stable/minio)"
-    if ! brew install minio/stable/minio; then
+    if ! as_user brew install minio/stable/minio; then
       err "Failed to install the MinIO server."
       err "Install it manually with: brew install minio/stable/minio"
       exit 1
@@ -253,12 +250,16 @@ ensure_minio() {
   fi
   if ! command -v mc >/dev/null 2>&1; then
     log "MinIO client (mc) not found; installing via Homebrew (minio/stable/mc)"
-    if ! brew install minio/stable/mc; then
+    if ! as_user brew install minio/stable/mc; then
       err "Failed to install the MinIO client."
       err "Install it manually with: brew install minio/stable/mc"
       err "(A conflicting Midnight Commander 'mc' may need 'brew unlink mc' first.)"
       exit 1
     fi
+  fi
+  if ! mc --version 2>/dev/null | grep -qi minio; then
+    err "The mc command is not the MinIO client. Resolve the Midnight Commander conflict first."
+    exit 1
   fi
   step "MinIO server: $(command -v minio)"
   step "MinIO client: $(command -v mc)"
@@ -291,12 +292,44 @@ resolve_scope() {
   slug="$(printf '%s' "${raw}" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9' '-' | tr -s '-')"
   slug="${slug#-}"; slug="${slug%-}"
   [[ -n "${slug}" ]] || { err "Could not derive a valid scope slug."; exit 2; }
-  SCOPE_SLUG="${SCOPE_KIND}-${slug}"
+  # Sanitization, OWNER/REPO flattening, and truncation are not injective.
+  # Include the canonical identity's digest so scopes never silently share a bucket.
+  local digest legacy_file installed_identity
+  digest="$(printf '%s:%s' "${SCOPE_KIND}" "${SCOPE}" | tr 'A-Z' 'a-z' | shasum -a 256 | awk '{print $1}')"
+  SCOPE_SLUG="${SCOPE_KIND}-${slug:0:27}-${digest:0:16}"
   BUCKET="actions-cache-${SCOPE_SLUG}"
-  # Bucket names are capped at 63 chars.
-  BUCKET="${BUCKET:0:63}"
-  BUCKET="${BUCKET%-}"
   POLICY_NAME="cache-${SCOPE_SLUG}"
+
+  # Reuse legacy scope names only after matching the original scope identity.
+  legacy_file="$(scope_file "${SCOPE_KIND}-${slug}")"
+  if [[ -r "${legacy_file}" ]]; then
+    installed_identity="$(
+      # shellcheck disable=SC1090
+      . "${legacy_file}"
+      printf '%s:%s' "${SCOPE_KIND}" "${SCOPE}" | tr 'A-Z' 'a-z'
+    )"
+    if [[ "${installed_identity}" == "$(printf '%s:%s' "${SCOPE_KIND}" "${SCOPE}" | tr 'A-Z' 'a-z')" ]]; then
+      SCOPE_SLUG="${SCOPE_KIND}-${slug}"
+      BUCKET="$(. "${legacy_file}"; printf '%s' "${BUCKET}")"
+      POLICY_NAME="$(. "${legacy_file}"; printf '%s' "${POLICY_NAME}")"
+    fi
+  fi
+}
+
+# Refuse to preserve a legacy configuration if another identity already points
+# at its bucket (old names could collide after truncation).
+verify_bucket_scope() {
+  local f other_bucket other_identity identity
+  identity="$(printf '%s:%s' "${SCOPE_KIND}" "${SCOPE}" | tr 'A-Z' 'a-z')"
+  for f in "${SCOPES_DIR}"/*.env; do
+    [[ -f "${f}" ]] || continue
+    other_bucket="$(. "${f}"; printf '%s' "${BUCKET}")"
+    other_identity="$(. "${f}"; printf '%s:%s' "${SCOPE_KIND}" "${SCOPE}" | tr 'A-Z' 'a-z')"
+    if [[ "${other_bucket}" == "${BUCKET}" && "${other_identity}" != "${identity}" ]]; then
+      err "Bucket ${BUCKET} is referenced by multiple scopes. Migrate the legacy scope credentials before reinstalling."
+      return 1
+    fi
+  done
 }
 
 scope_file() {
@@ -350,8 +383,16 @@ validate_scope_choice() {
     usage
     exit 2
   fi
-  if [[ -n "${REPO}" ]] && ! [[ "${REPO}" =~ ^[^/]+/[^/]+$ ]]; then
-    err "--repo must be in OWNER/REPO form (got: '${REPO}')"
+  validate_scope_names
+}
+
+validate_scope_names() {
+  if [[ -n "${ORG}" ]] && ! [[ "${ORG}" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}$ ]]; then
+    err "--org must be a GitHub organization name (letters, digits, hyphens; max 39 characters)."
+    exit 2
+  fi
+  if [[ -n "${REPO}" ]] && ! [[ "${REPO}" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100}$ ]]; then
+    err "--repo must be a valid GitHub OWNER/REPO name."
     exit 2
   fi
 }
@@ -402,13 +443,19 @@ parse_args() {
   case "${COMMAND}" in
     install)
       validate_scope_choice
-      if ! [[ "${PORT}" =~ ^[0-9]+$ ]] || [[ "${PORT}" -lt 1 || "${PORT}" -gt 65535 ]]; then
-        err "--port must be a valid TCP port (got: '${PORT}')"
+      if ! [[ "${PORT}" =~ ^[0-9]+$ ]] || [[ ${#PORT} -gt 5 ]] || [[ "$((10#${PORT}))" -lt 1024 || "$((10#${PORT}))" -gt 65535 ]]; then
+        err "--port must be an unprivileged TCP port (1024-65535) (got: '${PORT}')"
         exit 2
       fi
       if ! [[ "${CONSOLE_PORT}" =~ ^[0-9]+$ ]] \
-          || [[ "${CONSOLE_PORT}" -lt 1 || "${CONSOLE_PORT}" -gt 65535 ]]; then
-        err "--console-port must be a valid TCP port (got: '${CONSOLE_PORT}')"
+          || [[ ${#CONSOLE_PORT} -gt 5 ]] || [[ "$((10#${CONSOLE_PORT}))" -lt 1024 || "$((10#${CONSOLE_PORT}))" -gt 65535 ]]; then
+        err "--console-port must be an unprivileged TCP port (1024-65535) (got: '${CONSOLE_PORT}')"
+        exit 2
+      fi
+      PORT="$((10#${PORT}))"
+      CONSOLE_PORT="$((10#${CONSOLE_PORT}))"
+      if [[ "${PORT}" == "${CONSOLE_PORT}" ]]; then
+        err "--port and --console-port must be different."
         exit 2
       fi
       ;;
@@ -418,10 +465,7 @@ parse_args() {
         err "Choose only one of --org or --repo."
         exit 2
       fi
-      if [[ -n "${REPO}" ]] && ! [[ "${REPO}" =~ ^[^/]+/[^/]+$ ]]; then
-        err "--repo must be in OWNER/REPO form (got: '${REPO}')"
-        exit 2
-      fi
+      validate_scope_names
       ;;
   esac
 }
@@ -430,11 +474,11 @@ parse_args() {
 # Credentials (generated, stored 0600, never echoed)
 # ----------------------------------------------------------------------------
 gen_secret() {
-  openssl rand -base64 32 | tr -dc 'A-Za-z0-9' | head -c 40
+  openssl rand -hex 20
 }
 
 gen_access_key() {
-  printf 'cache%s' "$(openssl rand -hex 8)"
+  printf 'gha-%s' "$(openssl rand -hex 8)"
 }
 
 # ----------------------------------------------------------------------------
@@ -450,7 +494,8 @@ bootout_system() {
     sudo launchctl print "system/${label}" >/dev/null 2>&1 || return 0
     sleep 1
   done
-  return 0
+  err "Timed out waiting for system/${label} to stop; refusing to replace or remove live service files."
+  return 1
 }
 
 daemon_loaded() {
@@ -479,9 +524,104 @@ wait_healthy() {
 # a persistent ~/.mc alias file).
 # ----------------------------------------------------------------------------
 mc_admin() {
-  as_user env \
-    "MC_HOST_cache=http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@127.0.0.1:${CACHE_PORT}" \
-    mc "$@"
+  # Source credentials in the child instead of putting them in env(1)'s argv.
+  as_user bash -c '
+    set -euo pipefail
+    . "$1"
+    shift
+    export MC_HOST_cache="http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@127.0.0.1:${CACHE_PORT}"
+    exec mc "$@"
+  ' _ "${MINIO_ENV_FILE}" "$@"
+}
+
+write_minio_wrapper() {
+  as_user bash -c 'cat > "$1" && chmod 755 "$1"' _ "${WRAPPER_PATH}" <<'EOF'
+#!/usr/bin/env bash
+# Generated by runner-cache — do not edit; re-run `runner-cache install`.
+set -euo pipefail
+CACHE_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=/dev/null
+. "${CACHE_ROOT}/config/minio.env"
+# Sourcing alone does not pass these values to MinIO's process environment.
+export MINIO_ROOT_USER MINIO_ROOT_PASSWORD MINIO_PROMETHEUS_AUTH_TYPE
+exec "${MINIO_BIN}" server \
+  --address "127.0.0.1:${CACHE_PORT}" \
+  --console-address "127.0.0.1:${CACHE_CONSOLE_PORT}" \
+  "${CACHE_ROOT}/data"
+EOF
+}
+
+provision_scope() {
+  # --- Per-scope bucket + isolated access keypair. --------------------------
+  log "Provisioning scope '${SCOPE_SLUG}' (bucket ${BUCKET})"
+  if ! mc_admin mb --ignore-existing "cache/${BUCKET}" >/dev/null; then
+    err "Could not create bucket ${BUCKET}."
+    exit 1
+  fi
+
+  # Bucket-scoped policy: the scope's keypair can touch ONLY its own bucket.
+  # Written via as_user (not into WORK_TMPDIR, which may be root-owned) so mc,
+  # which runs as the real user, can read it.
+  local policy_file="${CACHE_ROOT}/config/${POLICY_NAME}.json"
+  as_user bash -c 'cat > "$1"' _ "${policy_file}" <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:*"],
+      "Resource": [
+        "arn:aws:s3:::${BUCKET}",
+        "arn:aws:s3:::${BUCKET}/*"
+      ]
+    }
+  ]
+}
+EOF
+  if ! mc_admin admin policy create cache "${POLICY_NAME}" "${policy_file}" >/dev/null 2>&1; then
+    err "Could not create/update policy ${POLICY_NAME}; refusing to provision an unverified scope."
+    exit 1
+  fi
+
+  local sf access_key secret_key new_scope=0
+  sf="$(scope_file "${SCOPE_SLUG}")"
+  if [[ -f "${sf}" ]]; then
+    step "Scope '${SCOPE_SLUG}' already has credentials; reusing (never displayed)."
+    access_key="$(. "${sf}"; printf '%s' "${ACCESS_KEY}")"
+    secret_key="$(. "${sf}"; printf '%s' "${SECRET_KEY}")"
+    as_user chmod 600 "${sf}"
+  else
+    new_scope=1
+    access_key="$(gen_access_key)"
+    secret_key="$(gen_secret)"
+    if mc_admin admin user info cache "${access_key}" >/dev/null 2>&1; then
+      err "Generated access key collides with an existing user; re-run install."
+      exit 1
+    fi
+  fi
+  # Reconcile existing users/policies too, so reinstall repairs partial setup.
+  if ! printf '%s\n%s\n' "${access_key}" "${secret_key}" | mc_admin admin user add cache >/dev/null 2>&1; then
+    err "Could not create/update the MinIO user for scope '${SCOPE_SLUG}'."
+    exit 1
+  fi
+  if [[ "${new_scope}" -eq 1 ]]; then
+    # Persist before policy attachment, so a retry can recover this keypair.
+    write_secret_file "${sf}" <<EOF
+SCOPE_KIND="${SCOPE_KIND}"
+SCOPE="${SCOPE}"
+BUCKET="${BUCKET}"
+POLICY_NAME="${POLICY_NAME}"
+ACCESS_KEY="${access_key}"
+SECRET_KEY="${secret_key}"
+CREATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+EOF
+    step "Scope credentials written to ${sf} (0600, never displayed)"
+  fi
+  if ! mc_admin admin policy attach cache "${POLICY_NAME}" --user "${access_key}" >/dev/null 2>&1; then
+    err "Could not attach policy ${POLICY_NAME} to the scope user. Re-run install to retry."
+    exit 1
+  fi
+
 }
 
 # ----------------------------------------------------------------------------
@@ -489,12 +629,13 @@ mc_admin() {
 # ----------------------------------------------------------------------------
 cmd_install() {
   detect_platform
-  require_cmds curl openssl awk sed grep tr uname id sudo launchctl plutil dscl head brew
+  require_cmds curl openssl awk sed grep tr uname id sudo launchctl plutil dscl shasum
   detect_user
   ensure_brew
   ensure_minio
   ensure_sudo
   resolve_scope
+  verify_bucket_scope
 
   WORK_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/runner-cache.XXXXXX")"
 
@@ -505,6 +646,7 @@ cmd_install() {
     sudo chown "${REAL_USER}:${REAL_GROUP}" "${CACHE_ROOT}"
   fi
   as_user mkdir -p "${CACHE_ROOT}/data" "${SCOPES_DIR}" "${CACHE_ROOT}/bin" "${LOG_DIR}"
+  as_user chmod 700 "${CACHE_ROOT}/config" "${SCOPES_DIR}"
 
   # --- Root credentials: generate once, reuse on re-run. -------------------
   if [[ -f "${MINIO_ENV_FILE}" ]]; then
@@ -524,6 +666,7 @@ MINIO_PROMETHEUS_AUTH_TYPE="public"
 EOF
   fi
   load_config
+  as_user chmod 600 "${MINIO_ENV_FILE}"
   # Ports fixed at first install win; warn if the caller asked for others.
   if [[ "${PORT}" != "${CACHE_PORT}" || "${CONSOLE_PORT}" != "${CACHE_CONSOLE_PORT}" ]]; then
     warn "Ports are already fixed at ${CACHE_PORT}/${CACHE_CONSOLE_PORT} from the first"
@@ -534,18 +677,7 @@ EOF
   #     and execs minio. Keeps credentials out of the 644 plist and out of
   #     'ps' (no secrets on the minio command line). ---
   step "Writing ${WRAPPER_PATH}"
-  as_user bash -c 'cat > "$1" && chmod 755 "$1"' _ "${WRAPPER_PATH}" <<'EOF'
-#!/usr/bin/env bash
-# Generated by runner-cache — do not edit; re-run `runner-cache install`.
-set -euo pipefail
-CACHE_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-# shellcheck source=/dev/null
-. "${CACHE_ROOT}/config/minio.env"
-exec "${MINIO_BIN}" server \
-  --address ":${CACHE_PORT}" \
-  --console-address ":${CACHE_CONSOLE_PORT}" \
-  "${CACHE_ROOT}/data"
-EOF
+  write_minio_wrapper
 
   # --- Author a FRESH system LaunchDaemon plist (same shape runner-setup
   #     uses: Label, UserName — NOT root —, absolute paths, KeepAlive). ---
@@ -622,67 +754,7 @@ EOF
     exit 1
   fi
 
-  # --- Per-scope bucket + isolated access keypair. --------------------------
-  log "Provisioning scope '${SCOPE_SLUG}' (bucket ${BUCKET})"
-  if ! mc_admin mb --ignore-existing "cache/${BUCKET}" >/dev/null; then
-    err "Could not create bucket ${BUCKET}."
-    exit 1
-  fi
-
-  # Bucket-scoped policy: the scope's keypair can touch ONLY its own bucket.
-  # Written via as_user (not into WORK_TMPDIR, which may be root-owned) so mc,
-  # which runs as the real user, can read it.
-  local policy_file="${CACHE_ROOT}/config/${POLICY_NAME}.json"
-  as_user bash -c 'cat > "$1"' _ "${policy_file}" <<EOF
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": ["s3:*"],
-      "Resource": [
-        "arn:aws:s3:::${BUCKET}",
-        "arn:aws:s3:::${BUCKET}/*"
-      ]
-    }
-  ]
-}
-EOF
-  if ! mc_admin admin policy create cache "${POLICY_NAME}" "${policy_file}" >/dev/null 2>&1; then
-    warn "Could not (re)create policy ${POLICY_NAME}; continuing (it may already exist)."
-  fi
-
-  local sf
-  sf="$(scope_file "${SCOPE_SLUG}")"
-  if [[ -f "${sf}" ]]; then
-    step "Scope '${SCOPE_SLUG}' already has credentials; reusing (never displayed)."
-  else
-    local access_key secret_key
-    access_key="$(gen_access_key)"
-    secret_key="$(gen_secret)"
-    if mc_admin admin user info cache "${access_key}" >/dev/null 2>&1; then
-      err "Generated access key collides with an existing user; re-run install."
-      exit 1
-    fi
-    if ! mc_admin admin user add cache "${access_key}" "${secret_key}" >/dev/null; then
-      err "Could not create the MinIO user for scope '${SCOPE_SLUG}'."
-      exit 1
-    fi
-    if ! mc_admin admin policy attach cache "${POLICY_NAME}" --user "${access_key}" >/dev/null; then
-      err "Could not attach policy ${POLICY_NAME} to the scope user."
-      exit 1
-    fi
-    write_secret_file "${sf}" <<EOF
-SCOPE_KIND="${SCOPE_KIND}"
-SCOPE="${SCOPE}"
-BUCKET="${BUCKET}"
-POLICY_NAME="${POLICY_NAME}"
-ACCESS_KEY="${access_key}"
-SECRET_KEY="${secret_key}"
-CREATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-EOF
-    step "Scope credentials written to ${sf} (0600, never displayed)"
-  fi
+  provision_scope
 
   printf '\n'
   log "Cache backend installed and running as ${REAL_USER} (system/${DAEMON_LABEL})."
@@ -715,7 +787,8 @@ cmd_start() {
   if wait_healthy; then
     log "MinIO is healthy on 127.0.0.1:${CACHE_PORT}."
   else
-    warn "MinIO not healthy yet; check ${LOG_DIR}/minio-stderr.log"
+    err "MinIO did not become healthy; check ${LOG_DIR}/minio-stderr.log"
+    return 1
   fi
 }
 
@@ -771,79 +844,71 @@ cmd_status() {
 }
 
 # ----------------------------------------------------------------------------
-# env — print the runner-service configuration for a scope (stdout), with the
-# wiring instructions on stderr. Credentials are NEVER printed.
+# env — print non-secret S3 settings on stdout; workflow instructions on stderr.
 # ----------------------------------------------------------------------------
 cmd_env() {
   detect_platform
-  require_cmds uname id dscl
+  require_cmds uname id dscl shasum awk tr
   detect_user
   pick_scope
   local sf
   sf="$(scope_file "${SCOPE_SLUG}")"
   if [[ ! -r "${sf}" ]]; then
-    err "Scope '${SCOPE_SLUG}' is not installed. Run:"
-    err "  ${PROG_NAME} install $( [[ -n "${ORG}" ]] && printf -- '--org %s' "${ORG}" || printf -- '--repo %s' "${REPO}" )"
+    err "Scope '${SCOPE_SLUG}' is not installed. Run install with the same scope."
     exit 1
   fi
   # shellcheck disable=SC1090
   . "${sf}"
   load_config
 
-  # stdout: the exact configuration (safe to capture/eval).
   cat <<EOF
-ACTIONS_CACHE_URL=http://127.0.0.1:${CACHE_PORT}/
-ACTIONS_RESULTS_URL=http://127.0.0.1:${CACHE_PORT}/
-ACTIONS_CACHE_SERVICE_V2=true
+RUNNER_CACHE_ENDPOINT=127.0.0.1
+RUNNER_CACHE_PORT=${CACHE_PORT}
+RUNNER_CACHE_BUCKET=${BUCKET}
+RUNNER_CACHE_INSECURE=true
 EOF
 
-  # stderr: how to wire it up.
   cat >&2 <<EOF
 
 ==> Scope '${SCOPE_SLUG}' uses bucket '${BUCKET}' on this host's MinIO.
-    S3 credentials for the bucket are in ${sf} (0600) — read them
-    with sudo only if you need to configure external tooling; they are
-    intentionally not printed here.
+    Scope credentials: ${sf} (0600). Configure GitHub Actions secrets
+    RUNNER_CACHE_ACCESS_KEY and RUNNER_CACHE_SECRET_KEY from ACCESS_KEY and
+    SECRET_KEY in this file. Never use MinIO root credentials in a workflow.
 
-==> WHERE THESE GO — the runner SERVICE, not the workflow:
-    The runner process reads ACTIONS_CACHE_URL / ACTIONS_RESULTS_URL /
-    ACTIONS_CACHE_SERVICE_V2 at STARTUP to choose its cache backend, so they
-    must be set in the runner LaunchDaemon's EnvironmentVariables — the plist
-    runner-setup wrote at:
+==> Add this step to the workflow (requires an up-to-date Actions runner):
 
-      ${LAUNCH_DAEMON_DIR}/com.github.runner-N.plist
-
-    Add to its <key>EnvironmentVariables</key> dict:
-
-      <key>ACTIONS_CACHE_URL</key><string>http://127.0.0.1:${CACHE_PORT}/</string>
-      <key>ACTIONS_RESULTS_URL</key><string>http://127.0.0.1:${CACHE_PORT}/</string>
-      <key>ACTIONS_CACHE_SERVICE_V2</key><string>true</string>
-
-    Then restart that runner (repeat per runner-N):
-
-      sudo launchctl kickstart -k system/com.github.runner-N
-
-    Setting these per-job ('env:' in a workflow) does NOT work — by the time a
-    job runs, the runner has already picked its cache backend.
-
-==> WORKFLOW SNIPPET — once the service env is set, actions/cache is
-    transparent (no workflow changes):
-
-      - uses: actions/cache@v4
+      - uses: tespkg/actions-cache@v1
+        id: dependency-cache
         with:
+          endpoint: 127.0.0.1
+          port: ${CACHE_PORT}
+          insecure: true
+          accessKey: \${{ secrets.RUNNER_CACHE_ACCESS_KEY }}
+          secretKey: \${{ secrets.RUNNER_CACHE_SECRET_KEY }}
+          bucket: ${BUCKET}
+          use-fallback: false
           path: ~/Library/Caches/Homebrew
-          key: brew-\${{ runner.os }}-\${{ hashFiles('**/Brewfile.lock.json') }}
+          key: brew-\${{ github.repository }}-\${{ runner.os }}-\${{ runner.arch }}-\${{ hashFiles('**/Brewfile.lock.json') }}
 
-    v2 backend: ACTIONS_CACHE_SERVICE_V2=true + ACTIONS_RESULTS_URL selects the
-    newer cache-results service path; legacy v1 clients fall back to
-    ACTIONS_CACHE_URL alone. Both point at the same local MinIO here.
+    Pin the action to a reviewed full commit SHA in production. Use an
+    existing dependency lockfile in the key; include toolchain versions for
+    compiled caches. Disable duplicate setup-* caching for this same path.
+    Enable use-fallback explicitly if you want GitHub cache fallback.
+
+    MinIO implements S3, not GitHub's cache protocol. Do not point
+    ACTIONS_CACHE_URL / ACTIONS_RESULTS_URL at it or change the runner's
+    ACTIONS_CACHE_SERVICE_V2 / ACTIONS_RUNTIME_TOKEN. Standard actions/cache,
+    setup-* caches, and Docker type=gha continue to use GitHub's cache service.
+    If earlier instructions added those variables to a runner plist, remove
+    the overrides and reload that LaunchDaemon when the runner is idle.
+    See docs/cache-backend.md for credential setup and migration details.
 EOF
 }
 
 # ----------------------------------------------------------------------------
 # metrics — scrape MinIO's Prometheus endpoint (auth disabled via
 # MINIO_PROMETHEUS_AUTH_TYPE=public in the generated env file) and summarize
-# basic hit/miss counters. Full exposition is at:
+# S3 request/error/transfer counters (not workflow cache hits). Full exposition is at:
 #   http://127.0.0.1:PORT/minio/v2/metrics/cluster
 # ----------------------------------------------------------------------------
 cmd_metrics() {
@@ -877,18 +942,13 @@ cmd_metrics() {
   printf '\n'
   printf '==> runner-cache metrics (from %s)\n' "${url}"
   printf '  %-34s %s\n' "S3 requests (total):" "${total}"
-  printf '  %-34s %s\n' "GET objects (cache reads):" "${gets}"
-  printf '  %-34s %s\n' "PUT objects (cache writes):" "${puts}"
-  printf '  %-34s %s\n' "4xx errors (incl. misses):" "${e4xx}"
+  printf '  %-34s %s\n' "GET object requests:" "${gets}"
+  printf '  %-34s %s\n' "PUT object requests:" "${puts}"
+  printf '  %-34s %s\n' "4xx errors:" "${e4xx}"
   printf '  %-34s %s\n' "5xx errors:" "${e5xx}"
   printf '  %-34s %s\n' "Bytes received:" "${rx}"
   printf '  %-34s %s\n' "Bytes sent:" "${tx}"
-  if [[ "${gets}" -gt 0 ]]; then
-    awk -v g="${gets}" -v m="${e4xx}" 'BEGIN {
-      hr = (g + m) > 0 ? (g / (g + m)) * 100 : 0
-      printf "  %-34s %.1f%%\n", "Approx. read hit rate:", hr
-    }'
-  fi
+  printf '  %s\n' "Cache hit rate: unavailable from S3 request counters; use the action's cache-hit output."
   printf '\n'
   log "Raw Prometheus exposition: ${PROG_NAME} metrics --raw"
   log "Scrape target for Prometheus/Grafana: ${url}"
@@ -915,7 +975,7 @@ cmd_uninstall() {
     log "About to PERMANENTLY remove:"
     printf '     - %s\n' "${PLIST_DEST}" >&2
     if [[ "${KEEP_DATA}" -eq 1 ]]; then
-      printf '     - %s (config, logs, wrapper; data kept)\n' "${CACHE_ROOT}" >&2
+      printf '     - %s (logs and wrapper removed; data + credentials kept)\n' "${CACHE_ROOT}" >&2
     else
       printf '     - %s (INCLUDING all cached blobs)\n' "${CACHE_ROOT}" >&2
     fi
@@ -940,8 +1000,8 @@ cmd_uninstall() {
   fi
   if [[ -d "${CACHE_ROOT}" ]]; then
     if [[ "${KEEP_DATA}" -eq 1 ]]; then
-      step "Removing ${CACHE_ROOT} except data/"
-      sudo rm -rf "${CACHE_ROOT}/config" "${CACHE_ROOT}/bin" "${CACHE_ROOT}/logs"
+      step "Removing runtime files; preserving ${CACHE_ROOT}/data and config"
+      sudo rm -rf "${CACHE_ROOT}/bin" "${CACHE_ROOT}/logs"
     else
       step "Deleting ${CACHE_ROOT}"
       sudo rm -rf "${CACHE_ROOT}"
@@ -967,4 +1027,6 @@ main() {
   esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
