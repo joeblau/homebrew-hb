@@ -282,6 +282,17 @@ record_status() {
   STATUS_RESULT+=("$2")
 }
 
+# runner-upgrade keeps this marker while an operator has a runner stopped.
+runner_in_maintenance() {
+  [[ "$1" =~ ^runner-[0-9]+$ && -f "${RUNNER_ROOT}/.maintenance/$1" ]]
+}
+
+report_maintenance() {
+  step "$1: maintenance active; health checks and remediation skipped."
+  emit_log "$1" maintenance skipped -1 skipped false none skipped
+  record_status "$1" "MAINTENANCE (skipped)"
+}
+
 # ----------------------------------------------------------------------------
 # Structured log line (stdout) — one per runner per pass, always.
 # ----------------------------------------------------------------------------
@@ -411,19 +422,26 @@ bootout_system() {
 # Verifies the daemon is visible afterwards; returns non-zero if it is not.
 remediate() {
   local label="$1" plist="$2" action="$3"
+  # Recheck immediately before acting: maintenance can start during a pass.
+  runner_in_maintenance "${label#com.github.}" && return 0
   case "${action}" in
     kickstart)
       ${SUDO} launchctl kickstart -k "system/${label}" 2>/dev/null || return 1
       ;;
     bootstrap)
       ${SUDO} launchctl bootstrap system "${plist}" 2>/dev/null || return 1
+      runner_in_maintenance "${label#com.github.}" && return 0
       ${SUDO} launchctl enable "system/${label}" 2>/dev/null || true
+      runner_in_maintenance "${label#com.github.}" && return 0
       ${SUDO} launchctl kickstart -k "system/${label}" 2>/dev/null || true
       ;;
     rebootstrap)
       bootout_system "${label}"
+      runner_in_maintenance "${label#com.github.}" && return 0
       ${SUDO} launchctl bootstrap system "${plist}" 2>/dev/null || return 1
+      runner_in_maintenance "${label#com.github.}" && return 0
       ${SUDO} launchctl enable "system/${label}" 2>/dev/null || true
+      runner_in_maintenance "${label#com.github.}" && return 0
       ${SUDO} launchctl kickstart -k "system/${label}" 2>/dev/null || true
       ;;
     *) return 1 ;;
@@ -442,12 +460,15 @@ discover_runners() {
 
   shopt -s nullglob
   for d in "${RUNNER_ROOT}"/runner-*; do
-    [[ -d "${d}" ]] && found+=("$(basename "${d}")")
+    [[ -d "${d}" ]] || continue
+    name="${d##*/}"
+    [[ "${name}" =~ ^runner-[0-9]+$ ]] && found+=("${name}")
   done
   for p in "${LAUNCH_DAEMON_DIR}"/com.github.runner-*.plist; do
     [[ -f "${p}" ]] || continue
     lbl="$(basename "${p}" .plist)"   # com.github.runner-N
-    found+=("${lbl#com.github.}")
+    name="${lbl#com.github.}"
+    [[ "${name}" =~ ^runner-[0-9]+$ ]] && found+=("${name}")
   done
   shopt -u nullglob
 
@@ -472,6 +493,10 @@ discover_runners() {
 # ----------------------------------------------------------------------------
 check_one() {
   local name="$1"
+  if runner_in_maintenance "${name}"; then
+    report_maintenance "${name}"
+    return 0
+  fi
   local dir="${RUNNER_ROOT}/${name}"
   local label="com.github.${name}"
   local plist="${LAUNCH_DAEMON_DIR}/${label}.plist"
@@ -616,6 +641,10 @@ check_one() {
 
   # --- Structured log + alert + status. A healthy runner clears the alert
   #     marker so the NEXT incident alerts again. --------------------------
+  if runner_in_maintenance "${name}"; then
+    report_maintenance "${name}"
+    return 0
+  fi
   emit_log "${name}" "${issue:-check}" "${svc_state}" "${diag_age_min}" \
     "${api_status}" "${busy}" "${action}" "${result}"
 
@@ -650,8 +679,15 @@ run_pass() {
     return 0
   fi
 
-  ensure_state_dir
-  api_fetch
+  API_ENABLED=0
+  API_JSON=""
+  for name in "${RUNNER_NAMES[@]}"; do
+    if ! runner_in_maintenance "${name}"; then
+      ensure_state_dir
+      api_fetch
+      break
+    fi
+  done
 
   local i
   printf '\n'

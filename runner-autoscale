@@ -510,6 +510,22 @@ fetch_token() {
 # ----------------------------------------------------------------------------
 # Local fleet inspection (runner-N directories under /opt/github-runners)
 # ----------------------------------------------------------------------------
+maintenance_active() {
+  local marker name
+  for marker in "${RUNNER_ROOT}"/.maintenance/runner-*; do
+    [[ -f "${marker}" ]] || continue
+    name="${marker##*/}"
+    [[ "${name}" =~ ^runner-[0-9]+$ ]] && return 0
+  done
+  return 1
+}
+
+hold_for_maintenance() {
+  maintenance_active || return 1
+  log_decision "?" "$(count_runners)" "hold" "runner maintenance active; scaling skipped"
+  return 0
+}
+
 list_runner_indices() {
   local d base idx
   shopt -s nullglob
@@ -585,6 +601,7 @@ save_idle_since() {
 # ----------------------------------------------------------------------------
 do_scale_up() {
   local depth="$1" current="$2"
+  hold_for_maintenance && return 0
   local next=1
   # runner-setup fills 1..N: stop at the first missing index so gaps do not
   # accidentally provision multiple runners or repeatedly target an old one.
@@ -594,6 +611,7 @@ do_scale_up() {
     log_decision "${depth}" "${current}" "error" "scale-up aborted: could not mint a registration token"
     return 1
   fi
+  hold_for_maintenance && return 0
   log_decision "${depth}" "${current}" "scale-up" \
     "minimum capacity or queued-job threshold requires one runner; provisioning runner-${next} via runner-setup"
 
@@ -618,6 +636,7 @@ do_scale_up() {
 
 do_scale_down() {
   local depth="$1" current="$2"
+  hold_for_maintenance && return 0
   local highest
   highest="$(highest_runner_index)"
   if [[ -z "${highest}" ]]; then
@@ -629,6 +648,7 @@ do_scale_down() {
     log_decision "${depth}" "${current}" "error" "scale-down aborted: could not mint a removal token"
     return 1
   fi
+  hold_for_maintenance && return 0
   log_decision "${depth}" "${current}" "scale-down" \
     "queue empty and runners idle beyond ${COOLDOWN_MINUTES}m cooldown; removing runner-${highest} via runner-cleanup"
 
@@ -648,8 +668,14 @@ do_scale_down() {
 # single-shot invocation reports failure, while --daemon mode keeps looping.
 # ----------------------------------------------------------------------------
 run_tick() {
+  hold_for_maintenance && return 0
   if ! acquire_lock; then
     log_decision "?" "$(count_runners)" "skip" "another scale operation is already in flight (lock held)"
+    return 0
+  fi
+
+  if hold_for_maintenance; then
+    release_lock
     return 0
   fi
 

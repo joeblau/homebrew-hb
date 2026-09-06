@@ -1,158 +1,203 @@
-# Automatic runner version upgrades
+# Runner shutdown, upgrade, and recovery
 
-`runner-upgrade` keeps the actions/runner binaries that `runner-setup`
-installed under `/opt/github-runners` up to date, without re-registering
-anything: the registration state (`.runner`, `.credentials`) and the `_work`
-directory are carried over, so runner identity and labels survive every
-upgrade.
-
-## Commands
+Tooling **v1.9.0** adds explicit maintenance controls to `runner-upgrade`.
+Homebrew's tooling version is separate from GitHub's runner binary version:
 
 ```sh
-runner-upgrade check --all          # report which runners are behind (exit 3 = upgrades pending)
-runner-upgrade run --all --yes      # canary-first upgrade
-runner-upgrade rollback --runner 2  # restore runner-2.prev over runner-2
+brew update
+brew upgrade joeblau/hb/runner-setup
+runner-upgrade check --all
 ```
 
-`run` is **canary-first**:
+`check` reports installed binary versions. A runner listed as `current` is not
+necessarily connected to GitHub; `start`, `repair`, and `run` verify startup.
 
-1. The new tarball is downloaded and SHA-256 verified exactly like
-   `runner-setup` does (same releases API, same `<!-- BEGIN SHA osx-* -->`
-   marker parsing, same `shasum` verification).
-2. The first selected runner (runner-1) is stopped via its system daemon
-   `com.github.runner-1`. If the daemon remains loaded, the script stops before
-   changing any installation files. Run upgrades after draining active jobs;
-   booting out a service is not an idle-job check.
-3. The old install is moved aside to `runner-1.prev`, the new binaries are
-   extracted, and registration/migration files, `.path`, `.env`, `.service`,
-   `.github_pat`, and `_work` are carried over. The PAT is required by the
-   ephemeral supervisor; its file permissions are preserved.
-4. Before bootstrapping the existing LaunchDaemon, the script prepares
-   `_diag/runner-stdout.log`, `_diag/runner-stderr.log`, and the executable
-   service wrapper. Health is verified by waiting (up to 120 s) for a fresh
-   `_diag/Runner_*.log` to print `Listening for Jobs`. It does not immediately
-   kill/restart the new process with `kickstart -k`.
-5. If **any** of that fails, `runner-1.prev` is restored automatically and
-   the remaining runners are left untouched.
-6. Only after a healthy canary are the remaining runners rolled the same way.
+## Maintenance flow
 
-Every event (checks, upgrades, rollbacks, failures) is appended to the stable
-log `/opt/github-runners/upgrade.log`.
+Pause dispatch of new jobs and allow active jobs to finish first. The helper
+refuses shutdown when it sees an active local `Runner.Worker` or cannot inspect
+worker state. This is a best-effort check, not an atomic GitHub queue drain.
 
-## Scheduling with launchd
+```sh
+# Optional explicit shutdown; retains registration, workspace, and plists.
+runner-upgrade shutdown --all --yes
 
-Run `check`/`run` on a timer with a system LaunchDaemon. Two constraints come
-straight from the runner's own rules:
+# Verify the download, shut down the selection, upgrade and restart it.
+runner-upgrade run --all --yes
 
-- the job must **not run as root** — the script refuses to manage runners as
-  root, so the plist needs a `UserName` key naming the runner owner (the same
-  user `runner-setup` ran as);
-- that user needs passwordless sudo for the few privileged operations
-  (`launchctl bootstrap/bootout`, file ops under `/opt` and
-  `/Library/LaunchDaemons`). Grant it narrowly.
-
-### sudoers
-
-Create `/etc/sudoers.d/github-runner-upgrade` (with `visudo`), replacing
-`joe` with the runner owner:
-
-```
-joe ALL=(root) NOPASSWD: /bin/mkdir, /bin/mv, /bin/rm, /bin/cp, /usr/sbin/chown, /usr/bin/touch, /bin/launchctl
+# Resume stopped runners without changing their installed binary versions.
+runner-upgrade start --all --yes
 ```
 
-### Sample plist
+`run` performs shutdown and startup itself; separate `shutdown` is useful for a
+longer maintenance window. If you shut down explicitly, a later download or
+preflight failure leaves those runners stopped until you run `start`.
 
-Save as `/Library/LaunchDaemons/com.github.runner-upgrade.plist`, owned
-`root:wheel`, mode `644`. This checks and upgrades every 6 hours
-(`StartInterval 21600`); use `StartCalendarInterval` instead if you prefer a
-fixed daily time. Replace `joe` and the `runner-upgrade` path.
+Every command accepts `--runner N` to select one runner. `check`, `shutdown`,
+`run`, and `start` also accept `--runners N` for runner-1 through runner-N, or
+`--all` for the fleet. Selectors cannot be combined. For example, when runner-2
+is already upgraded, repair and upgrade only runner-1:
+
+```sh
+runner-upgrade repair --runner 1
+runner-upgrade run --runner 1 --yes
+runner-upgrade check --all
+```
+
+`repair` requires a fresh registration token for that runner's original scope;
+see the deleted-registration recovery section below.
+
+### What `run` does
+
+1. Check for the known deleted-registration error and active local jobs before
+   changing services. A deleted registration must be repaired first.
+2. Resolve the latest GitHub runner release. Download and verify its published
+   SHA-256 before stopping any selected runner. No download is needed when all
+   selected binaries are current. Existing `.prev` backups block another binary
+   upgrade until the operator resolves them.
+3. Mark and stop every selected runner, confirming its LaunchDaemon unloads.
+   A shutdown failure stops the operation before any binary upgrade begins.
+4. Upgrade the first outdated runner as a canary. Retain registration and
+   migration files, `.path`, `.env`, `.service`, `.github_pat`, and `_work`.
+   Prepare launchd log paths and the executable service wrapper before startup.
+5. Wait for readiness from the fresh diagnostic logs. The default timeout is
+   **300 seconds**, allowing GitHub's four-minute session-conflict retry window;
+   override it with `--health-timeout SECONDS`. Concurrent `--version` logs do
+   not hide the service's readiness message. The explicit deleted-registration
+   error fails immediately and prints the repair command.
+6. After a healthy canary, upgrade and start the remaining runners. Selected
+   runners whose binaries are already current are also restarted. If any start
+   or upgrade fails, stop the flow; unstarted runners remain in maintenance.
+
+If a binary upgrade fails, the helper attempts rollback of that runner. Read
+its recovery status: `ROLLED BACK (unconfirmed)` means the old files were
+restored but startup was not confirmed. Other selected runners remain stopped
+until explicitly resumed. Use `start --runner N` to resume one without restarting
+an already running service. `start` does not repair a deleted registration.
+
+### Watchdog and autoscaler coordination
+
+Shutdown writes `/opt/github-runners/.maintenance/runner-N`. The v1.9.0 health
+watchdog skips marked runners, and the autoscaler holds while any runner is
+marked. Successful startup clears the runner's marker; failures leave it in
+place so maintenance is not undone by a controller.
+
+Restart any long-running watchdog or autoscaler after upgrading the Homebrew
+tools and before maintenance. An older process still executing v1.8.0 code does
+not know about these markers. A fresh launchd timer invocation reads the new
+script. These local markers do not pause GitHub job dispatch or coordinate
+other machines. Do not run overlapping maintenance commands on the same host.
+
+## Deleted-registration recovery
+
+This startup error is a registration failure, not a binary-version failure:
+
+```text
+The runner registration has been deleted from the server, please re-configure.
+```
+
+The listener can connect to GitHub but cannot create a session with its obsolete
+identity. Restoring older binaries retains the same invalid credentials. A
+plain `runner-setup` rerun is not the recovery procedure: an already loaded
+service may be skipped, and configuration refuses existing local registration.
+
+Run repair as the runner owner:
+
+```sh
+runner-upgrade repair --runner 1
+```
+
+The helper displays the saved runner name and GitHub URL. Get a fresh
+**registration token** from that scope's GitHub **Settings → Actions → Runners
+→ New self-hosted runner** page and enter it at the local configuration prompt.
+This is not a removal token. Configuration also asks for custom labels if you
+did not specify `--labels`; restore the labels your workflows expect. Labels
+are not saved in `.runner`. The setup tool's default custom labels were
+`macos,macmini,self-hosted`, but existing fleets may have used other labels.
+
+Repair targets one runner. It:
+
+- Backs up registration, migration state, and operator settings privately under
+  `/opt/github-runners/.registration-backups/`.
+- Stops the selected service and uses the runner's native `remove --local` to
+  clear obsolete local registration. It makes no server deletion request.
+- Reconfigures the existing binary with its saved URL, name, work directory,
+  runner group, ephemeral setting, and automatic-update setting. `--runnergroup`
+  can override the saved group. `.env`, `.path`, `_work`, and the plist are kept.
+- Avoids `--replace`, so a same-name runner on another machine is not silently
+  displaced. Resolve a reported name collision before retrying.
+- Starts the existing service and verifies readiness. If registration fails,
+  the runner stays stopped with its workspace and diagnostics retained. Retry
+  uses the protected backup metadata without restoring obsolete credentials.
+
+For unattended repair, supply `RUNNER_TOKEN` and explicit `--labels`:
+
+```sh
+RUNNER_TOKEN=$(runner-token registration --org YOUR_ORG) \
+  runner-upgrade repair --runner 1 --labels macos,macmini,self-hosted --yes
+```
+
+Use the runner's actual organization or repository scope with `runner-token`;
+its authorizing credential must already be configured. The helper does not log
+or persist the fresh token. Upstream configuration accepts a supplied token as
+a process argument, so prefer the interactive token prompt on shared hosts.
+
+After repair succeeds, use `run --runner 1` to upgrade that runner's binaries.
+Custom labels and a fresh token cannot be reconstructed from a deleted server
+registration; the operator must provide them.
+
+## Rollback and retained diagnostics
+
+```sh
+runner-upgrade rollback --runner 2
+runner-upgrade rollback --all --yes
+```
+
+Rollback confirms the service stopped, moves the current `_work` back into
+`runner-N.prev`, and restores that installation. If both directories contain
+`_work`, it refuses to overwrite either. Startup diagnostics are archived under
+`/opt/github-runners/.upgrade-diagnostics/` before any failed installation is
+removed. Prior diagnostics are archived before starting the restored version,
+so old readiness text cannot make an unconfirmed rollback look healthy.
+
+Read both `runner-stdout.log` and `runner-stderr.log`, plus `Runner_*.log` in the
+printed archive. GitHub's service supervisor sends listener stderr to service
+stdout. The stable event log is `/opt/github-runners/upgrade.log`.
+
+Once satisfied, remove `.prev` directories to reclaim space. Retain/export
+needed diagnostics and registration backups before applying your own retention
+policy. Registration backups contain obsolete credentials and must remain
+private. The helper does not expire these files automatically.
+
+## Scheduling version checks
+
+Schedule `check` separately from the maintenance window. For example, save this
+as `/Library/LaunchDaemons/com.github.runner-upgrade.plist`, owned by `root:wheel`
+and mode `644`. Replace the owner and Homebrew path for the host:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key>
-  <string>com.github.runner-upgrade</string>
-  <key>UserName</key>
-  <string>joe</string>
+  <key>Label</key><string>com.github.runner-upgrade</string>
+  <key>UserName</key><string>joe</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/local/bin/runner-upgrade</string>
-    <string>run</string>
-    <string>--all</string>
-    <string>--yes</string>
+    <string>/opt/homebrew/bin/runner-upgrade</string>
+    <string>check</string><string>--all</string>
   </array>
   <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key>
-    <string>/Users/joe</string>
-  </dict>
-  <key>StartInterval</key>
-  <integer>21600</integer>
-  <key>StandardOutPath</key>
-  <string>/opt/github-runners/upgrade-launchd-stdout.log</string>
-  <key>StandardErrorPath</key>
-  <string>/opt/github-runners/upgrade-launchd-stderr.log</string>
+  <dict><key>HOME</key><string>/Users/joe</string></dict>
+  <key>StartInterval</key><integer>21600</integer>
+  <key>StandardOutPath</key><string>/opt/github-runners/upgrade-launchd-stdout.log</string>
+  <key>StandardErrorPath</key><string>/opt/github-runners/upgrade-launchd-stderr.log</string>
 </dict>
 </plist>
 ```
 
-Load it:
-
-```sh
-sudo launchctl bootstrap system /Library/LaunchDaemons/com.github.runner-upgrade.plist
-```
-
-`--yes` is required in the plist: without a TTY the script refuses to upgrade
-unless confirmation is bypassed.
-
-## Rollback
-
-After a successful `run`, each runner's previous install remains as
-`runner-N.prev`. To revert a runner:
-
-```sh
-runner-upgrade rollback --runner 2      # one runner
-runner-upgrade rollback --all           # every runner that has a .prev
-```
-
-Rollback confirms the daemon has stopped, moves the current `_work` back into
-`runner-N.prev`, then restores the old installation. If both directories
-contain `_work`, it refuses to overwrite either one. Startup diagnostics are
-retained under `/opt/github-runners/.upgrade-diagnostics/` before the failed
-installation is removed. Prior-version diagnostics are archived before
-restarting the restored version, so an old `Listening for Jobs` line cannot
-make a failed rollback look healthy. Unconfirmed rollback health returns an
-error; read the recovery status rather than assuming rollback succeeded.
-
-Once you are satisfied with an upgrade, remove the `.prev` directories to
-reclaim space. Apply your log retention policy to `.upgrade-diagnostics/`
-after exporting any needed evidence; the helper does not expire those logs.
-
-## Startup timeout after an upgrade
-
-A verified download followed by a readiness timeout means the new service
-was not confirmed ready. It does not indicate a failed SHA-256 check.
-The official runner archive deliberately omits `_diag` during
-[packaging](https://github.com/actions/runner/blob/v2.337.0/src/dev.sh#L165).
-The previous upgrader did not recreate the directory even though our
-LaunchDaemons place stdout/stderr inside it. It also omitted the ephemeral
-PAT and deleted failed-install logs/workspace during rollback. These paths
-now have regression coverage with an archive fixture lacking `_diag`.
-
-For a failed attempt with the corrected helper, inspect the printed archived
-diagnostics path, the current runner's `_diag`, and `upgrade.log`. Let recovery
-finish before starting another upgrade. Logs retained by the older helper
-may only describe the restored version because it removed the failed install.
-These startup and rollback fixes are included in tooling release **v1.8.0**.
-Update the helper before retrying, after any existing rollback has finished:
-
-```sh
-brew update
-brew upgrade joeblau/hb/runner-setup
-```
-
-Then run `runner-upgrade run --all` after confirming the runners are idle, and
-use `runner-upgrade check --all` to verify their installed binary versions.
-The Homebrew tooling version and GitHub's `actions/runner` version are separate.
+The runner owner must be able to write the output paths. `check` exits 3 when
+upgrades are pending, 0 when versions are current, and 1 on errors.
+Unattended maintenance additionally requires `--yes`, the appropriate sudo
+configuration, and an external process that pauses dispatch and drains jobs.
+It must run as the runner owner; runner processes cannot run as root.
