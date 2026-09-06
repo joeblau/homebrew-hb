@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import plistlib
 import subprocess
 import sys
 import tempfile
@@ -34,7 +35,13 @@ class RunnerRepairTests(unittest.TestCase):
             (self.runner / name).write_text("original " + name)
         (self.runner / ".runner_migrated").write_text(json.dumps(self.settings))
         (self.root / "plists").mkdir()
-        (self.root / "plists/com.github.runner-1.plist").touch()
+        self.plist = self.root / "plists/com.github.runner-1.plist"
+        self.plist.write_bytes(plistlib.dumps({
+            "Label": "com.github.runner-1", "WorkingDirectory": str(self.runner),
+            "ProgramArguments": [str(self.runner / "bin/runsvc.sh")],
+            "EnvironmentVariables": {"HOME": "/Users/fixture", "TEST_VALUE": "keep < & quotes\""},
+            "RunAtLoad": True,
+        }))
         (self.root / "runners/runner-2").mkdir()
         (self.root / "runners/runner-2/untouched").write_text("other runner")
         listener = self.runner / "bin/Runner.Listener"
@@ -65,11 +72,11 @@ assert not (directory / ".runner_migrated").exists()
 if os.environ.get("TEST_CONFIG_FAIL"):
     print("Registration rejected", file=sys.stderr)
     sys.exit(1)
-def value(name):
-    return args[args.index(name) + 1]
+def value(name, default=None):
+    return args[args.index(name) + 1] if name in args else default
 settings = {
     "agentId": 84, "agentName": value("--name"), "gitHubUrl": value("--url"),
-    "workFolder": value("--work"), "poolName": value("--runnergroup"),
+    "workFolder": value("--work"), "poolName": value("--runnergroup", "Default"),
     "ephemeral": "--ephemeral" in args, "disableUpdate": "--disableupdate" in args,
 }
 if os.environ.get("TEST_BAD_ARTIFACT"):
@@ -79,6 +86,17 @@ if os.environ.get("TEST_BAD_ARTIFACT"):
 (directory / ".credentials_rsaparams").write_text("fresh RSA key")
 ''')
         listener.chmod(0o755)
+
+    def supervisor(self, args=None):
+        self.settings["ephemeral"] = True
+        (self.runner / ".runner").write_text(json.dumps(self.settings))
+        (self.runner / ".runner_migrated").write_text(json.dumps(self.settings))
+        document = plistlib.loads(self.plist.read_bytes())
+        document["ProgramArguments"] = args or [
+            "/opt/homebrew/bin/runner-ephemeral", "--dir", str(self.runner),
+            "--org", "acme", "--labels", "old-label", "--name", self.settings["agentName"],
+        ]
+        self.plist.write_bytes(plistlib.dumps(document))
 
     def shell(self, body="cmd_repair", **env):
         definitions = SCRIPT.read_text().rsplit('main "$@"', 1)[0]
@@ -92,7 +110,15 @@ ASSUME_YES=1
 REPAIR_LABELS="${TEST_LABELS-macos,macmini,self-hosted}"
 REPAIR_LABELS_SET="${TEST_LABELS_SET-1}"
 REPAIR_RUNNER_GROUP="${TEST_RUNNER_GROUP-}"
+REPAIR_ORG="${TEST_REPAIR_ORG-}"
+REPAIR_REPO="${TEST_REPAIR_REPO-}"
 as_user() { "$@"; }
+sudo() {
+  case "$1" in
+    chown) [[ "${TEST_PLIST_INSTALL_FAIL-}" != 1 ]] ;;
+    *) "$@" ;;
+  esac
+}
 ensure_sudo() { :; }
 prepare_event_log() { touch "$LOG_FILE"; }
 shutdown_runner() {
@@ -100,6 +126,7 @@ shutdown_runner() {
   [[ "${TEST_STOP_FAIL-}" != 1 ]]
 }
 start_runner() {
+  repair_resume_pending_plist "$1" || return 1
   printf '%s\n' "$1" >> "$TEST_ROOT/started"
   [[ "${TEST_START_FAIL-}" != 1 ]]
 }

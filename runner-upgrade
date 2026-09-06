@@ -56,6 +56,8 @@ HEALTH_FAILURE=""
 REPAIR_LABELS=""
 REPAIR_LABELS_SET=0
 REPAIR_RUNNER_GROUP=""
+REPAIR_ORG=""
+REPAIR_REPO=""
 
 COMMAND=""
 RUNNERS=""                # --runners N (runners 1..N)
@@ -98,7 +100,7 @@ USAGE:
   ${PROG_NAME} shutdown [--runner N | --all] [--yes]
   ${PROG_NAME} run [--runner N | --runners N | --all] [--yes]
   ${PROG_NAME} start [--runner N | --all] [--yes]
-  ${PROG_NAME} repair --runner N [--labels LABELS] [--runnergroup GROUP] [--yes]
+  ${PROG_NAME} repair --runner N [--org ORG | --repo OWNER/REPO] [--labels LABELS] [--yes]
   ${PROG_NAME} rollback (--runner N | --all) [--yes]
 
 COMMANDS:
@@ -125,6 +127,8 @@ OPTIONS:
   --health-timeout SECONDS  Startup wait (default: 300).
   --labels CSV  Custom labels for repair (not stored in local runner metadata).
   --runnergroup NAME  Override the saved runner group for repair.
+  --org ORG     Explicitly register the repaired runner with this organization.
+  --repo OWNER/REPO  Explicitly register the repaired runner with this repository.
   -y, --yes     Do not prompt for confirmation (required for launchd jobs).
   -h, --help    Show this help and exit.
 
@@ -134,6 +138,7 @@ EXAMPLES:
   ${PROG_NAME} run --all --yes
   ${PROG_NAME} start --all --yes
   ${PROG_NAME} repair --runner 1
+  ${PROG_NAME} repair --runner 1 --org acme --labels macos,macmini,self-hosted
   ${PROG_NAME} rollback --runner 2
 
   launchd runs the job unattended; a typical StartInterval job executes:
@@ -214,6 +219,14 @@ parse_args() {
         [[ $# -ge 2 ]] || { err "--runnergroup requires a value"; exit 2; }
         REPAIR_RUNNER_GROUP="$2"; shift 2 ;;
       --runnergroup=*) REPAIR_RUNNER_GROUP="${1#*=}"; shift ;;
+      --org)
+        [[ $# -ge 2 && -n "$2" ]] || { err "--org requires an organization"; exit 2; }
+        REPAIR_ORG="$2"; shift 2 ;;
+      --org=*) REPAIR_ORG="${1#*=}"; [[ -n "${REPAIR_ORG}" ]] || { err "--org requires an organization"; exit 2; }; shift ;;
+      --repo)
+        [[ $# -ge 2 && -n "$2" ]] || { err "--repo requires OWNER/REPO"; exit 2; }
+        REPAIR_REPO="$2"; shift 2 ;;
+      --repo=*) REPAIR_REPO="${1#*=}"; [[ -n "${REPAIR_REPO}" ]] || { err "--repo requires OWNER/REPO"; exit 2; }; shift ;;
       -y|--yes)     ASSUME_YES=1; shift ;;
       -h|--help)    usage; exit 0 ;;
       *) err "Unknown argument: $1"; usage; exit 2 ;;
@@ -236,8 +249,17 @@ parse_args() {
       || [[ -n "${RUNNERS}" && "${SELECT_ALL}" -eq 1 ]]; then
     err "Choose exactly one of --runner, --runners, or --all."; exit 2
   fi
-  if [[ "${COMMAND}" != repair && ( "${REPAIR_LABELS_SET}" -eq 1 || -n "${REPAIR_RUNNER_GROUP}" ) ]]; then
-    err "--labels and --runnergroup are only valid with repair."; exit 2
+  if [[ "${COMMAND}" != repair && ( "${REPAIR_LABELS_SET}" -eq 1 || -n "${REPAIR_RUNNER_GROUP}" || -n "${REPAIR_ORG}" || -n "${REPAIR_REPO}" ) ]]; then
+    err "--labels, --runnergroup, --org, and --repo are only valid with repair."; exit 2
+  fi
+  if [[ -n "${REPAIR_ORG}" && -n "${REPAIR_REPO}" ]]; then
+    err "Choose either --org or --repo for repair."; exit 2
+  fi
+  if [[ -n "${REPAIR_ORG}" ]] && ! [[ "${REPAIR_ORG}" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]]; then
+    err "--org must be an organization name, without a URL or slash."; exit 2
+  fi
+  if [[ -n "${REPAIR_REPO}" ]] && ! [[ "${REPAIR_REPO}" =~ ^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$ ]]; then
+    err "--repo must be OWNER/REPO, without a URL."; exit 2
   fi
 
   case "${COMMAND}" in
@@ -308,7 +330,7 @@ detect_arch() {
 require_cmds() {
   local missing=()
   local c
-  for c in curl tar uname id sudo launchctl dscl shasum tr grep sed awk ls date sleep mkdir mktemp chmod touch mv ps tee jq; do
+  for c in curl tar uname id sudo launchctl dscl shasum tr grep sed awk ls date sleep mkdir mktemp chmod touch mv ps tee jq plutil; do
     command -v "${c}" >/dev/null 2>&1 || missing+=("${c}")
   done
   if [[ ${#missing[@]} -gt 0 ]]; then
@@ -559,6 +581,7 @@ shutdown_runner() {
 
 start_runner() {
   local name="$1" dir="${RUNNER_ROOT}/$1"
+  repair_resume_pending_plist "${name}" || return 1
   if service_is_running "${name}"; then
     # An unheld live service needs no restart. A service that was restarted
     # externally while held needs a fresh idle restart: old logs cannot prove
@@ -714,6 +737,7 @@ archive_diagnostics() {
 # ----------------------------------------------------------------------------
 bootstrap_daemon() {
   local name="$1"
+  repair_resume_pending_plist "${name}" || return 1
   local label="com.github.${name}"
   local plist="${LAUNCH_DAEMON_DIR}/${label}.plist"
 
@@ -760,6 +784,10 @@ bootstrap_daemon() {
 # ----------------------------------------------------------------------------
 rollback_runner() {
   local name="$1"
+  if [[ -e "${RUNNER_ROOT}/.registration-backups/${name}.pending-plist" || -L "${RUNNER_ROOT}/.registration-backups/${name}.pending-plist" ]]; then
+    err "Finish the pending supervisor repair with 'start --runner ${name#runner-}' before rolling back ${name}."
+    return 1
+  fi
   local dir="${RUNNER_ROOT}/${name}"
   local prev="${dir}.prev"
 
@@ -1017,15 +1045,137 @@ repair_preserve_failed_registration() {
   done
 }
 
+# Inspect the actual service, including during retries whose saved settings
+# already contain the new scope. Never rewrite an unknown wrapper's arguments.
+repair_plist_plan() {
+  local plist="$1" dir="$2" url="$3" document program arguments updated api_url
+  document="$(plutil -convert json -o - -- "${plist}" 2>/dev/null)" || {
+    err "Cannot parse LaunchDaemon ${plist}; no registration was changed."; return 1;
+  }
+  if ! printf '%s' "${document}" | jq -e --arg dir "${dir}" '
+      (.ProgramArguments | type == "array" and length > 0 and all(.[]; type == "string"))
+      and (.Program == null or .Program == .ProgramArguments[0])
+      and .WorkingDirectory == $dir' >/dev/null; then
+    err "Unrecognized LaunchDaemon structure in ${plist}; refusing to change registration."; return 1
+  fi
+  arguments="$(printf '%s' "${document}" | jq -c .ProgramArguments)"
+  program="$(printf '%s' "${arguments}" | jq -r '.[0]')"
+  if [[ "${program}" == "${dir}/bin/runsvc.sh" ]]; then
+    printf '{"supervisor":false,"arguments":null}\n'
+    return 0
+  fi
+  if [[ "${program}" != /* || "${program##*/}" != runner-ephemeral ]]; then
+    err "Unrecognized service executable in ${plist}; cannot safely reconcile its registration scope."; return 1
+  fi
+  if [[ "${REPAIR_LABELS_SET}" -ne 1 ]]; then
+    err "Ephemeral repair requires explicit --labels so later jobs retain the selected labels."; return 2
+  fi
+  api_url="$(printf '%s' "${arguments}" | jq -er '
+    [range(0; length) as $i | if .[$i] == "--api-url" then .[$i + 1]
+      elif (.[$i] | startswith("--api-url=")) then .[$i] | sub("^--api-url="; "")
+      else empty end] | if length > 1 then error("Duplicate API override") else .[0] // "" end
+    | select(type == "string")' 2>/dev/null)" || {
+      err "Malformed supervisor API override; no registration was changed."; return 1;
+    }
+  if [[ "${url}" == https://github.com/* && -n "${api_url}" && "${api_url%/}" != https://api.github.com ]]; then
+    err "The supervisor's --api-url does not match GitHub.com; reconcile that override before changing registration."; return 1
+  fi
+  # JSON editing preserves quoting, XML escaping, and unrelated options such
+  # as --name, --dir, and --pat-file. Handle both --flag value and --flag=value.
+  if ! updated="$(printf '%s' "${arguments}" | jq -ce --arg url "${url}" --arg labels "${REPAIR_LABELS}" '
+      def strip_registration_options:
+        if length == 0 then []
+        elif .[0] == "--org" or .[0] == "--repo" or .[0] == "--url" or .[0] == "--labels" then
+          if length < 2 or (.[1] | startswith("--")) then error("Missing supervisor option value")
+          else .[2:] | strip_registration_options end
+        elif (.[0] | test("^--(org|repo|url|labels)=")) then .[1:] | strip_registration_options
+        else [.[0]] + (.[1:] | strip_registration_options) end;
+      .[0:1] + (.[1:] | strip_registration_options) + ["--url", $url, "--labels", $labels]
+    ' 2>/dev/null)"; then
+    err "Malformed registration arguments in ${plist}; no registration was changed."; return 1
+  fi
+  jq -cn --argjson arguments "${updated}" '{supervisor:true, arguments:$arguments}'
+}
+
+repair_install_plist() {
+  local name="$1" staged="$2" plist="$3" install_tmp
+  install_tmp="$(sudo mktemp "${LAUNCH_DAEMON_DIR}/.com.github.${name}.repair.XXXXXX")" || return 1
+  if ! { sudo cp "${staged}" "${install_tmp}" \
+      && sudo chown root:wheel "${install_tmp}" && sudo chmod 644 "${install_tmp}" \
+      && sudo plutil -lint "${install_tmp}" >/dev/null \
+      && sudo mv -f "${install_tmp}" "${plist}"; }; then
+    sudo rm -f "${install_tmp}" 2>/dev/null || true
+    return 1
+  fi
+}
+
+repair_resume_pending_plist() {
+  local name="$1" root="${RUNNER_ROOT}/.registration-backups" pointer backup_name backup expected_scope="" settings
+  pointer="${root}/${name}.pending-plist"
+  [[ -e "${pointer}" || -L "${pointer}" ]] || return 0
+  if [[ -L "${root}" || -L "${pointer}" ]]; then
+    err "Invalid pending supervisor backup; ${name} remains stopped."; return 1
+  fi
+  backup_name="$(cat "${pointer}")" || return 1
+  if [[ "${backup_name}" != "${name}-"* || "${backup_name}" == */* || "${backup_name}" == *..* ]]; then
+    err "Invalid pending supervisor backup; ${name} remains stopped."; return 1
+  fi
+  backup="${root}/${backup_name}"
+  if [[ -L "${backup}" || -L "${backup}/LaunchDaemon.updated.plist" || -L "${backup}/registered.json" ]] \
+      || [[ ! -s "${backup}/registered.json" || ! -s "${backup}/LaunchDaemon.updated.plist" ]]; then
+    err "Incomplete supervisor repair; inspect ${backup} before starting or re-registering ${name}."; return 1
+  fi
+  settings="$(repair_settings "${backup}/registered.json" 2>/dev/null)" || return 1
+  [[ -z "${REPAIR_ORG}" ]] || expected_scope="https://github.com/${REPAIR_ORG}"
+  [[ -z "${REPAIR_REPO}" ]] || expected_scope="https://github.com/${REPAIR_REPO}"
+  if [[ -n "${expected_scope}" && "${expected_scope}" != "$(printf '%s' "${settings}" | jq -r .gitHubUrl)" ]]; then
+    err "Finish the pending repair for ${name} with 'start --runner ${name#runner-}' before changing scope again."; return 1
+  fi
+  if [[ ! -s "${RUNNER_ROOT}/${name}/.credentials" || ! -s "${RUNNER_ROOT}/${name}/.credentials_rsaparams" ]] \
+      || ! jq -e --slurpfile saved "${backup}/registered.json" \
+        '.agentId == $saved[0].agentId and .gitHubUrl == $saved[0].gitHubUrl and .agentName == $saved[0].agentName' \
+        "${RUNNER_ROOT}/${name}/.runner" >/dev/null 2>&1; then
+    err "Registration no longer matches pending repair ${backup}; ${name} remains stopped."; return 1
+  fi
+  if ! repair_install_plist "${name}" "${backup}/LaunchDaemon.updated.plist" "${LAUNCH_DAEMON_DIR}/com.github.${name}.plist"; then
+    err "Could not install pending supervisor plist from ${backup}; ${name} remains stopped. Retry 'start --runner ${name#runner-}'."; return 1
+  fi
+  as_user rm -f "${pointer}" || return 1
+  step "Installed the pending supervisor configuration for ${name}; retained its new registration."
+}
+
+repair_token_guidance() {
+  local url="$1" scope="${1#https://github.com/}"
+  if [[ "${url}" == https://github.com/* && "${scope}" != */* ]]; then
+    err "Use a fresh ORGANIZATION registration token from https://github.com/organizations/${scope}/settings/actions/runners/new"
+  elif [[ "${url}" == https://github.com/* && "${scope}" =~ ^[^/]+/[^/]+$ && "${scope}" != enterprises/* ]]; then
+    err "Use a fresh REPOSITORY registration token from ${url}/settings/actions/runners/new"
+  else
+    err "Use a fresh runner registration token issued for ${url}."
+  fi
+  err "The token must match that scope; organization, repository, removal tokens, and PATs are not interchangeable."
+}
+
 cmd_repair() {
   # Upstream accepts a supplied registration token as a configure argument.
   # Never allow this helper's tracing to disclose it.
   set +x
   local name="runner-${TARGET_RUNNER}" dir="${RUNNER_ROOT}/runner-${TARGET_RUNNER}"
   local backup_root="${RUNNER_ROOT}/.registration-backups" source settings latest=""
-  local backup pointer pointer_tmp backup_name f url runner_name work group ephemeral disable_update config_rc=0
+  local backup pointer pointer_tmp backup_name f url old_url runner_name work group ephemeral disable_update config_rc=0
+  local plist="${LAUNCH_DAEMON_DIR}/com.github.${name}.plist" plist_plan plist_args staged_plist=""
+  local pending_plist="${backup_root}/${name}.pending-plist"
   local -a config_args=()
   [[ -n "${TARGET_RUNNER}" ]] || { err "repair requires --runner N."; return 2; }
+  if [[ -e "${pending_plist}" || -L "${pending_plist}" ]]; then
+    RUNNER_NAMES=("${name}")
+    confirm "finish the pending supervisor repair and start ${name}"
+    ensure_sudo
+    prepare_event_log || return 1
+    if ! start_runner "${name}"; then print_summary; return 1; fi
+    print_summary
+    return 0
+  fi
   if [[ ! -t 0 && ( -z "${RUNNER_TOKEN:-}" || "${REPAIR_LABELS_SET}" -ne 1 ) ]]; then
     err "Unattended repair requires RUNNER_TOKEN and explicit --labels (an empty value is allowed)."
     return 2
@@ -1065,13 +1215,29 @@ cmd_repair() {
     err "Invalid registration settings in ${source}; no service or registration was changed."
     return 1
   fi
-  url="$(printf '%s' "${settings}" | jq -r .gitHubUrl)"
+  old_url="$(printf '%s' "${settings}" | jq -r .gitHubUrl)"
+  url="${old_url}"
+  [[ -z "${REPAIR_ORG}" ]] || url="https://github.com/${REPAIR_ORG}"
+  [[ -z "${REPAIR_REPO}" ]] || url="https://github.com/${REPAIR_REPO}"
+  if [[ "$(printf '%s' "${old_url%/}" | tr '[:upper:]' '[:lower:]')" != "$(printf '%s' "${url%/}" | tr '[:upper:]' '[:lower:]')" ]]; then
+    # Groups belong to the destination scope; a source group's name may be
+    # absent there. Omission lets interactive config ask, or uses its default.
+    settings="$(printf '%s' "${settings}" | jq -c --arg url "${url}" '.gitHubUrl = $url | .poolName = ""')" || return 1
+    step "Changing registration scope from ${old_url} to ${url}; the old server registration will not be deleted."
+  fi
   runner_name="$(printf '%s' "${settings}" | jq -r .agentName)"
   work="$(printf '%s' "${settings}" | jq -r .workFolder)"
   group="$(printf '%s' "${settings}" | jq -r .poolName)"
   ephemeral="$(printf '%s' "${settings}" | jq -r .ephemeral)"
   disable_update="$(printf '%s' "${settings}" | jq -r .disableUpdate)"
   [[ -z "${REPAIR_RUNNER_GROUP}" ]] || group="${REPAIR_RUNNER_GROUP}"
+  # Persist the intended scope and group for a retry after a rejected token.
+  settings="$(printf '%s' "${settings}" | jq -c --arg url "${url}" --arg group "${group}" '.gitHubUrl = $url | .poolName = $group')" || return 1
+  plist_plan="$(repair_plist_plan "${plist}" "${dir}" "${url}")" || return 1
+  plist_args="$(printf '%s' "${plist_plan}" | jq -c '.arguments // empty')"
+  if [[ "$(printf '%s' "${plist_plan}" | jq -r .supervisor)" == true ]]; then
+    step "The ephemeral supervisor's configured PAT must authorize token creation for ${url}."
+  fi
   config_args=(configure --url "${url}" --name "${runner_name}" --work "${work}")
   [[ -z "${group}" ]] || config_args+=(--runnergroup "${group}")
   [[ "${ephemeral}" != true ]] || config_args+=(--ephemeral)
@@ -1102,6 +1268,19 @@ cmd_repair() {
       return 1
     fi
   done
+  if [[ -n "${plist_args}" ]]; then
+    staged_plist="${backup}/LaunchDaemon.updated.plist"
+    if ! { as_user cp "${plist}" "${backup}/LaunchDaemon.original.plist" \
+        && as_user cp "${plist}" "${staged_plist}" \
+        && as_user plutil -replace ProgramArguments -json "${plist_args}" -- "${staged_plist}" \
+        && as_user plutil -lint "${staged_plist}" >/dev/null; }; then
+      err "Could not stage the updated supervisor plist; registration unchanged. Backup: ${backup}"
+      return 1
+    fi
+    if ! printf '%s\n' "${backup##*/}" | as_user tee "${pending_plist}" >/dev/null; then
+      err "Could not record the pending supervisor update; registration unchanged. Backup: ${backup}"; return 1
+    fi
+  fi
   pointer_tmp="$(as_user mktemp "${backup_root}/.repair-pointer-XXXXXX")" || return 1
   if ! printf '%s\n' "${backup##*/}" | as_user tee "${pointer_tmp}" >/dev/null \
       || ! as_user mv "${pointer_tmp}" "${pointer}"; then
@@ -1115,10 +1294,12 @@ cmd_repair() {
   # The native local removal also clears migrated settings and RSA keys. It
   # makes no server deletion request and does not touch _work, .env, or .path.
   if ! (cd "${dir}" && as_user ./bin/Runner.Listener remove --local); then
+    [[ -z "${staged_plist}" ]] || as_user rm -f "${pending_plist}" || true
     err "Could not clear obsolete local registration. ${name} remains stopped; backup: ${backup}"
     return 1
   fi
   if [[ -e "${dir}/.runner" || -e "${dir}/.runner_migrated" ]]; then
+    [[ -z "${staged_plist}" ]] || as_user rm -f "${pending_plist}" || true
     err "Local registration was not cleared. ${name} remains stopped; backup: ${backup}"
     return 1
   fi
@@ -1136,13 +1317,26 @@ cmd_repair() {
     if ! repair_preserve_failed_registration "${dir}" "${backup}"; then
       err "Could not archive all failed registration files. Inspect ${dir} and ${backup}/failed-registration before retrying."
     fi
+    [[ -z "${staged_plist}" ]] || as_user rm -f "${pending_plist}" || true
     err "Registration failed; ${name} remains stopped. Its workspace and service settings are preserved."
+    repair_token_guidance "${url}"
     err "Backup: ${backup}. Re-run repair with a fresh token for ${url}; saved settings are recovered if .runner is absent."
     err "If GitHub reports a duplicate name, resolve that collision before retrying; no other registration was replaced."
     record_status "${name}" "FAILED (registration; stopped)"
     log_event "${PROG_NAME} repair ${name} FAILED registration backup=${backup}"
     print_summary
     return 1
+  fi
+  if [[ -n "${staged_plist}" ]]; then
+    if ! as_user cp "${dir}/.runner" "${backup}/registered.json" \
+        || ! repair_resume_pending_plist "${name}"; then
+      err "Registration succeeded; ${name} remains stopped while its supervisor update is pending."
+      err "Retry '${PROG_NAME} start --runner ${TARGET_RUNNER}' to install the saved plist and reuse this registration. Backup: ${backup}"
+      record_status "${name}" "REGISTERED (plist update failed; stopped)"
+      log_event "${PROG_NAME} repair ${name} registered plist=failed backup=${backup}"
+      print_summary
+      return 1
+    fi
   fi
   if ! start_runner "${name}"; then
     err "${name} was registered, but startup health is unconfirmed. Inspect its diagnostics before retrying; backup: ${backup}"
