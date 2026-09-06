@@ -1,6 +1,7 @@
 # Runner shutdown, upgrade, and recovery
 
 Tooling **v1.9.0** adds explicit maintenance controls to `runner-upgrade`.
+Tooling **v1.9.1** adds explicit organization/repository selection during repair.
 Homebrew's tooling version is separate from GitHub's runner binary version:
 
 ```sh
@@ -145,6 +146,58 @@ a process argument, so prefer the interactive token prompt on shared hosts.
 After repair succeeds, use `run --runner 1` to upgrade that runner's binaries.
 Custom labels and a fresh token cannot be reconstructed from a deleted server
 registration; the operator must provide them.
+
+### Choose an organization instead of the saved repository
+
+Repair normally reuses the old registration scope. In v1.9.1, select a different
+scope explicitly when moving an existing runner:
+
+```sh
+runner-upgrade repair --runner 1 --org lev7finance
+# Or choose one repository:
+runner-upgrade repair --runner 1 --repo OWNER/REPO
+```
+
+Use a fresh registration token from the **same scope printed by repair**. For
+`--org lev7finance`, open the organization's [New self-hosted runner page](https://github.com/organizations/lev7finance/settings/actions/runners/new).
+An organization token cannot register the runner with a saved repository URL
+such as `https://github.com/bloxwap/monorepo`; that mismatch can produce GitHub's
+`404 Not Found` during authentication. An expired token can also produce 404.
+The URL shown in the GitHub page's `config.sh --url ...` command must match
+repair's target URL. Enter its registration token at the local prompt.
+
+The new scope is saved for retries if authentication fails. The original
+registration stays in the private backup. A scope change does not carry the
+old runner group into the new scope; choose a destination group when prompted,
+or specify `--runnergroup NAME`. Name, work directory, and lifecycle settings
+are preserved. The helper does not delete any old server registration or
+replace an existing registration on another machine.
+
+For a service using `runner-ephemeral`, repair also updates the supervisor's
+saved scope and labels in its LaunchDaemon. Supply `--labels` explicitly so
+subsequent jobs retain those labels. Its PAT (from the environment or configured
+PAT file) must also authorize registration in the destination organization;
+the temporary registration token does not grant that ongoing access. The
+supervisor preserves the configured runner group across job cycles.
+
+### Which repositories can use an organization runner?
+
+An organization runner serves repositories allowed by its runner group. In
+GitHub, open **Organization Settings → Actions → Runner groups**, select the
+group, and configure **Repository access** for all or selected repositories.
+Their workflows can then request its labels, for example:
+
+```yaml
+runs-on: [self-hosted, macOS, ARM64]
+```
+
+A repository registration serves one repository; an organization registration
+serves allowed repositories within that organization. Enterprise registrations
+can be assigned to multiple organizations in the same enterprise. A single
+registration cannot serve arbitrary unrelated organizations. One Mac can host
+separate runner instances registered to different scopes, sharing its hardware
+capacity. See GitHub's [runner scopes](https://docs.github.com/en/actions/concepts/runners/self-hosted-runners)
+and [runner-group access controls](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/manage-access).
 
 ## Rollback and retained diagnostics
 

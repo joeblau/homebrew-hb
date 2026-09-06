@@ -332,11 +332,12 @@ fetch_registration_token() {
 }
 
 # ----------------------------------------------------------------------------
-# Read the previous registration's name/URL from .runner BEFORE wiping, like
+# Read the previous registration's name/URL/group from .runner BEFORE wiping, like
 # runner-setup's existing_name logic: the runner keeps its GitHub identity
 # (and its LaunchDaemon/label naming) stable across ephemeral re-registrations.
 # ----------------------------------------------------------------------------
 read_saved_identity() {
+  local saved_group=""
   SAVED_NAME=""
   SAVED_URL=""
   if [[ -f "${DIR}/.runner" ]]; then
@@ -344,6 +345,7 @@ read_saved_identity() {
       "${DIR}/.runner" 2>/dev/null | head -n1 || true)"
     SAVED_URL="$(sed -n 's/.*"gitHubUrl"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
       "${DIR}/.runner" 2>/dev/null | head -n1 || true)"
+    saved_group="$(jq -r '.poolName | select(type == "string")' "${DIR}/.runner" 2>/dev/null || true)"
   fi
   # Precedence: --name CLI arg > previous registration's agentName > dir name.
   # Resolve once, then retain the identity if GitHub removes .runner.
@@ -354,6 +356,9 @@ read_saved_identity() {
   fi
   RUNNER_NAME="${NAME_ARG}"
   [[ -n "${SAVED_URL}" ]] && RUNNER_URL="${SAVED_URL}"
+  # Ephemeral completion can remove .runner. Retain the last known group so
+  # later registrations keep the group's workflow access restrictions.
+  [[ -n "${saved_group}" ]] && RUNNER_GROUP="${saved_group}"
   return 0
 }
 
@@ -376,6 +381,7 @@ FETCHED_TOKEN=""
 SAVED_NAME=""
 SAVED_URL=""
 RUNNER_NAME=""
+RUNNER_GROUP=""
 
 run_cycle() {
   read_saved_identity
@@ -397,6 +403,11 @@ run_cycle() {
   # the runner automatically after it completes ONE job. --replace overwrites
   # any stale same-name registration left by an interrupted previous cycle.
   local config_rc=0 saved_path=""
+  local -a config_args=(
+    --unattended --ephemeral --url "${RUNNER_URL}" --token "${FETCHED_TOKEN}"
+    --name "${RUNNER_NAME}" --labels "${LABELS}" --replace
+  )
+  [[ -z "${RUNNER_GROUP}" ]] || config_args+=(--runnergroup "${RUNNER_GROUP}")
   # Upstream config.sh runs env.sh, which rewrites .path from its environment.
   # Carry the existing toolchain PATH into config, not just through wipe_state.
   if [[ -f "${DIR}/.path" ]]; then
@@ -409,15 +420,9 @@ run_cycle() {
   (
     cd "${DIR}" || exit 1
     [[ -z "${saved_path}" ]] || export PATH="${saved_path}"
-    ./config.sh \
-      --unattended \
-      --ephemeral \
-      --url "${RUNNER_URL}" \
-      --token "${FETCHED_TOKEN}" \
-      --name "${RUNNER_NAME}" \
-      --labels "${LABELS}" \
-      --replace
+    ./config.sh "${config_args[@]}"
   ) || config_rc=$?
+  config_args=()
   FETCHED_TOKEN=""
   if [[ "${config_rc}" -ne 0 || ! -f "${DIR}/.runner" ]]; then
     local marker; marker="$( [[ -f "${DIR}/.runner" ]] && echo present || echo missing )"

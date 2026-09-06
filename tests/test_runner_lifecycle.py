@@ -127,6 +127,63 @@ printf '%s' "$RUNNER_NAME"
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "host-runner-1")
 
+    def test_ephemeral_runner_group_survives_registration_file_removal(self):
+        (self.root / ".runner").write_text(json.dumps({
+            "agentName": "host-runner-1", "poolName": "ARM build runners",
+        }))
+        result = self.shell("runner-ephemeral", '''
+DIR="$TEST_ROOT"; RUNNER_URL=https://github.com/acme
+read_saved_identity
+rm "$DIR/.runner"
+read_saved_identity
+printf '%s' "$RUNNER_GROUP"
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "ARM build runners")
+
+    def test_ephemeral_cycles_register_in_saved_group_after_registration_disappears(self):
+        group = 'Build "ARM" runners'
+        (self.root / ".runner").write_text(json.dumps({
+            "agentName": "host-runner-1", "poolName": group,
+        }))
+        (self.root / "bin").mkdir()
+        for name, code in (
+            ("config.sh", "printf '%s\\0' \"$@\" >> config-args\ntouch .runner"),
+            ("bin/runsvc.sh", "rm .runner"),
+        ):
+            path = self.root / name
+            path.write_text("#!/bin/bash\n" + code + "\n")
+            path.chmod(0o755)
+        result = self.shell("runner-ephemeral", '''
+DIR="$TEST_ROOT"; RUNNER_URL=https://github.com/acme
+fetch_registration_token() { FETCHED_TOKEN=secret; }
+if ! run_cycle || ! run_cycle; then exit 99; fi
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        arguments = (self.root / "config-args").read_bytes().decode().split("\0")
+        groups = [arguments[index + 1] for index, value in enumerate(arguments) if value == "--runnergroup"]
+        self.assertEqual(groups, [group, group])
+        self.assertFalse((self.root / ".runner").exists())
+
+    def test_ephemeral_registration_without_saved_group_omits_group_override(self):
+        (self.root / ".runner").write_text(json.dumps({"agentName": "host-runner-1"}))
+        (self.root / "bin").mkdir()
+        for name, code in (
+            ("config.sh", "printf '%s\\0' \"$@\" > config-args\ntouch .runner"),
+            ("bin/runsvc.sh", "exit 0"),
+        ):
+            path = self.root / name
+            path.write_text("#!/bin/bash\n" + code + "\n")
+            path.chmod(0o755)
+        result = self.shell("runner-ephemeral", '''
+DIR="$TEST_ROOT"; RUNNER_URL=https://github.com/acme
+fetch_registration_token() { FETCHED_TOKEN=secret; }
+if ! run_cycle; then exit 99; fi
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        arguments = (self.root / "config-args").read_bytes().decode().split("\0")
+        self.assertNotIn("--runnergroup", arguments)
+
     def test_ephemeral_wipe_keeps_operator_configuration(self):
         for name in (".env", ".path", ".runner", ".credentials", ".credentials_rsaparams"):
             (self.root / name).write_text("data")
