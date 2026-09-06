@@ -4,11 +4,14 @@
 # self-hosted runners that runner-setup provisioned on macOS.
 #
 # Usage:
-#   runner-upgrade check [--runners N | --all]
-#   runner-upgrade run   [--runners N | --all] [--yes]
+#   runner-upgrade check [--runner N | --runners N | --all]
+#   runner-upgrade shutdown [--runner N | --all] [--yes]
+#   runner-upgrade run [--runner N | --runners N | --all] [--yes]
+#   runner-upgrade start [--runner N | --all] [--yes]
+#   runner-upgrade repair --runner N [--labels LABELS] [--yes]
 #   runner-upgrade rollback (--runner N | --all) [--yes]
 #
-# Designed to be driven by a launchd StartInterval/StartCalendarInterval job
+# Version checks can be driven by a launchd timer
 # (see docs/auto-upgrades.md for a sample plist):
 #
 #   check    Resolve the latest actions/runner release (same releases API and
@@ -17,15 +20,18 @@
 #            reporting which runners need an upgrade. Exits 3 when upgrades
 #            are pending so a wrapper job can decide to invoke `run`.
 #
-#   run      CANARY FIRST: upgrade ONLY runner-1 — quiesce it (bootout the
-#            system daemon), download + SHA-verify the new tarball (same
-#            logic as runner-setup), move the old install aside to
-#            runner-1.prev, swap in the new binaries preserving
+#   run      Verify the archive before shutting down the selection. Upgrade
+#            the first outdated runner as canary, moving its old install to
+#            runner-N.prev and swapping in new binaries while preserving
 #            .runner/.credentials/_work (so the GitHub registration and
 #            labels survive untouched), re-bootstrap, and verify health by
-#            waiting for the newest _diag log to print 'Listening for Jobs'.
-#            If the canary fails, runner-1.prev is restored automatically.
-#            Only after canary success are the remaining runners rolled.
+#            waiting for fresh logs to print 'Listening for Jobs'. If the canary
+#            fails, its previous binaries are restored; other selected runners
+#            stay stopped. Current-version runners are also restarted.
+#
+#   shutdown / start preserve registration and coordinate maintenance with the
+#            watchdog and autoscaler. repair re-registers one runner whose
+#            server registration was deleted, using a fresh token.
 #
 #   rollback Restore runner-N.prev over runner-N (the pre-upgrade install)
 #            and re-bootstrap its daemon. Use after a bad `run`.
@@ -45,7 +51,11 @@ RUNNER_ROOT="/opt/github-runners"
 LAUNCH_DAEMON_DIR="/Library/LaunchDaemons"
 LATEST_API="https://api.github.com/repos/actions/runner/releases/latest"
 LOG_FILE="${RUNNER_ROOT}/upgrade.log"
-HEALTH_TIMEOUT=120        # seconds to wait for 'Listening for Jobs'
+HEALTH_TIMEOUT=300        # allow GitHub's four-minute session-conflict retry window
+HEALTH_FAILURE=""
+REPAIR_LABELS=""
+REPAIR_LABELS_SET=0
+REPAIR_RUNNER_GROUP=""
 
 COMMAND=""
 RUNNERS=""                # --runners N (runners 1..N)
@@ -84,8 +94,11 @@ usage() {
 ${PROG_NAME} — upgrade actions/runner versions on macOS self-hosted runners
 
 USAGE:
-  ${PROG_NAME} check [--runners N | --all]
-  ${PROG_NAME} run   [--runners N | --all] [--yes]
+  ${PROG_NAME} check [--runner N | --runners N | --all]
+  ${PROG_NAME} shutdown [--runner N | --all] [--yes]
+  ${PROG_NAME} run [--runner N | --runners N | --all] [--yes]
+  ${PROG_NAME} start [--runner N | --all] [--yes]
+  ${PROG_NAME} repair --runner N [--labels LABELS] [--runnergroup GROUP] [--yes]
   ${PROG_NAME} rollback (--runner N | --all) [--yes]
 
 COMMANDS:
@@ -94,21 +107,33 @@ COMMANDS:
                0  all selected runners are current
                3  one or more runners need an upgrade
                1  an error occurred
-  run        Canary-first upgrade: runner-1 is upgraded and health-checked
-             FIRST; only on success are the remaining runners rolled. Each
-             runner's previous install is kept as runner-N.prev for rollback.
+  shutdown   Stop selected runners without deleting registration or workspace.
+             Leave maintenance markers so the watchdog/autoscaler hold.
+  run        Download and verify first, shut down selected runners, then upgrade
+             and start the canary before the rest. Already-current runners are
+             also restarted. A failed canary leaves remaining runners stopped.
+  start      Start stopped runners and verify readiness; clear their maintenance
+             markers only after success. Running services are left in place.
+  repair     Re-register one runner using its saved identity and a fresh token.
+             Back up local registration first; preserve workspace and toolchain.
   rollback   Restore runner-N.prev over runner-N and re-bootstrap its daemon.
 
 OPTIONS:
-  --runners N   Operate on runners 1..N (check/run).
+  --runners N   Operate on runners 1..N (check/run/shutdown/start).
   --all         Operate on every runner under ${RUNNER_ROOT} (default).
-  --runner N    Operate only on runner-N (rollback).
+  --runner N    Operate only on runner-N.
+  --health-timeout SECONDS  Startup wait (default: 300).
+  --labels CSV  Custom labels for repair (not stored in local runner metadata).
+  --runnergroup NAME  Override the saved runner group for repair.
   -y, --yes     Do not prompt for confirmation (required for launchd jobs).
   -h, --help    Show this help and exit.
 
 EXAMPLES:
   ${PROG_NAME} check --all
+  ${PROG_NAME} shutdown --all --yes
   ${PROG_NAME} run --all --yes
+  ${PROG_NAME} start --all --yes
+  ${PROG_NAME} repair --runner 1
   ${PROG_NAME} rollback --runner 2
 
   launchd runs the job unattended; a typical StartInterval job executes:
@@ -116,6 +141,11 @@ EXAMPLES:
   See docs/auto-upgrades.md for a ready-to-use plist.
 
 SECURITY NOTE:
+  Pause job dispatch before maintenance. Local worker checks are best-effort;
+  they cannot atomically prevent GitHub assigning a new job. Shutdown does not
+  deregister runners. For unattended repair, supply RUNNER_TOKEN and --labels;
+  interactive repair prompts for missing registration inputs. Never paste a
+  token into logs or chat. Upstream configuration accepts it as a process arg.
   This script uses sudo for /opt and ${LAUNCH_DAEMON_DIR}; the runner
   processes themselves run as the invoking (non-root) user, because the
   GitHub Actions runner refuses to run as root. Upgrade events are appended
@@ -151,12 +181,12 @@ log_event() {
 # ----------------------------------------------------------------------------
 parse_args() {
   if [[ $# -lt 1 ]]; then
-    err "Missing command: check, run, or rollback."
+    err "Missing command: check, shutdown, run, start, repair, or rollback."
     usage
     exit 2
   fi
   case "$1" in
-    check|run|rollback) COMMAND="$1"; shift ;;
+    check|shutdown|run|start|repair|rollback) COMMAND="$1"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) err "Unknown command: $1"; usage; exit 2 ;;
   esac
@@ -172,6 +202,18 @@ parse_args() {
         [[ $# -ge 2 ]] || { err "--runner requires a value"; usage; exit 2; }
         TARGET_RUNNER="$2"; shift 2 ;;
       --runner=*)   TARGET_RUNNER="${1#*=}"; shift ;;
+      --health-timeout)
+        [[ $# -ge 2 ]] || { err "--health-timeout requires seconds"; exit 2; }
+        HEALTH_TIMEOUT="$2"; shift 2 ;;
+      --health-timeout=*) HEALTH_TIMEOUT="${1#*=}"; shift ;;
+      --labels)
+        [[ $# -ge 2 ]] || { err "--labels requires a value"; exit 2; }
+        REPAIR_LABELS="$2"; REPAIR_LABELS_SET=1; shift 2 ;;
+      --labels=*) REPAIR_LABELS="${1#*=}"; REPAIR_LABELS_SET=1; shift ;;
+      --runnergroup)
+        [[ $# -ge 2 ]] || { err "--runnergroup requires a value"; exit 2; }
+        REPAIR_RUNNER_GROUP="$2"; shift 2 ;;
+      --runnergroup=*) REPAIR_RUNNER_GROUP="${1#*=}"; shift ;;
       -y|--yes)     ASSUME_YES=1; shift ;;
       -h|--help)    usage; exit 0 ;;
       *) err "Unknown argument: $1"; usage; exit 2 ;;
@@ -182,19 +224,29 @@ parse_args() {
     err "--runners must be a positive integer (got: '${RUNNERS}')"
     exit 2
   fi
-  if [[ -n "${TARGET_RUNNER}" ]] && ! [[ "${TARGET_RUNNER}" =~ ^[0-9]+$ ]]; then
+  if [[ -n "${TARGET_RUNNER}" ]] && { ! [[ "${TARGET_RUNNER}" =~ ^[1-9][0-9]*$ ]]; }; then
     err "--runner must be a positive integer (got: '${TARGET_RUNNER}')"
     exit 2
   fi
 
+  if ! [[ "${HEALTH_TIMEOUT}" =~ ^[1-9][0-9]*$ ]]; then
+    err "--health-timeout must be a positive integer."; exit 2
+  fi
+  if [[ -n "${TARGET_RUNNER}" && ( -n "${RUNNERS}" || "${SELECT_ALL}" -eq 1 ) ]] \
+      || [[ -n "${RUNNERS}" && "${SELECT_ALL}" -eq 1 ]]; then
+    err "Choose exactly one of --runner, --runners, or --all."; exit 2
+  fi
+  if [[ "${COMMAND}" != repair && ( "${REPAIR_LABELS_SET}" -eq 1 || -n "${REPAIR_RUNNER_GROUP}" ) ]]; then
+    err "--labels and --runnergroup are only valid with repair."; exit 2
+  fi
+
   case "${COMMAND}" in
-    check|run)
-      if [[ -n "${TARGET_RUNNER}" ]]; then
-        err "--runner is only valid with rollback; use --runners N or --all."
-        exit 2
-      fi
+    check|run|shutdown|start)
       # Default selection is --all.
-      [[ -n "${RUNNERS}" ]] || SELECT_ALL=1
+      [[ -n "${RUNNERS}" || -n "${TARGET_RUNNER}" ]] || SELECT_ALL=1
+      ;;
+    repair)
+      [[ -n "${TARGET_RUNNER}" ]] || { err "repair requires --runner N."; exit 2; }
       ;;
     rollback)
       if [[ -n "${RUNNERS}" ]]; then
@@ -256,7 +308,7 @@ detect_arch() {
 require_cmds() {
   local missing=()
   local c
-  for c in curl tar uname id sudo launchctl dscl shasum tr grep sed awk ls date sleep mkdir mktemp chmod touch mv; do
+  for c in curl tar uname id sudo launchctl dscl shasum tr grep sed awk ls date sleep mkdir mktemp chmod touch mv ps tee jq; do
     command -v "${c}" >/dev/null 2>&1 || missing+=("${c}")
   done
   if [[ ${#missing[@]} -gt 0 ]]; then
@@ -390,7 +442,11 @@ discover_runners() {
   local d name i
   local -a found=()
 
-  if [[ -n "${RUNNERS}" ]]; then
+  if [[ -n "${TARGET_RUNNER}" ]]; then
+    [[ -d "${RUNNER_ROOT}/runner-${TARGET_RUNNER}" ]] \
+      || { err "Runner directory not found: ${RUNNER_ROOT}/runner-${TARGET_RUNNER}"; return 1; }
+    found+=("runner-${TARGET_RUNNER}")
+  elif [[ -n "${RUNNERS}" ]]; then
     for ((i = 1; i <= RUNNERS; i++)); do
       [[ -d "${RUNNER_ROOT}/runner-${i}" ]] && found+=("runner-${i}")
     done
@@ -419,8 +475,141 @@ discover_runners() {
 }
 
 record_status() {
+  local i
+  for i in "${!STATUS_NAME[@]}"; do
+    if [[ "${STATUS_NAME[$i]}" == "$1" ]]; then
+      STATUS_RESULT[$i]="$2"
+      return 0
+    fi
+  done
   STATUS_NAME+=("$1")
   STATUS_RESULT+=("$2")
+}
+
+prepare_event_log() {
+  if [[ ! -f "${LOG_FILE}" ]]; then
+    sudo mkdir -p "${RUNNER_ROOT}" && sudo touch "${LOG_FILE}" \
+      && sudo chown "${REAL_USER}:${REAL_GROUP}" "${LOG_FILE}"
+  fi
+}
+
+# A local worker check reduces accidental interruption; it cannot atomically
+# drain GitHub's queue. Operators must pause job dispatch before maintenance.
+# Return 0 = busy, 1 = idle, 2 = inspection failed/ambiguous executable.
+active_workers() {
+  local name="$1" processes executable ambiguous=0
+  if ! processes="$(ps -axww -o comm=)"; then return 2; fi
+  while IFS= read -r executable; do
+    # ps can pad its first column. Do not inspect arguments (which may contain
+    # job secrets), and do not confuse runner-1 with runner-10 or .prev.
+    executable="${executable#"${executable%%[![:space:]]*}"}"
+    [[ "${executable}" != "${RUNNER_ROOT}/${name}/bin/Runner.Worker" ]] || return 0
+    case "${executable}" in
+      Runner.Worker|./*Runner.Worker|bin/Runner.Worker) ambiguous=1 ;;
+    esac
+  done <<< "${processes}"
+  [[ "${ambiguous}" -eq 0 ]] || return 2
+  return 1
+}
+
+require_idle() {
+  local name="$1" rc
+  if active_workers "${name}"; then rc=0; else rc=$?; fi
+  case "${rc}" in
+    1) return 0 ;;
+    0) err "${name} has an active job. Pause dispatch and let it finish before maintenance." ;;
+    *) err "Could not establish local worker state for ${name}; refusing to stop it." ;;
+  esac
+  record_status "${name}" "FAILED (worker active or unknown)"
+  return 1
+}
+
+mark_maintenance() {
+  local name="$1" root="${RUNNER_ROOT}/.maintenance"
+  if ! { as_user mkdir -p "${root}" && as_user chmod 700 "${root}" \
+      && as_user touch "${root}/${name}"; }; then
+    err "Could not record maintenance for ${name}; refusing to stop it."; return 1
+  fi
+}
+
+clear_maintenance() {
+  if ! as_user rm -f "${RUNNER_ROOT}/.maintenance/$1"; then
+    err "Runner started, but its maintenance marker could not be cleared."; return 1
+  fi
+}
+
+service_is_running() {
+  local state
+  state="$(sudo launchctl print "system/com.github.$1" 2>/dev/null)" || return 1
+  # Only inspect the top-level service state, not nested resource-coalition state.
+  [[ "$(printf '%s\n' "${state}" | awk '$1 == "state" && $2 == "=" {print $3; exit}')" == running ]]
+}
+
+shutdown_runner() {
+  local name="$1"
+  require_idle "${name}" || return 1
+  mark_maintenance "${name}" || return 1
+  step "Shutting down ${name} (registration and workspace retained)"
+  if ! bootout_system "com.github.${name}"; then
+    record_status "${name}" "FAILED (shutdown unconfirmed)"; return 1
+  fi
+  record_status "${name}" "stopped (maintenance)"
+  log_event "${PROG_NAME} shutdown ${name} OK"
+}
+
+start_runner() {
+  local name="$1" dir="${RUNNER_ROOT}/$1"
+  if service_is_running "${name}"; then
+    # An unheld live service needs no restart. A service that was restarted
+    # externally while held needs a fresh idle restart: old logs cannot prove
+    # readiness for its current process.
+    if [[ ! -f "${RUNNER_ROOT}/.maintenance/${name}" ]]; then
+      record_status "${name}" "running (left in place)"; return 0
+    fi
+  fi
+  require_idle "${name}" || return 1
+  mark_maintenance "${name}" || return 1
+  if ! bootstrap_daemon "${name}"; then
+    record_status "${name}" "FAILED (start bootstrap)"; return 1
+  fi
+  if ! wait_for_listening "${dir}"; then
+    report_startup_failure "${name}"
+    record_status "${name}" "FAILED (${HEALTH_FAILURE:-startup unconfirmed})"
+    return 1
+  fi
+  clear_maintenance "${name}" || return 1
+  record_status "${name}" "started (listening for jobs)"
+  log_event "${PROG_NAME} start ${name} OK"
+}
+
+cmd_shutdown() {
+  discover_runners || return 1
+  [[ ${#RUNNER_NAMES[@]} -gt 0 ]] || { log "No runners found."; return 0; }
+  confirm "shut down selected runners for maintenance (pause job dispatch first)"
+  ensure_sudo
+  prepare_event_log || return 1
+  local name rc=0
+  # Preflight the complete selection before stopping any runner.
+  for name in "${RUNNER_NAMES[@]}"; do require_idle "${name}" || return 1; done
+  for name in "${RUNNER_NAMES[@]}"; do
+    if ! shutdown_runner "${name}"; then rc=1; break; fi
+  done
+  print_summary
+  return "${rc}"
+}
+
+cmd_start() {
+  discover_runners || return 1
+  [[ ${#RUNNER_NAMES[@]} -gt 0 ]] || { log "No runners found."; return 0; }
+  confirm "start selected runners"
+  ensure_sudo
+  prepare_event_log || return 1
+  local name rc=0
+  for name in "${RUNNER_NAMES[@]}"; do
+    if ! start_runner "${name}"; then rc=1; fi
+  done
+  print_summary
+  return "${rc}"
 }
 
 # Boot a system service out and WAIT for it to actually disappear (bootout is
@@ -460,15 +649,43 @@ installed_version() {
 wait_for_listening() {
   local dir="$1"
   local waited=0 f
+  HEALTH_FAILURE=""
   while [[ "${waited}" -lt "${HEALTH_TIMEOUT}" ]]; do
-    f="$(ls -t "${dir}"/_diag/Runner_*.log 2>/dev/null | head -n1 || true)"
-    if [[ -n "${f}" ]] && grep -q 'Listening for Jobs' "${f}" 2>/dev/null; then
-      return 0
+    if registration_deleted "${dir}"; then
+      HEALTH_FAILURE=registration_deleted
+      return 1
     fi
+    # A concurrent --version invocation also writes a Runner_ log. It must not
+    # hide readiness in another log from this fresh launch generation.
+    for f in "${dir}"/_diag/Runner_*.log; do
+      [[ -f "${f}" ]] || continue
+      if grep -q 'Listening for Jobs' "${f}" 2>/dev/null; then return 0; fi
+    done
     sleep 3
     waited=$((waited + 3))
   done
+  HEALTH_FAILURE=timeout
   return 1
+}
+
+registration_deleted() {
+  local dir="$1" f
+  for f in "${dir}"/_diag/Runner_*.log "${dir}/_diag/runner-stdout.log" "${dir}/_diag/runner-stderr.log"; do
+    [[ -f "${f}" ]] || continue
+    if grep -qi 'runner registration has been deleted from the server' "${f}" 2>/dev/null; then return 0; fi
+  done
+  return 1
+}
+
+report_startup_failure() {
+  local name="$1"
+  if [[ "${HEALTH_FAILURE}" == registration_deleted ]]; then
+    err "${name}: GitHub deleted this runner's registration; new binaries cannot restore it."
+    err "Re-register with a fresh token: ${PROG_NAME} repair --runner ${name#runner-}"
+  else
+    err "${name}: no confirmed readiness within ${HEALTH_TIMEOUT}s."
+    err "Inspect ${RUNNER_ROOT}/${name}/_diag/runner-stdout.log and runner-stderr.log."
+  fi
 }
 
 # Keep startup evidence outside the installation before it is replaced or its
@@ -556,6 +773,8 @@ rollback_runner() {
   log_event "${PROG_NAME} rollback ${name} start"
 
   # Quiesce before touching the install dir.
+  require_idle "${name}" || return 1
+  mark_maintenance "${name}" || return 1
   if ! bootout_system "com.github.${name}"; then
     record_status "${name}" "FAILED (rollback: service still loaded)"
     return 1
@@ -606,10 +825,12 @@ rollback_runner() {
   fi
 
   if wait_for_listening "${dir}"; then
+    clear_maintenance "${name}" || return 1
     step "${name} rolled back and listening for jobs."
     record_status "${name}" "rolled back (healthy)"
     log_event "${PROG_NAME} rollback ${name} OK"
   else
+    report_startup_failure "${name}"
     warn "${name} rolled back but no 'Listening for Jobs' within ${HEALTH_TIMEOUT}s."
     record_status "${name}" "ROLLED BACK (unconfirmed)"
     log_event "${PROG_NAME} rollback ${name} unconfirmed"
@@ -645,6 +866,8 @@ upgrade_runner() {
   fi
 
   # --- Quiesce: boot the daemon out so no job is mid-flight on old code. ----
+  require_idle "${name}" || return 1
+  mark_maintenance "${name}" || return 1
   step "Booting out system/${label}"
   if ! bootout_system "${label}"; then
     record_status "${name}" "FAILED (service still loaded)"
@@ -708,12 +931,14 @@ upgrade_runner() {
 
   step "Waiting for '${name}' to listen for jobs (up to ${HEALTH_TIMEOUT}s)"
   if ! wait_for_listening "${dir}"; then
+    report_startup_failure "${name}"
     err "${name} did not report 'Listening for Jobs' within ${HEALTH_TIMEOUT}s; rolling back."
     log_event "${PROG_NAME} upgrade ${name} FAILED (health check)"
     rollback_runner "${name}"
     return 1
   fi
 
+  clear_maintenance "${name}" || return 1
   step "${name} upgraded to ${RUNNER_VERSION} and is listening for jobs."
   record_status "${name}" "upgraded ${old_version:-unknown} -> ${RUNNER_VERSION}"
   log_event "${PROG_NAME} upgrade ${name} ${old_version:-unknown} -> ${RUNNER_VERSION} OK"
@@ -757,6 +982,179 @@ print_summary() {
   done
   printf '\n'
   log "Event log: ${LOG_FILE}"
+}
+
+# ----------------------------------------------------------------------------
+# repair — replace a deleted server registration without changing binaries.
+# ----------------------------------------------------------------------------
+# Read only operator settings, never credentials. Keep validation ahead of any
+# service changes, and reject control characters that could corrupt arguments.
+repair_settings() {
+  jq -cse '
+    def text: type == "string" and length > 0 and (test("[\\x00-\\x1f\\x7f]") | not);
+    select(length == 1) | .[0] | select(type == "object")
+    | select(.gitHubUrl | text and test("^https://[^[:space:]/]+/[^[:space:]]+$"))
+    | select(.agentName | text)
+    | select((.workFolder // "_work") | text)
+    | select(.poolName == null or (.poolName | type == "string" and (test("[\\x00-\\x1f\\x7f]") | not)))
+    | select(.ephemeral == null or (.ephemeral | type == "boolean"))
+    | select(.disableUpdate == null or (.disableUpdate | type == "boolean"))
+    | {gitHubUrl, agentName, workFolder: (.workFolder // "_work"),
+       poolName: (.poolName // ""), ephemeral: (.ephemeral // false),
+       disableUpdate: (.disableUpdate // false)}
+  ' "$1"
+}
+
+# Deleted server identities cannot be repaired by changing runner binaries.
+# Re-register exactly one stopped runner, preserving its work and service setup.
+repair_preserve_failed_registration() {
+  local dir="$1" backup="$2" f
+  as_user mkdir -p "${backup}/failed-registration" || return 1
+  for f in .runner .runner_migrated .credentials .credentials_migrated .credentials_rsaparams; do
+    if [[ -e "${dir}/${f}" || -L "${dir}/${f}" ]]; then
+      as_user mv "${dir}/${f}" "${backup}/failed-registration/${f}" || return 1
+    fi
+  done
+}
+
+cmd_repair() {
+  # Upstream accepts a supplied registration token as a configure argument.
+  # Never allow this helper's tracing to disclose it.
+  set +x
+  local name="runner-${TARGET_RUNNER}" dir="${RUNNER_ROOT}/runner-${TARGET_RUNNER}"
+  local backup_root="${RUNNER_ROOT}/.registration-backups" source settings latest=""
+  local backup pointer pointer_tmp backup_name f url runner_name work group ephemeral disable_update config_rc=0
+  local -a config_args=()
+  [[ -n "${TARGET_RUNNER}" ]] || { err "repair requires --runner N."; return 2; }
+  if [[ ! -t 0 && ( -z "${RUNNER_TOKEN:-}" || "${REPAIR_LABELS_SET}" -ne 1 ) ]]; then
+    err "Unattended repair requires RUNNER_TOKEN and explicit --labels (an empty value is allowed)."
+    return 2
+  fi
+  if [[ ! -x "${dir}/bin/Runner.Listener" || ! -f "${LAUNCH_DAEMON_DIR}/com.github.${name}.plist" ]]; then
+    err "Missing listener or LaunchDaemon for ${name}; restore the installation before repairing registration."
+    return 1
+  fi
+
+  pointer="${backup_root}/${name}.latest"
+  if [[ -L "${backup_root}" || -L "${pointer}" ]]; then
+    err "Registration backup paths must not be symlinks; no service or registration was changed."
+    return 1
+  fi
+  source="${dir}/.runner"
+  if [[ ! -f "${source}" && -f "${dir}/.runner_migrated" ]]; then
+    source="${dir}/.runner_migrated"
+  elif [[ ! -f "${source}" ]]; then
+    # A rejected token may leave the runner unconfigured. Reuse the settings
+    # saved by its last repair, without restoring obsolete OAuth credentials.
+    if [[ -f "${pointer}" ]]; then
+      backup_name="$(cat "${pointer}")" || return 1
+      if [[ "${backup_name}" != "${name}-"* || "${backup_name}" == */* || "${backup_name}" == *..* ]]; then
+        err "Invalid repair backup pointer ${pointer}; no service or registration was changed."
+        return 1
+      fi
+      latest="${backup_root}/${backup_name}"
+    fi
+    source="${latest}/settings.json"
+    if [[ -z "${latest}" || -L "${latest}" || -L "${source}" || ! -f "${source}" ]]; then
+      err "No registration settings for ${name}. Restore .runner metadata from its private backup before retrying repair."
+      return 1
+    fi
+    step "Recovering registration settings from ${source}"
+  fi
+  if ! settings="$(repair_settings "${source}" 2>/dev/null)"; then
+    err "Invalid registration settings in ${source}; no service or registration was changed."
+    return 1
+  fi
+  url="$(printf '%s' "${settings}" | jq -r .gitHubUrl)"
+  runner_name="$(printf '%s' "${settings}" | jq -r .agentName)"
+  work="$(printf '%s' "${settings}" | jq -r .workFolder)"
+  group="$(printf '%s' "${settings}" | jq -r .poolName)"
+  ephemeral="$(printf '%s' "${settings}" | jq -r .ephemeral)"
+  disable_update="$(printf '%s' "${settings}" | jq -r .disableUpdate)"
+  [[ -z "${REPAIR_RUNNER_GROUP}" ]] || group="${REPAIR_RUNNER_GROUP}"
+  config_args=(configure --url "${url}" --name "${runner_name}" --work "${work}")
+  [[ -z "${group}" ]] || config_args+=(--runnergroup "${group}")
+  [[ "${ephemeral}" != true ]] || config_args+=(--ephemeral)
+  [[ "${disable_update}" != true ]] || config_args+=(--disableupdate)
+  [[ "${REPAIR_LABELS_SET}" -ne 1 ]] || config_args+=(--labels "${REPAIR_LABELS}")
+  [[ -z "${RUNNER_TOKEN:-}" ]] || config_args+=(--token "${RUNNER_TOKEN}")
+  [[ -t 0 ]] || config_args+=(--unattended)
+
+  RUNNER_NAMES=("${name}")
+  log "Repairing '${runner_name}' at ${url}; binary rollback cannot restore a deleted GitHub registration."
+  confirm "re-register ${name} with GitHub"
+  ensure_sudo
+  prepare_event_log || return 1
+  shutdown_runner "${name}" || return 1
+
+  if ! as_user mkdir -p "${backup_root}" || ! as_user chmod 700 "${backup_root}"; then
+    err "Could not prepare private registration backups; ${name} remains stopped with its original files."
+    return 1
+  fi
+  backup="$(as_user mktemp -d "${backup_root}/${name}-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")" || return 1
+  if ! printf '%s\n' "${settings}" | as_user tee "${backup}/settings.json" >/dev/null; then
+    err "Could not back up registration settings; ${name} remains stopped."
+    return 1
+  fi
+  for f in .runner .runner_migrated .credentials .credentials_migrated .credentials_rsaparams .env .path .service; do
+    if [[ -f "${dir}/${f}" ]] && ! as_user cp -p "${dir}/${f}" "${backup}/${f}"; then
+      err "Could not back up ${f}; registration unchanged. Partial backup: ${backup}"
+      return 1
+    fi
+  done
+  pointer_tmp="$(as_user mktemp "${backup_root}/.repair-pointer-XXXXXX")" || return 1
+  if ! printf '%s\n' "${backup##*/}" | as_user tee "${pointer_tmp}" >/dev/null \
+      || ! as_user mv "${pointer_tmp}" "${pointer}"; then
+    err "Could not record the repair backup; registration unchanged. Backup: ${backup}"
+    return 1
+  fi
+  step "Preserved registration backup: ${backup}"
+  log_event "${PROG_NAME} repair ${name} start backup=${backup}"
+  archive_diagnostics "${name}" "${dir}" || return 1
+
+  # The native local removal also clears migrated settings and RSA keys. It
+  # makes no server deletion request and does not touch _work, .env, or .path.
+  if ! (cd "${dir}" && as_user ./bin/Runner.Listener remove --local); then
+    err "Could not clear obsolete local registration. ${name} remains stopped; backup: ${backup}"
+    return 1
+  fi
+  if [[ -e "${dir}/.runner" || -e "${dir}/.runner_migrated" ]]; then
+    err "Local registration was not cleared. ${name} remains stopped; backup: ${backup}"
+    return 1
+  fi
+  step "Registering '${runner_name}'; enter a fresh registration token and the original custom labels if prompted."
+  # Avoid config.sh: it invokes env.sh, which overwrites the saved .path.
+  # No --replace: a same-name runner on another machine must stay registered.
+  (cd "${dir}" && as_user ./bin/Runner.Listener "${config_args[@]}") || config_rc=$?
+  config_args=()
+  if [[ "${config_rc}" -ne 0 ]] \
+      || [[ ! -s "${dir}/.credentials" || ! -s "${dir}/.credentials_rsaparams" ]] \
+      || ! jq -e --arg url "${url}" --arg name "${runner_name}" --arg work "${work}" \
+        '(.agentId | type == "number" and . > 0) and .gitHubUrl == $url and .agentName == $name and .workFolder == $work' \
+        "${dir}/.runner" >/dev/null 2>&1; then
+    archive_diagnostics "${name}" "${dir}" || true
+    if ! repair_preserve_failed_registration "${dir}" "${backup}"; then
+      err "Could not archive all failed registration files. Inspect ${dir} and ${backup}/failed-registration before retrying."
+    fi
+    err "Registration failed; ${name} remains stopped. Its workspace and service settings are preserved."
+    err "Backup: ${backup}. Re-run repair with a fresh token for ${url}; saved settings are recovered if .runner is absent."
+    err "If GitHub reports a duplicate name, resolve that collision before retrying; no other registration was replaced."
+    record_status "${name}" "FAILED (registration; stopped)"
+    log_event "${PROG_NAME} repair ${name} FAILED registration backup=${backup}"
+    print_summary
+    return 1
+  fi
+  if ! start_runner "${name}"; then
+    err "${name} was registered, but startup health is unconfirmed. Inspect its diagnostics before retrying; backup: ${backup}"
+    record_status "${name}" "REGISTERED (startup unconfirmed)"
+    log_event "${PROG_NAME} repair ${name} registered startup=unconfirmed backup=${backup}"
+    print_summary
+    return 1
+  fi
+  record_status "${name}" "REPAIRED (registered and listening)"
+  log_event "${PROG_NAME} repair ${name} OK backup=${backup}"
+  print_summary
+  return 0
 }
 
 # ----------------------------------------------------------------------------
@@ -805,78 +1203,90 @@ cmd_check() {
 # ----------------------------------------------------------------------------
 cmd_run() {
   detect_arch
-  discover_runners
+  discover_runners || return 1
   if [[ ${#RUNNER_NAMES[@]} -eq 0 ]]; then
     log "No runners found under ${RUNNER_ROOT}; nothing to upgrade."
-    exit 0
+    return 0
   fi
 
+  local name v i rc=0
+  local -a pending=() current=()
+  # Reject the observed terminal registration failure before any download or
+  # fleet shutdown. Repair needs a new token, not a binary rollback.
+  for name in "${RUNNER_NAMES[@]}"; do
+    if registration_deleted "${RUNNER_ROOT}/${name}"; then
+      HEALTH_FAILURE=registration_deleted
+      report_startup_failure "${name}"
+      record_status "${name}" "NEEDS REGISTRATION REPAIR"
+      print_summary
+      return 1
+    fi
+    require_idle "${name}" || return 1
+  done
   resolve_latest_release
-
-  # Skip runners already on the latest version; upgrade only the rest.
-  local -a pending=()
-  local name v
   for name in "${RUNNER_NAMES[@]}"; do
     v="$(installed_version "${RUNNER_ROOT}/${name}")"
     if [[ "${v}" == "${RUNNER_VERSION}" ]]; then
-      step "${name} already on ${RUNNER_VERSION} — skipping."
-      record_status "${name}" "skipped (already ${RUNNER_VERSION})"
+      current+=("${name}")
     else
+      if [[ -d "${RUNNER_ROOT}/${name}.prev" ]]; then
+        err "${name}.prev already exists; resolve its previous upgrade before maintenance."
+        return 1
+      fi
       pending+=("${name}")
     fi
   done
 
-  if [[ ${#pending[@]} -eq 0 ]]; then
-    log "All runners are current (${RUNNER_VERSION}); nothing to do."
-    print_summary
-    exit 0
-  fi
-
-  RUNNER_NAMES=("${pending[@]}")
-  confirm "upgrade to actions/runner ${RUNNER_VERSION} (canary: ${RUNNER_NAMES[0]})"
-
+  confirm "shut down selected runners, upgrade to ${RUNNER_VERSION}, and restart (pause dispatch first)"
   ensure_sudo
-  # Stable event log: create root-free, owned by the runner user, on first use.
-  if [[ ! -f "${LOG_FILE}" ]]; then
-    sudo mkdir -p "${RUNNER_ROOT}"
-    sudo touch "${LOG_FILE}"
-    sudo chown "${REAL_USER}:${REAL_GROUP}" "${LOG_FILE}"
-  fi
+  prepare_event_log || return 1
+  # The fleet remains available if fetching or validating the archive fails.
+  if [[ ${#pending[@]} -gt 0 ]]; then download_tarball || return 1; fi
+  for name in "${RUNNER_NAMES[@]}"; do require_idle "${name}" || return 1; done
   log_event "${PROG_NAME} run start latest=${RUNNER_VERSION} targets=${RUNNER_NAMES[*]}"
-
-  download_tarball
-
-  # --- CANARY: upgrade ONLY the first runner and health-check it. -----------
-  local canary="${RUNNER_NAMES[0]}"
-  log "Canary: upgrading ${canary} first"
-  if ! upgrade_runner "${canary}"; then
-    err "Canary ${canary} FAILED. See recovery status above; remaining runners untouched."
-    log_event "${PROG_NAME} run aborted canary=${canary} FAILED"
-    print_summary
-    err "Inspect ${RUNNER_ROOT}/.upgrade-diagnostics/ and ${RUNNER_ROOT}/${canary}/_diag/ before retrying."
-    exit 1
-  fi
-  log "Canary ${canary} healthy on ${RUNNER_VERSION}; rolling remaining runners."
-
-  # --- Roll the rest. -------------------------------------------------------
-  local overall_rc=0 i
-  for ((i = 1; i < ${#RUNNER_NAMES[@]}; i++)); do
-    if ! upgrade_runner "${RUNNER_NAMES[$i]}"; then
-      overall_rc=1
-      warn "${RUNNER_NAMES[$i]} failed; check its recovery status above. Continuing with remaining runners."
+  for name in "${RUNNER_NAMES[@]}"; do
+    if ! shutdown_runner "${name}"; then
+      err "Shutdown failed; no runner binaries were changed. Use start to recover stopped runners."
+      print_summary
+      return 1
     fi
   done
 
-  log_event "${PROG_NAME} run done latest=${RUNNER_VERSION} rc=${overall_rc}"
-  print_summary
-  if [[ "${overall_rc}" -ne 0 ]]; then
-    err "One or more runners failed to upgrade. See each runner’s recovery status above."
+  # Upgrade the first outdated runner as canary; current-version runners are
+  # restarted too, so an explicit shutdown never strands an up-to-date runner.
+  local canary=""
+  if [[ ${#pending[@]} -gt 0 ]]; then canary="${pending[0]}"; else canary="${current[0]}"; fi
+  log "Canary: starting ${canary} on ${RUNNER_VERSION}"
+  if [[ ${#pending[@]} -gt 0 ]]; then
+    if ! upgrade_runner "${canary}"; then rc=1; fi
   else
-    log "All selected runners upgraded to ${RUNNER_VERSION}."
-    log "Previous installs kept as runner-N.prev; remove them once satisfied,"
-    log "or use '${PROG_NAME} rollback --runner N' to revert."
+    if ! start_runner "${canary}"; then rc=1; fi
   fi
-  return "${overall_rc}"
+  if [[ "${rc}" -ne 0 ]]; then
+    err "Canary ${canary} failed. Remaining selected runners stay stopped for maintenance."
+    err "Inspect recovery status; use '${PROG_NAME} start --runner N' to resume a stopped runner."
+    print_summary
+    return 1
+  fi
+
+  for ((i = 1; i < ${#pending[@]}; i++)); do
+    if ! upgrade_runner "${pending[$i]}"; then rc=1; break; fi
+  done
+  if [[ "${rc}" -eq 0 && ${#current[@]} -gt 0 ]]; then
+    for name in "${current[@]}"; do
+      [[ "${name}" != "${canary}" ]] || continue
+      if ! start_runner "${name}"; then rc=1; break; fi
+    done
+  fi
+  log_event "${PROG_NAME} run done latest=${RUNNER_VERSION} rc=${rc}"
+  print_summary
+  if [[ "${rc}" -ne 0 ]]; then
+    err "Maintenance stopped on a failure. Unstarted runners remain held; inspect their status before resuming."
+  else
+    log "All selected runners started on ${RUNNER_VERSION}."
+    log "Previous installs remain as runner-N.prev; keep them until satisfied."
+  fi
+  return "${rc}"
 }
 
 # ----------------------------------------------------------------------------
@@ -927,7 +1337,10 @@ main() {
 
   case "${COMMAND}" in
     check)    cmd_check ;;
+    shutdown) cmd_shutdown ;;
     run)      cmd_run ;;
+    start)    cmd_start ;;
+    repair)   cmd_repair ;;
     rollback) cmd_rollback ;;
   esac
 }
