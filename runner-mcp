@@ -1,0 +1,428 @@
+#!/usr/bin/env bash
+#
+# runner-mcp — stdio MCP server exposing this Mac's GitHub Actions runner
+# diagnostics to coding agents (Claude Code, Codex, Cursor, ...).
+#
+# Usage:
+#   runner-mcp                # serve newline-delimited JSON-RPC 2.0 on stdio
+#   runner-mcp --list         # print the tool catalogue and exit
+#
+# Every tool is READ-ONLY. They shell out to the sibling runner-* commands with
+# their --json flags (runner-health --dry-run, runner-logs tail/jobs, ...) and
+# to `gh` for the failed-step log of a workflow run. Nothing here restarts a
+# runner, prunes a cache, or changes Docker state; an agent that finds a
+# problem tells the operator which runner-* command fixes it.
+#
+# Register once per host (the client launches this as a subprocess):
+#   claude mcp add --scope user runner -- runner-mcp
+#
+# Tools that read the launchd system domain (runner_health, runner_metrics)
+# use sudo inside the wrapped command. Without a terminal that prompt cannot
+# be answered, so the tool returns sudo's error instead of hanging; see
+# docs/agent-tools.md for a sudoers rule limited to `launchctl print`.
+
+set -euo pipefail
+
+PROG_NAME="$(basename "$0")"
+SERVER_VERSION="1.0.0"
+PROTOCOL_VERSION="2025-06-18"
+
+# Sibling commands are resolved from this script's directory first (Homebrew
+# installs them side by side), then PATH. RUNNER_MCP_BIN_DIR overrides both.
+BIN_DIR="${RUNNER_MCP_BIN_DIR:-$(cd "$(dirname "$0")" && pwd)}"
+WORK_TMPDIR=""
+
+log()  { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
+err()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; }
+
+usage() {
+  cat >&2 <<EOF
+${PROG_NAME} — MCP server for runner diagnostics (stdio, read-only)
+
+USAGE:
+  ${PROG_NAME}              Serve MCP over stdin/stdout (launched by a client)
+  ${PROG_NAME} --list       Print the tool catalogue as JSON and exit
+  ${PROG_NAME} -h | --help  Show this help and exit
+
+TOOLS:
+  runner_health           runner-health --once --dry-run --json
+  runner_metrics          runner-logs metrics --once
+  runner_jobs             runner-logs jobs --json
+  runner_logs_tail        runner-logs tail --json
+  cache_status            runner-cache status --json
+  docker_builder_status   runner-docker-builder status --json
+  gh_failed_run_log       gh run view --log-failed (latest failed run or an id)
+
+REGISTER (Claude Code):
+  claude mcp add --scope user runner -- ${PROG_NAME}
+
+ENVIRONMENT:
+  RUNNER_MCP_BIN_DIR   Directory holding the runner-* commands (default: the
+                       directory of this script, then PATH).
+  GITHUB_PAT           Optional; forwarded to runner-health for online/busy
+                       checks when the org/repo argument is given.
+
+See docs/agent-tools.md for the JSON schemas and the sudo note.
+EOF
+}
+
+cleanup() {
+  local code=$?
+  [[ -n "${WORK_TMPDIR}" && -d "${WORK_TMPDIR}" ]] && rm -rf "${WORK_TMPDIR}" 2>/dev/null
+  return "${code}"
+}
+trap cleanup EXIT
+
+require_cmds() {
+  local missing=() c
+  for c in jq tail; do
+    command -v "${c}" >/dev/null 2>&1 || missing+=("${c}")
+  done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    err "Required command(s) not found: ${missing[*]} (brew install jq)"
+    exit 1
+  fi
+}
+
+# Path to a sibling runner-* command, or empty when it is not installed.
+sibling() {
+  if [[ -x "${BIN_DIR}/$1" ]]; then
+    printf '%s' "${BIN_DIR}/$1"
+  else
+    command -v "$1" 2>/dev/null || true
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# Tool catalogue (static JSON; jq validates it once at startup)
+# ----------------------------------------------------------------------------
+tool_catalogue() {
+  cat <<'EOF'
+[
+  {
+    "name": "runner_health",
+    "description": "Run the runner-health watchdog in dry-run mode: for every runner-N on this Mac report launchd state, diag log freshness, and (with org/repo + GITHUB_PAT) GitHub online/busy status. Nothing is restarted; issues carry result=\"detected\" and the action runner-health would take. Uses sudo to read launchd.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "org": {"type": "string", "description": "GitHub organization for API checks (requires GITHUB_PAT in the server environment)."},
+        "repo": {"type": "string", "description": "OWNER/REPO for API checks instead of org."},
+        "stale_minutes": {"type": "integer", "minimum": 1, "description": "Diag log age that counts as stale (default 15)."}
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "runner_metrics",
+    "description": "One JSON line per runner: daemon_loaded, status (idle/busy/offline), last job name and result, disk usage on the runner volume, and queue depth when GITHUB_PAT is set. Uses sudo to read launchd.",
+    "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+  },
+  {
+    "name": "runner_jobs",
+    "description": "Recent job completions parsed from Worker logs across runners, newest first: runner, job, result, started, duration_s, log file. No sudo.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "runner": {"type": "string", "description": "Restrict to one runner: 'runner-2' or '2'."},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 500, "description": "Maximum completions to return (default 20)."}
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "runner_logs_tail",
+    "description": "Last N lines of a runner's newest log. kind: runner (listener diag), worker (job diag — the place to look for a failed step), stdout or stderr (LaunchDaemon output). No sudo.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "runner": {"type": "string", "description": "'runner-2' or '2'. Optional when exactly one runner is installed."},
+        "kind": {"type": "string", "enum": ["runner", "worker", "stdout", "stderr"], "description": "Log to read (default runner)."},
+        "lines": {"type": "integer", "minimum": 1, "maximum": 5000, "description": "Trailing lines to return (default 200)."}
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "cache_status",
+    "description": "Status of the local MinIO dependency cache (runner-cache): installed, launchd_loaded, healthy, endpoint, data_dir, disk_usage_kb, buckets. Never prompts; no secrets.",
+    "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+  },
+  {
+    "name": "docker_builder_status",
+    "description": "Docker build setup on this Mac: active context, selected buildx builder and mode (remote/colima/desktop), all builders with driver and status, BuildKit cache total for a runner builder, and Colima state.",
+    "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+  },
+  {
+    "name": "gh_failed_run_log",
+    "description": "Failed-step log of a GitHub Actions workflow run via the gh CLI. Defaults to the most recent failed run in the repo. Requires gh to be installed and authenticated.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "repo": {"type": "string", "description": "OWNER/REPO. Optional when a runner here is registered to a single repository."},
+        "run_id": {"type": "integer", "description": "Specific run id; default is the latest failed run."},
+        "lines": {"type": "integer", "minimum": 1, "maximum": 5000, "description": "Trailing lines of the failed-step log to return (default 300)."}
+      },
+      "additionalProperties": false
+    }
+  }
+]
+EOF
+}
+
+# ----------------------------------------------------------------------------
+# JSON-RPC plumbing — one line in, one line out; stdout carries ONLY protocol.
+# ----------------------------------------------------------------------------
+send() { printf '%s\n' "$1"; }
+
+respond_result() {
+  local id="$1" result="$2"
+  send "$(jq -cn --argjson id "${id}" --argjson result "${result}" \
+    '{jsonrpc:"2.0", id:$id, result:$result}')"
+}
+
+respond_error() {
+  local id="$1" code="$2" message="$3"
+  send "$(jq -cn --argjson id "${id}" --argjson code "${code}" --arg message "${message}" \
+    '{jsonrpc:"2.0", id:$id, error:{code:$code, message:$message}}')"
+}
+
+# Tool result envelope: text content plus isError.
+tool_text() {
+  local id="$1" text="$2" is_error="$3"
+  respond_result "${id}" "$(jq -cn --arg text "${text}" --argjson e "${is_error}" \
+    '{content:[{type:"text", text:$text}], isError:$e}')"
+}
+
+tool_error() { tool_text "$1" "$2" true; }
+
+# ----------------------------------------------------------------------------
+# Argument helpers — every value that reaches a command line is validated
+# against a strict pattern first, so no agent-supplied string is interpolated
+# unchecked into argv.
+# ----------------------------------------------------------------------------
+arg() { printf '%s' "$1" | jq -r --arg k "$2" '.[$k] // empty' 2>/dev/null || true; }
+
+valid_runner()  { [[ "$1" =~ ^(runner-)?[0-9]+$ ]]; }
+valid_int()     { [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge "$2" && "$1" -le "$3" ]]; }
+valid_repo()    { [[ "$1" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; }
+valid_org()     { [[ "$1" =~ ^[A-Za-z0-9_.-]+$ ]]; }
+
+# Run a command with stdin closed, capturing stdout/stderr separately, and
+# answer the request. Success returns stdout; failure returns exit code plus
+# stderr so the agent sees why (sudo prompts, missing tooling, ...).
+run_tool() {
+  local id="$1"; shift
+  local out_file="${WORK_TMPDIR}/out" err_file="${WORK_TMPDIR}/err" status=0
+  "$@" </dev/null >"${out_file}" 2>"${err_file}" || status=$?
+  local out errtxt
+  out="$(cat "${out_file}")"
+  errtxt="$(sed 's/\x1b\[[0-9;]*m//g' "${err_file}")"
+  if [[ "${status}" -eq 0 ]]; then
+    [[ -n "${out}" ]] || out="${errtxt}"
+    tool_text "${id}" "${out}" false
+  else
+    tool_error "${id}" "$(printf '%s exited %s\n%s\n%s' "$(basename "$1")" "${status}" "${errtxt}" "${out}")"
+  fi
+}
+
+# need <id> <command>: sets BIN to the command's path, or answers the request
+# with a tool error and returns 1 (callers `|| return 0`). Not a subshell, so
+# the error response reaches stdout.
+BIN=""
+need() {
+  local id="$1" cmd="$2"
+  BIN="$(sibling "${cmd}")"
+  if [[ -z "${BIN}" ]]; then
+    tool_error "${id}" "${cmd} is not installed on this host (brew install joeblau/hb/runner-setup)."
+    return 1
+  fi
+}
+
+# Repo slug from a repo-scoped runner's .runner file, or empty.
+default_repo() {
+  local f url path
+  for f in /opt/github-runners/runner-*/.runner; do
+    [[ -f "${f}" ]] || continue
+    url="$(sed -n 's/.*"gitHubUrl"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${f}" 2>/dev/null | head -n1 || true)"
+    path="${url#*://}"; path="${path#*/}"; path="${path%/}"
+    if [[ "${path}" == */* ]]; then
+      printf '%s' "${path}"
+      return 0
+    fi
+  done
+  return 0
+}
+
+# ----------------------------------------------------------------------------
+# Tools
+# ----------------------------------------------------------------------------
+tool_runner_health() {
+  local id="$1" args="$2" org repo stale
+  need "${id}" runner-health || return 0
+  org="$(arg "${args}" org)"; repo="$(arg "${args}" repo)"; stale="$(arg "${args}" stale_minutes)"
+  local -a argv=("${BIN}" --once --dry-run --json)
+  if [[ -n "${org}" && -n "${repo}" ]]; then tool_error "${id}" "Give org or repo, not both."; return 0; fi
+  if [[ -n "${org}" ]];  then valid_org "${org}"   || { tool_error "${id}" "Invalid org."; return 0; };  argv+=(--org "${org}"); fi
+  if [[ -n "${repo}" ]]; then valid_repo "${repo}" || { tool_error "${id}" "Invalid repo; expected OWNER/REPO."; return 0; }; argv+=(--repo "${repo}"); fi
+  if [[ -n "${stale}" ]]; then valid_int "${stale}" 1 100000 || { tool_error "${id}" "stale_minutes must be a positive integer."; return 0; }; argv+=(--stale-minutes "${stale}"); fi
+  run_tool "${id}" "${argv[@]}"
+}
+
+tool_runner_metrics() {
+  local id="$1"
+  need "${id}" runner-logs || return 0
+  run_tool "${id}" "${BIN}" metrics --once
+}
+
+tool_runner_jobs() {
+  local id="$1" args="$2" runner limit
+  need "${id}" runner-logs || return 0
+  runner="$(arg "${args}" runner)"; limit="$(arg "${args}" limit)"
+  local -a argv=("${BIN}" jobs --json)
+  if [[ -n "${runner}" ]]; then valid_runner "${runner}" || { tool_error "${id}" "Invalid runner; expected runner-N or N."; return 0; }; argv+=(--runner "${runner}"); fi
+  if [[ -n "${limit}" ]];  then valid_int "${limit}" 1 500  || { tool_error "${id}" "limit must be 1-500."; return 0; }; argv+=(--limit "${limit}"); fi
+  run_tool "${id}" "${argv[@]}"
+}
+
+tool_runner_logs_tail() {
+  local id="$1" args="$2" runner kind lines
+  need "${id}" runner-logs || return 0
+  runner="$(arg "${args}" runner)"; kind="$(arg "${args}" kind)"; lines="$(arg "${args}" lines)"
+  local -a argv=("${BIN}" tail --json)
+  if [[ -n "${runner}" ]]; then valid_runner "${runner}" || { tool_error "${id}" "Invalid runner; expected runner-N or N."; return 0; }; argv+=(--runner "${runner}"); fi
+  if [[ -n "${kind}" ]]; then
+    case "${kind}" in
+      runner|worker|stdout|stderr) argv+=(--kind "${kind}") ;;
+      *) tool_error "${id}" "kind must be runner, worker, stdout, or stderr."; return 0 ;;
+    esac
+  fi
+  if [[ -n "${lines}" ]]; then valid_int "${lines}" 1 5000 || { tool_error "${id}" "lines must be 1-5000."; return 0; }; argv+=(--lines "${lines}"); fi
+  run_tool "${id}" "${argv[@]}"
+}
+
+tool_cache_status() {
+  local id="$1"
+  need "${id}" runner-cache || return 0
+  run_tool "${id}" "${BIN}" status --json
+}
+
+tool_docker_builder_status() {
+  local id="$1"
+  need "${id}" runner-docker-builder || return 0
+  run_tool "${id}" "${BIN}" status --json
+}
+
+tool_gh_failed_run_log() {
+  local id="$1" args="$2" repo run_id lines
+  if ! command -v gh >/dev/null 2>&1; then
+    tool_error "${id}" "gh CLI is not installed (brew install gh) or not on PATH."
+    return 0
+  fi
+  repo="$(arg "${args}" repo)"; run_id="$(arg "${args}" run_id)"; lines="$(arg "${args}" lines)"
+  [[ -n "${repo}" ]] || repo="$(default_repo)"
+  if [[ -z "${repo}" ]]; then
+    tool_error "${id}" "No repo given and no repo-scoped runner found to infer one; pass repo as OWNER/REPO."
+    return 0
+  fi
+  valid_repo "${repo}" || { tool_error "${id}" "Invalid repo; expected OWNER/REPO."; return 0; }
+  [[ -z "${run_id}" ]] || valid_int "${run_id}" 1 999999999999 || { tool_error "${id}" "run_id must be a positive integer."; return 0; }
+  [[ -n "${lines}" ]] || lines=300
+  valid_int "${lines}" 1 5000 || { tool_error "${id}" "lines must be 1-5000."; return 0; }
+
+  local header
+  if [[ -z "${run_id}" ]]; then
+    local listing
+    if ! listing="$(gh run list --repo "${repo}" --status failure --limit 1 \
+        --json databaseId,displayTitle,workflowName,headBranch,url,createdAt </dev/null 2>"${WORK_TMPDIR}/err")"; then
+      tool_error "${id}" "gh run list failed: $(cat "${WORK_TMPDIR}/err")"
+      return 0
+    fi
+    run_id="$(printf '%s' "${listing}" | jq -r '.[0].databaseId // empty')"
+    if [[ -z "${run_id}" ]]; then
+      tool_text "${id}" "No failed workflow runs found in ${repo}." false
+      return 0
+    fi
+    header="$(printf '%s' "${listing}" | jq -r '.[0] | "run \(.databaseId) — \(.workflowName): \(.displayTitle) [\(.headBranch)] \(.createdAt)\n\(.url)"')"
+  else
+    header="run ${run_id} in ${repo}"
+  fi
+
+  local body status=0
+  body="$(gh run view "${run_id}" --repo "${repo}" --log-failed </dev/null 2>"${WORK_TMPDIR}/err" | tail -n "${lines}")" || status=$?
+  if [[ "${status}" -ne 0 && -z "${body}" ]]; then
+    tool_error "${id}" "gh run view failed: $(cat "${WORK_TMPDIR}/err")"
+    return 0
+  fi
+  [[ -n "${body}" ]] || body="(no failed-step log lines; the run may still be in progress or have failed outside a step)"
+  tool_text "${id}" "$(printf '%s\n\n%s' "${header}" "${body}")" false
+}
+
+# ----------------------------------------------------------------------------
+# Dispatch
+# ----------------------------------------------------------------------------
+handle_tools_call() {
+  local id="$1" params="$2" name args
+  name="$(printf '%s' "${params}" | jq -r '.name // empty')"
+  args="$(printf '%s' "${params}" | jq -c '.arguments // {}')"
+  case "${name}" in
+    runner_health)         tool_runner_health "${id}" "${args}" ;;
+    runner_metrics)        tool_runner_metrics "${id}" ;;
+    runner_jobs)           tool_runner_jobs "${id}" "${args}" ;;
+    runner_logs_tail)      tool_runner_logs_tail "${id}" "${args}" ;;
+    cache_status)          tool_cache_status "${id}" ;;
+    docker_builder_status) tool_docker_builder_status "${id}" ;;
+    gh_failed_run_log)     tool_gh_failed_run_log "${id}" "${args}" ;;
+    *) respond_error "${id}" -32602 "Unknown tool: ${name}" ;;
+  esac
+}
+
+handle_line() {
+  local line="$1" method id params
+  if ! printf '%s' "${line}" | jq -e . >/dev/null 2>&1; then
+    respond_error null -32700 "Parse error"
+    return 0
+  fi
+  method="$(printf '%s' "${line}" | jq -r '.method // empty')"
+  id="$(printf '%s' "${line}" | jq -c 'if has("id") then .id else null end')"
+  params="$(printf '%s' "${line}" | jq -c '.params // {}')"
+
+  case "${method}" in
+    notifications/*) return 0 ;;   # no response to notifications
+    initialize)
+      local requested
+      requested="$(printf '%s' "${params}" | jq -r '.protocolVersion // empty')"
+      respond_result "${id}" "$(jq -cn --arg v "${requested:-${PROTOCOL_VERSION}}" \
+        --arg name "${PROG_NAME}" --arg ver "${SERVER_VERSION}" \
+        '{protocolVersion:$v, capabilities:{tools:{}}, serverInfo:{name:$name, version:$ver}}')"
+      ;;
+    ping)        respond_result "${id}" '{}' ;;
+    tools/list)  respond_result "${id}" "$(jq -cn --argjson t "${TOOLS}" '{tools:$t}')" ;;
+    tools/call)  handle_tools_call "${id}" "${params}" ;;
+    "")          respond_error "${id}" -32600 "Invalid Request: missing method" ;;
+    *)           respond_error "${id}" -32601 "Method not found: ${method}" ;;
+  esac
+}
+
+serve() {
+  local line
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ -n "${line//[[:space:]]/}" ]] || continue
+    handle_line "${line}"
+  done
+}
+
+main() {
+  case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+    --list)    require_cmds; tool_catalogue | jq .; exit 0 ;;
+    "") ;;
+    *) err "Unknown argument: $1"; usage; exit 2 ;;
+  esac
+  require_cmds
+  TOOLS="$(tool_catalogue | jq -c .)"
+  WORK_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/runner-mcp.XXXXXX")"
+  log "${PROG_NAME} ${SERVER_VERSION}: serving read-only runner tools on stdio (commands from ${BIN_DIR})"
+  serve
+}
+
+main "$@"

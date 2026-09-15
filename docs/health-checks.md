@@ -146,3 +146,13 @@ Every 300 seconds launchd runs one pass; pass/fail lines and alerts land in
 - `1` — at least one issue could not be fixed locally (e.g. daemon and plist
   both missing → re-run `runner-setup`) or a remediation failed.
 - `2` — usage error.
+
+## Diagnosis without remediation
+
+`runner-health --once --dry-run` runs every check but never restarts a
+runner, sends an alert, or clears alert markers; issues are reported with
+`result="detected"` and the exit status is `1` when anything was found. Add
+`--json` to get one document per pass instead of log lines and the summary
+table. Both are what `runner-mcp` exposes to coding agents; see
+[agent-tools.md](agent-tools.md) for the schema and a sudoers rule that keeps
+the launchd read non-interactive.

@@ -38,6 +38,7 @@ PLATFORM=""            # optional CSV of target platforms for the builder
 COLIMA_CPU=4           # setup-colima defaults
 COLIMA_MEM=8           # GiB
 COLIMA_DISK=60         # GiB
+JSON=0                 # status --json
 
 # ----------------------------------------------------------------------------
 # Output helpers — progress goes to stderr.
@@ -55,7 +56,7 @@ USAGE:
   ${PROG_NAME} setup-remote --host ssh://user@linux-builder [options]
   ${PROG_NAME} setup-colima [options]
   ${PROG_NAME} use-desktop
-  ${PROG_NAME} status
+  ${PROG_NAME} status [--json]
 
 COMMANDS:
   setup-remote     Point docker buildx at a remote Linux builder over SSH
@@ -68,6 +69,8 @@ COMMANDS:
                    (builder name: ${COLIMA_BUILDER_NAME}, docker-container driver).
   use-desktop      Revert the default builder to Docker Desktop (desktop-linux).
   status           Show the active docker context and buildx builders.
+                   --json emits one object (context, selected builder, mode,
+                   builders, colima state, cache size); see docs/agent-tools.md.
 
 OPTIONS (setup-remote):
   --host URL          SSH URL of the Linux builder, e.g. ssh://ci@builder.local.
@@ -81,6 +84,7 @@ OPTIONS (setup-colima):
   --disk GB           Disk in GiB for the colima VM (default: ${COLIMA_DISK})
 
 OTHER:
+  --json              (status) Machine-readable output on stdout
   -h, --help          Show this help and exit
 
 EXAMPLES:
@@ -146,6 +150,7 @@ parse_args() {
         [[ $# -ge 2 ]] || { err "--disk requires a value"; usage; exit 2; }
         COLIMA_DISK="$2"; shift 2 ;;
       --disk=*)    COLIMA_DISK="${1#*=}"; shift ;;
+      --json)      JSON=1; shift ;;
       -h|--help)   usage; exit 0 ;;
       *)
         err "Unknown argument: $1"
@@ -378,8 +383,79 @@ use_desktop() {
 # ----------------------------------------------------------------------------
 # status — show active context and builders (parse without jq)
 # ----------------------------------------------------------------------------
+json_escape() {
+  printf '%s' "$1" \
+    | tr -d '\000-\010\013-\037' \
+    | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/\\t/g'
+}
+
+builder_mode() {
+  case "$1" in
+    "${REMOTE_BUILDER_NAME}") printf remote ;;
+    "${COLIMA_BUILDER_NAME}") printf colima ;;
+    desktop-linux)            printf desktop ;;
+    "")                       printf unknown ;;
+    *)                        printf other ;;
+  esac
+}
+
+# Machine-readable status. Builders come from the top-level rows of
+# `docker buildx ls` (node rows are indented); the selected builder from
+# `docker buildx inspect`. cache_total is BuildKit's own "Total:" figure for a
+# provisioned runner builder, or null when it is not selected/available.
+status_json() {
+  local ctx default_builder mode
+  ctx="$(docker context show 2>/dev/null || true)"
+  default_builder="$(docker buildx inspect 2>/dev/null | awk '$1 == "Name:" {print $2; exit}' || true)"
+  mode="$(builder_mode "${default_builder}")"
+
+  # awk folds `buildx ls` into one TSV row per builder: the top-level row gives
+  # name/driver, its first indented node row gives the status column.
+  local builders="" first=1 name driver bstatus
+  while IFS=$'\t' read -r name driver bstatus; do
+    [[ -n "${name}" ]] || continue
+    if [[ "${first}" -eq 1 ]]; then first=0; else builders="${builders},"; fi
+    builders="${builders}$(printf '{"name":"%s","driver":"%s","status":"%s","selected":%s}' \
+      "$(json_escape "${name}")" "$(json_escape "${driver}")" "$(json_escape "${bstatus}")" \
+      "$([[ "${name}" == "${default_builder}" ]] && echo true || echo false)")"
+  done < <(docker buildx ls 2>/dev/null | awk '
+    NR == 1 && $1 == "NAME/NODE" { next }
+    /^[^ \t\\]/ { if (name != "") print name "\t" driver "\t" status
+                  name = $1; sub(/\*$/, "", name); driver = $2; status = ""; next }
+    $1 == "\\_" && name != "" && status == "" { status = $5 }
+    END { if (name != "") print name "\t" driver "\t" status }' || true)
+
+  local cache_total=null
+  case "${default_builder}" in
+    "${REMOTE_BUILDER_NAME}"|"${COLIMA_BUILDER_NAME}")
+      cache_total="$(docker buildx du --builder "${default_builder}" 2>/dev/null \
+        | awk '$1 == "Total:" {print $2; exit}' || true)"
+      if [[ -n "${cache_total}" ]]; then cache_total="\"$(json_escape "${cache_total}")\""; else cache_total=null; fi
+      ;;
+  esac
+
+  local colima_installed=false colima_running=false
+  if command -v colima >/dev/null 2>&1; then
+    colima_installed=true
+    colima status default >/dev/null 2>&1 && colima_running=true
+  fi
+
+  printf '{"context":%s,"selected_builder":%s,"mode":"%s","builders":[%s],"cache_total":%s,"colima":{"installed":%s,"running":%s}}\n' \
+    "$([[ -n "${ctx}" ]] && printf '"%s"' "$(json_escape "${ctx}")" || printf null)" \
+    "$([[ -n "${default_builder}" ]] && printf '"%s"' "$(json_escape "${default_builder}")" || printf null)" \
+    "${mode}" "${builders}" "${cache_total}" "${colima_installed}" "${colima_running}"
+}
+
 status() {
-  require_docker
+  # Read-only: never install tooling from a status query.
+  if ! command -v docker >/dev/null 2>&1; then
+    err "docker CLI not found. Install it with: brew install docker"
+    exit 1
+  fi
+  if [[ "${JSON}" -eq 1 ]]; then
+    status_json
+    return 0
+  fi
 
   log "docker context"
   local ctx

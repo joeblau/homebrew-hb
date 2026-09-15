@@ -163,7 +163,7 @@ persist across rotation.
 | `install (--org ORG \| --repo OWNER/REPO)` | Install dependencies, configure the daemon, and provision a scope. |
 | `env [--org ORG \| --repo OWNER/REPO]` | Print S3 settings and workflow instructions without secrets. Scope can be omitted if exactly one is installed. |
 | `start` / `stop` | Start or stop MinIO; `start` fails if health does not recover. |
-| `status` | Report daemon, health, buckets, and disk usage. |
+| `status [--json]` | Report daemon, health, buckets, and disk usage; `--json` for scripts and agents ([schema](agent-tools.md)). |
 | `metrics [--raw]` | Report S3 request/error/traffic counters, or raw Prometheus output. |
 | `uninstall [--yes] [--keep-data]` | Remove the daemon. `--keep-data` preserves **both data and credentials/config** for reinstall; otherwise all cache files are removed. |
 

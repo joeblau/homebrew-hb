@@ -22,6 +22,7 @@ For Docker builds, configure [Colima or a remote Linux builder](docs/docker-buil
 - `runner-token` — mint short-lived registration/removal tokens on demand ([docs](docs/token-management.md))
 - `runner-netisolate` — pf egress policy and VPN kill-switch for runners ([docs](docs/network-isolation.md))
 - `runner-docker-builder` — fast Docker builds via a remote Linux builder or colima ([docs](docs/docker-builds.md))
+- `runner-mcp` — read-only MCP server so Claude Code/Codex can diagnose runners, jobs, caches, and failed CI runs on this Mac ([docs](docs/agent-tools.md))
 
 See the [performance review and Blacksmith capability map](docs/runner-performance.md)
 for corrected integrations, remaining platform gaps, sizing guidance, and a

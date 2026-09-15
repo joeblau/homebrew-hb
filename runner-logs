@@ -6,6 +6,8 @@
 # Usage:
 #   runner-logs ship [--sink file|http] [--output-dir DIR] [--interval SEC]
 #   runner-logs metrics [--interval SEC] [--once]
+#   runner-logs tail [--runner N] [--kind runner|worker|stdout|stderr] [--lines N] [--json]
+#   runner-logs jobs [--runner N] [--limit N] [--json]
 #
 # ship:    tails every runner's _diag/*.log (Runner_*.log, Worker_*.log, plus
 #          the runner-stdout.log / runner-stderr.log written by the LaunchDaemon
@@ -19,6 +21,13 @@
 #          (Worker 'completed with result' lines), disk usage on the runner
 #          volume, and — when GITHUB_PAT is set — queue depth from the GitHub
 #          API. Uses sudo only for `launchctl print system/...`.
+#
+# tail:    print the last N lines of one runner's newest diag log (Runner_*,
+#          Worker_*, or the LaunchDaemon stdout/stderr files). No sudo.
+#
+# jobs:    list recent Worker completions (job name, result, start time,
+#          duration) across runners, newest first. No sudo. Both tail and
+#          jobs accept --json for agents and scripts (docs/agent-tools.md).
 #
 # The script never runs any runner process and never sets
 # RUNNER_ALLOW_RUNASROOT; it only READS runner state. Secrets (bearer token,
@@ -34,7 +43,13 @@ PROG_NAME="$(basename "$0")"
 RUNNER_ROOT="/opt/github-runners"
 GITHUB_API="https://api.github.com"
 
-MODE=""                          # ship | metrics
+MODE=""                          # ship | metrics | tail | jobs
+RUNNER_FILTER=""                 # tail/jobs: only this runner (runner-N or N)
+LOG_KIND="runner"                # tail: runner | worker | stdout | stderr
+LINES=200                        # tail: lines to print
+LIMIT=20                         # jobs: completions to list
+JSON=0                           # tail/jobs: JSON output on stdout
+SUDO="sudo"                      # metrics: "sudo -n" when launchctl print is passwordless
 SINK="file"                      # file | http
 OUTPUT_DIR=""                    # default resolved after arg parse
 INTERVAL=""                      # default depends on MODE
@@ -65,6 +80,8 @@ ${PROG_NAME} — ship runner logs and metrics to a central aggregator (macOS)
 USAGE:
   ${PROG_NAME} [ship] [--sink file|http] [--output-dir DIR] [--interval SEC] [--once]
   ${PROG_NAME} metrics [--interval SEC] [--once]
+  ${PROG_NAME} tail [--runner N] [--kind runner|worker|stdout|stderr] [--lines N] [--json]
+  ${PROG_NAME} jobs [--runner N] [--limit N] [--json]
 
 MODES:
   ship (default)   Tail ${RUNNER_ROOT}/runner-*/_diag/*.log (Runner_*,
@@ -78,6 +95,11 @@ MODES:
                    'Listening for Jobs'), last job result (Worker 'completed
                    with result' lines), disk free/used on the runner volume,
                    and queue depth when GITHUB_PAT is set.
+  tail             Print the last --lines lines of one runner's newest log of
+                   the chosen --kind. Defaults to the single installed runner
+                   when --runner is omitted and exactly one exists. No sudo.
+  jobs             List recent job completions parsed from Worker_*.log files
+                   (name, result, started, duration), newest first. No sudo.
 
 SINKS (ship mode):
   --sink file      Append JSON lines to OUTPUT_DIR/runner-logs-YYYYMMDD.jsonl
@@ -95,6 +117,11 @@ OPTIONS:
   --batch-size N    Max JSON lines per HTTP POST (default: ${BATCH_SIZE})
   --interval SEC    Seconds between passes (default: 10 ship / 60 metrics)
   --once            Run a single pass and exit (for cron/launchd/manual runs)
+  --runner N        tail/jobs: restrict to runner-N (accepts 'runner-N' or 'N')
+  --kind KIND       tail: runner (default) | worker | stdout | stderr
+  --lines N         tail: number of trailing lines (default: ${LINES})
+  --limit N         jobs: maximum completions to list (default: ${LIMIT})
+  --json            tail/jobs: emit JSON on stdout instead of text
   -h, --help        Show this help and exit
 
 ENVIRONMENT:
@@ -110,6 +137,8 @@ EXAMPLES:
   LOG_HTTP_ENDPOINT=https://logs.example.com:8080 LOG_HTTP_TOKEN=... ${PROG_NAME} ship
   ${PROG_NAME} metrics --once
   GITHUB_PAT=ghp_... GITHUB_QUEUE_REPO=acme/monorepo ${PROG_NAME} metrics --once
+  ${PROG_NAME} tail --runner 2 --kind worker --lines 50
+  ${PROG_NAME} jobs --limit 5 --json
 
   Emit a synthetic 'job' event for every Worker completion line — each such
   shipped line also carries job_name / job_result / job_duration_s so
@@ -148,7 +177,7 @@ parse_args() {
   # Optional leading mode word; default is ship.
   if [[ $# -gt 0 ]]; then
     case "$1" in
-      ship|metrics) MODE="$1"; shift ;;
+      ship|metrics|tail|jobs) MODE="$1"; shift ;;
     esac
   fi
   [[ -n "${MODE}" ]] || MODE="ship"
@@ -180,6 +209,23 @@ parse_args() {
         INTERVAL="$2"; shift 2 ;;
       --interval=*) INTERVAL="${1#*=}"; shift ;;
       --once)      ONCE=1; shift ;;
+      --runner)
+        [[ $# -ge 2 ]] || { err "--runner requires a value"; usage; exit 2; }
+        RUNNER_FILTER="$2"; shift 2 ;;
+      --runner=*)  RUNNER_FILTER="${1#*=}"; shift ;;
+      --kind)
+        [[ $# -ge 2 ]] || { err "--kind requires a value"; usage; exit 2; }
+        LOG_KIND="$2"; shift 2 ;;
+      --kind=*)    LOG_KIND="${1#*=}"; shift ;;
+      --lines)
+        [[ $# -ge 2 ]] || { err "--lines requires a value"; usage; exit 2; }
+        LINES="$2"; shift 2 ;;
+      --lines=*)   LINES="${1#*=}"; shift ;;
+      --limit)
+        [[ $# -ge 2 ]] || { err "--limit requires a value"; usage; exit 2; }
+        LIMIT="$2"; shift 2 ;;
+      --limit=*)   LIMIT="${1#*=}"; shift ;;
+      --json)      JSON=1; shift ;;
       -h|--help)   usage; exit 0 ;;
       *)
         err "Unknown argument: $1"
@@ -187,6 +233,26 @@ parse_args() {
         exit 2 ;;
     esac
   done
+
+  if [[ -n "${RUNNER_FILTER}" ]]; then
+    [[ "${RUNNER_FILTER}" == runner-* ]] || RUNNER_FILTER="runner-${RUNNER_FILTER}"
+    if ! [[ "${RUNNER_FILTER}" =~ ^runner-[0-9]+$ ]]; then
+      err "--runner must be N or runner-N (got: '${RUNNER_FILTER}')"
+      exit 2
+    fi
+  fi
+  case "${LOG_KIND}" in
+    runner|worker|stdout|stderr) ;;
+    *) err "--kind must be runner, worker, stdout, or stderr (got: '${LOG_KIND}')"; exit 2 ;;
+  esac
+  if ! [[ "${LINES}" =~ ^[0-9]+$ ]] || [[ "${LINES}" -lt 1 ]]; then
+    err "--lines must be a positive integer (got: '${LINES}')"
+    exit 2
+  fi
+  if ! [[ "${LIMIT}" =~ ^[0-9]+$ ]] || [[ "${LIMIT}" -lt 1 ]]; then
+    err "--limit must be a positive integer (got: '${LIMIT}')"
+    exit 2
+  fi
 
   case "${SINK}" in
     file|http) ;;
@@ -228,6 +294,8 @@ require_cmds() {
   local cmds="sed grep awk cut tail stat date basename uname mktemp tr ls"
   if [[ "${MODE}" == "metrics" ]]; then
     cmds="${cmds} sudo launchctl df head sleep"
+  elif [[ "${MODE}" == "tail" || "${MODE}" == "jobs" ]]; then
+    cmds="${cmds} head sort"
   fi
   if [[ "${SINK}" == "http" && "${MODE}" == "ship" ]] \
       || [[ "${MODE}" == "metrics" && -n "${GITHUB_PAT:-}" ]]; then
@@ -256,12 +324,12 @@ detect_host() {
 iso_now() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
 
 # Escape a raw log line for embedding in a JSON string: backslashes, double
-# quotes, literal tabs; strip carriage returns. (Other control characters are
-# rare in runner diag output and passed through.)
+# quotes, literal tabs. Every other control character (carriage returns, ANSI
+# escapes in Worker output) is stripped so the result is always valid JSON.
 json_escape() {
   printf '%s' "$1" \
-    | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/\\t/g' \
-    | tr -d '\r'
+    | tr -d '\000-\010\013-\037' \
+    | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/\\t/g'
 }
 
 # Build a 0600 curl config file carrying the Authorization header so the
@@ -504,7 +572,7 @@ metrics_one() {
 
   # launchd state (sudo only for the system domain).
   local daemon_loaded=0
-  if sudo launchctl print "system/${label}" >/dev/null 2>&1; then
+  if ${SUDO} launchctl print "system/${label}" >/dev/null 2>&1; then
     daemon_loaded=1
   fi
 
@@ -600,11 +668,16 @@ run_metrics() {
     make_curl_auth_config "${GITHUB_PAT}"
   fi
   # metrics reads the system launchd domain; prime sudo once up front so
-  # prompts don't interleave with JSON on stdout.
-  log "Requesting administrator privileges (needed for launchctl print system/...)"
-  if ! sudo -v; then
-    err "Could not obtain sudo privileges."
-    exit 1
+  # prompts don't interleave with JSON on stdout. A NOPASSWD rule for
+  # `launchctl print` (docs/agent-tools.md) keeps this non-interactive.
+  if sudo -n launchctl print system >/dev/null 2>&1; then
+    SUDO="sudo -n"
+  else
+    log "Requesting administrator privileges (needed for launchctl print system/...)"
+    if ! sudo -v; then
+      err "Could not obtain sudo privileges."
+      exit 1
+    fi
   fi
   log "Emitting runner metrics to stdout (interval ${INTERVAL}s)"
   while :; do
@@ -625,6 +698,147 @@ run_metrics() {
 }
 
 # ----------------------------------------------------------------------------
+# tail / jobs — read-only views of diag logs for operators and agents.
+# ----------------------------------------------------------------------------
+# Runner directories to inspect: --runner, else every runner-N under RUNNER_ROOT.
+runner_dirs() {
+  local d
+  if [[ -n "${RUNNER_FILTER}" ]]; then
+    d="${RUNNER_ROOT}/${RUNNER_FILTER}"
+    if [[ ! -d "${d}" ]]; then
+      err "No such runner: ${d}"
+      return 1
+    fi
+    printf '%s\n' "${d}"
+    return 0
+  fi
+  shopt -s nullglob
+  for d in "${RUNNER_ROOT}"/runner-*; do
+    [[ -d "${d}" && "${d##*/}" =~ ^runner-[0-9]+$ ]] && printf '%s\n' "${d}"
+  done
+  shopt -u nullglob
+  return 0
+}
+
+# Newest file for a log kind inside one runner directory (empty when none).
+newest_log() {
+  local dir="$1" kind="$2"
+  case "${kind}" in
+    runner) ls -t "${dir}"/_diag/Runner_*.log 2>/dev/null | head -n1 || true ;;
+    worker) ls -t "${dir}"/_diag/Worker_*.log 2>/dev/null | head -n1 || true ;;
+    stdout) [[ -f "${dir}/_diag/runner-stdout.log" ]] && printf '%s\n' "${dir}/_diag/runner-stdout.log" || true ;;
+    stderr) [[ -f "${dir}/_diag/runner-stderr.log" ]] && printf '%s\n' "${dir}/_diag/runner-stderr.log" || true ;;
+  esac
+}
+
+run_tail() {
+  local -a dirs=()
+  local d list
+  list="$(runner_dirs)" || exit 1
+  while IFS= read -r d; do [[ -n "${d}" ]] && dirs+=("${d}"); done <<< "${list}"
+  if [[ ${#dirs[@]} -eq 0 ]]; then
+    err "No runners found under ${RUNNER_ROOT}."
+    exit 1
+  fi
+  if [[ ${#dirs[@]} -gt 1 ]]; then
+    err "Several runners are installed; choose one with --runner N:"
+    for d in "${dirs[@]}"; do err "  ${d##*/}"; done
+    exit 2
+  fi
+  local dir="${dirs[0]}" name file
+  name="${dir##*/}"
+  file="$(newest_log "${dir}" "${LOG_KIND}")"
+  if [[ -z "${file}" ]]; then
+    if [[ "${JSON}" -eq 1 ]]; then
+      printf '{"runner":"%s","kind":"%s","file":null,"lines":[]}\n' \
+        "$(json_escape "${name}")" "${LOG_KIND}"
+      exit 0
+    fi
+    err "${name}: no ${LOG_KIND} log found under ${dir}/_diag."
+    exit 1
+  fi
+
+  if [[ "${JSON}" -eq 0 ]]; then
+    tail -n "${LINES}" "${file}"
+    return 0
+  fi
+  local line lines="" first=1
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    if [[ "${first}" -eq 1 ]]; then first=0; else lines="${lines},"; fi
+    lines="${lines}\"$(json_escape "${line}")\""
+  done < <(tail -n "${LINES}" "${file}")
+  printf '{"runner":"%s","kind":"%s","file":"%s","mtime":"%s","lines":[%s]}\n' \
+    "$(json_escape "${name}")" "${LOG_KIND}" "$(json_escape "${file}")" \
+    "$(date -u -r "$(stat -f %m "${file}")" '+%Y-%m-%dT%H:%M:%SZ')" "${lines}"
+}
+
+# Print one TSV record per Worker completion: <epoch>\t<runner>\t<started>\t<duration_s>\t<result>\t<job>\t<file>
+# Worker logs are named Worker_YYYYMMDD-HHMMSS-utc.log; the start stamp is the
+# file name and the finish time is the file's mtime, so duration needs no
+# parsing of the log body.
+job_records() {
+  local dir name f base stamp started epoch finished duration result job line
+  while IFS= read -r dir; do
+    [[ -n "${dir}" ]] || continue
+    name="${dir##*/}"
+    for f in "${dir}"/_diag/Worker_*.log; do
+      [[ -f "${f}" ]] || continue
+      line="$(grep 'completed with result' "${f}" 2>/dev/null | tail -n1 || true)"
+      [[ -n "${line}" ]] || continue
+      base="${f##*/}"
+      stamp="$(printf '%s' "${base}" \
+        | sed -n 's/^Worker_\([0-9]\{8\}-[0-9]\{6\}\)-utc\.log/\1/p' || true)"
+      epoch=""
+      [[ -z "${stamp}" ]] || epoch="$(date -j -u -f '%Y%m%d-%H%M%S' "${stamp}" '+%s' 2>/dev/null || true)"
+      finished="$(stat -f %m "${f}" 2>/dev/null || echo 0)"
+      started=""; duration=""
+      if [[ -n "${epoch}" ]]; then
+        started="$(date -u -r "${epoch}" '+%Y-%m-%dT%H:%M:%SZ')"
+        duration=$(( finished - epoch ))
+        [[ "${duration}" -ge 0 ]] || duration=""
+      fi
+      result="$(printf '%s' "${line}" \
+        | sed -n 's/.*completed with result:[[:space:]]*\([A-Za-z]*\).*/\1/p' | head -n1 || true)"
+      job="$(printf '%s' "${line}" | sed -n "s/.*Job '\([^']*\)'.*/\1/p" | head -n1 || true)"
+      [[ -n "${job}" ]] || job="$(printf '%s' "${line}" \
+        | sed -n 's/.*Job \([^ ]*\) completed.*/\1/p' | head -n1 || true)"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "${epoch:-${finished}}" "${name}" "${started}" "${duration}" "${result:-unknown}" "${job}" "${f}"
+    done
+  done < <(runner_dirs)
+}
+
+run_jobs() {
+  local records
+  runner_dirs >/dev/null || exit 1
+  shopt -s nullglob
+  records="$(job_records | sort -t $'\t' -k1,1nr | head -n "${LIMIT}")" || exit 1
+  shopt -u nullglob
+
+  local epoch name started duration result job file
+  if [[ "${JSON}" -eq 0 ]]; then
+    printf '%-10s %-20s %-9s %-9s %s\n' RUNNER STARTED DURATION RESULT JOB
+    [[ -n "${records}" ]] || return 0
+    while IFS=$'\t' read -r epoch name started duration result job file; do
+      printf '%-10s %-20s %-9s %-9s %s\n' "${name}" "${started:-?}" "${duration:+${duration}s}" "${result}" "${job}"
+    done <<< "${records}"
+    return 0
+  fi
+  local items="" first=1 obj
+  if [[ -n "${records}" ]]; then
+    while IFS=$'\t' read -r epoch name started duration result job file; do
+      obj="$(printf '{"runner":"%s","job":"%s","result":"%s","started":%s,"duration_s":%s,"file":"%s"}' \
+        "$(json_escape "${name}")" "$(json_escape "${job}")" "$(json_escape "${result}")" \
+        "$([[ -n "${started}" ]] && printf '"%s"' "${started}" || printf null)" \
+        "${duration:-null}" "$(json_escape "${file}")")"
+      if [[ "${first}" -eq 1 ]]; then first=0; else items="${items},"; fi
+      items="${items}${obj}"
+    done <<< "${records}"
+  fi
+  printf '{"host":"%s","jobs":[%s]}\n' "$(json_escape "${HOST_LABEL}")" "${items}"
+}
+
+# ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
 main() {
@@ -635,6 +849,8 @@ main() {
   case "${MODE}" in
     ship)    run_ship ;;
     metrics) run_metrics ;;
+    tail)    run_tail ;;
+    jobs)    run_jobs ;;
   esac
 }
 

@@ -58,6 +58,7 @@ size can increase; shrinking an existing disk is unsupported.
 
 ```sh
 runner-docker-builder status
+runner-docker-builder status --json   # for scripts and agents (docs/agent-tools.md)
 runner-docker-builder use-desktop
 ```
 
