@@ -5,6 +5,8 @@
 # Usage:
 #   runner-health --once [--org ORG | --repo OWNER/REPO] [options]
 #   runner-health [--interval SECONDS]            # watch mode (default)
+#   runner-health --once --json                   # one JSON document per pass
+#   runner-health --once --dry-run                # detect only; never restart
 #
 # For every runner-N under /opt/github-runners it checks, each pass:
 #   1. launchd state — `launchctl print system/com.github.runner-N` must report
@@ -49,6 +51,10 @@ STALE_MINUTES="${DEFAULT_STALE_MINUTES}"
 BUSY_TIMEOUT_MINUTES="${DEFAULT_BUSY_TIMEOUT_MINUTES}"
 INTERVAL="${DEFAULT_INTERVAL}"
 ONCE=0
+JSON=0                # --json: one JSON document per pass on stdout
+DRY_RUN=0             # --dry-run: report issues, never remediate or alert
+ACT=""                # "would " under --dry-run, for step messages
+JSON_RUNNERS=""       # accumulated per-runner JSON objects for the pass
 
 ORG=""
 REPO=""
@@ -90,6 +96,15 @@ OPTIONS:
                             StartInterval timers and cron). Exit status is 0
                             when every runner is healthy or was successfully
                             remediated, 1 when any issue could not be fixed.
+  --dry-run                 Detect issues but never restart anything and never
+                            send alerts. Issues are reported with
+                            result="detected"; the exit status is 1 when any
+                            issue was found. Safe for agents and read-only
+                            diagnosis.
+  --json                    Replace the per-runner log lines and summary table
+                            with one JSON document per pass on stdout (progress
+                            still goes to stderr). Intended for agents and
+                            scripts; see docs/agent-tools.md for the schema.
   --interval SECONDS        Delay between passes in watch mode
                             (default: ${DEFAULT_INTERVAL}).
   --stale-minutes N         A running service whose newest _diag log is older
@@ -118,6 +133,7 @@ ENVIRONMENT:
 
 EXAMPLES:
   ${PROG_NAME} --once
+  ${PROG_NAME} --once --json
   GITHUB_PAT=ghp_... ALERT_WEBHOOK_URL=https://hooks.slack.com/services/... \
     ${PROG_NAME} --once --org acme
   ${PROG_NAME} --repo acme/monorepo --interval 600
@@ -154,6 +170,8 @@ parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --once)      ONCE=1; shift ;;
+      --json)      JSON=1; shift ;;
+      --dry-run)   DRY_RUN=1; ACT="would "; shift ;;
       --interval)
         [[ $# -ge 2 ]] || { err "--interval requires a value"; usage; exit 2; }
         INTERVAL="$2"; shift 2 ;;
@@ -253,6 +271,12 @@ detect_privilege() {
 
 ensure_sudo() {
   [[ -z "${SUDO}" ]] && return 0
+  # A NOPASSWD rule for `launchctl print` (docs/agent-tools.md) lets agents and
+  # timers run without a terminal: stay non-interactive when it is present.
+  if sudo -n launchctl print system >/dev/null 2>&1; then
+    SUDO="sudo -n"
+    return 0
+  fi
   log "Requesting administrator privileges (needed for launchctl and ${RUNNER_ROOT})"
   if ! sudo -v; then
     err "Could not obtain sudo privileges."
@@ -294,13 +318,37 @@ report_maintenance() {
 }
 
 # ----------------------------------------------------------------------------
-# Structured log line (stdout) — one per runner per pass, always.
+# Structured log line (stdout) — one per runner per pass, always. With --json
+# the line is instead accumulated as an object and printed once per pass.
 # ----------------------------------------------------------------------------
+json_escape() {
+  printf '%s' "$1" \
+    | tr -d '\000-\010\013-\037' \
+    | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/\\t/g'
+}
+
 emit_log() {
   # emit_log <runner> <event> <svc_state> <diag_age_min> <api_status> <busy> <action> <result>
+  if [[ "${JSON}" -eq 1 ]]; then
+    local obj
+    obj="$(printf '{"runner":"%s","event":"%s","svc_state":"%s","diag_age_min":%s,"api_status":"%s","busy":%s,"action":"%s","result":"%s"}' \
+      "$(json_escape "$1")" "$(json_escape "$2")" "$(json_escape "$3")" "$4" \
+      "$(json_escape "$5")" "$6" "$(json_escape "$7")" "$(json_escape "$8")")"
+    JSON_RUNNERS="${JSON_RUNNERS:+${JSON_RUNNERS},}${obj}"
+    return 0
+  fi
   printf 'ts="%s" host="%s" prog="%s" runner="%s" event="%s" svc_state="%s" diag_age_min=%s api_status="%s" busy=%s action="%s" result="%s"\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${HOST_LABEL}" "${PROG_NAME}" \
     "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8"
+}
+
+# One document per pass: {"ts","host","ok","runners":[...]} where every
+# runner object is the same record emit_log writes as a log line.
+emit_json_pass() {
+  local ok="$1"
+  printf '{"ts":"%s","host":"%s","prog":"%s","ok":%s,"runners":[%s]}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(json_escape "${HOST_LABEL}")" \
+    "$(json_escape "${PROG_NAME}")" "${ok}" "${JSON_RUNNERS}"
 }
 
 # ----------------------------------------------------------------------------
@@ -449,6 +497,16 @@ remediate() {
   ${SUDO} launchctl print "system/${label}" >/dev/null 2>&1
 }
 
+# apply_remediation <label> <plist> <action>: prints the resulting status word
+# — "remediated"/"failed", or "detected" under --dry-run where nothing runs.
+apply_remediation() {
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    printf detected
+    return 0
+  fi
+  if remediate "$@"; then printf remediated; else printf failed; fi
+}
+
 # ----------------------------------------------------------------------------
 # Discover runner names (union of runner dirs + daemon plists, de-duplicated;
 # same sources and bash-3.2-safe pattern as runner-cleanup).
@@ -512,8 +570,9 @@ check_one() {
     err "${name}: ${dir} is gone but a daemon/plist remains."
     err "Run 'runner-cleanup --runner ${name#runner-}' to finish the teardown,"
     err "or re-run runner-setup to reprovision it."
+    [[ "${DRY_RUN}" -eq 1 ]] && result="detected"
     emit_log "${name}" "${issue}" "n/a" -1 "n/a" false "none" "${result}"
-    alert "${name}" "${PROG_NAME} on ${HOST_LABEL}: ${name} orphaned (dir missing) — run runner-cleanup or re-run runner-setup"
+    [[ "${DRY_RUN}" -eq 1 ]] || alert "${name}" "${PROG_NAME} on ${HOST_LABEL}: ${name} orphaned (dir missing) — run runner-cleanup or re-run runner-setup"
     record_status "${name}" "FAILED (orphaned; dir missing)"
     return 1
   fi
@@ -524,16 +583,13 @@ check_one() {
     if [[ -f "${plist}" ]]; then
       issue="daemon_not_loaded"
       action="bootstrap"
-      step "${name}: daemon not loaded but ${plist} exists; bootstrapping."
-      if remediate "${label}" "${plist}" bootstrap; then
-        result="remediated"
-        svc_state="running"
-      else
-        result="failed"
-      fi
+      step "${name}: daemon not loaded but ${plist} exists; ${ACT}bootstrap."
+      result="$(apply_remediation "${label}" "${plist}" bootstrap)"
+      [[ "${result}" != "remediated" ]] || svc_state="running"
     else
       issue="daemon_missing"
       result="failed"
+      [[ "${DRY_RUN}" -eq 0 ]] || result="detected"
       err "${name}: no LaunchDaemon AND no plist — nothing local to restart."
       err "Re-run runner-setup to reprovision ${name}."
     fi
@@ -545,13 +601,9 @@ check_one() {
     if [[ "${svc_state}" != "running" ]]; then
       issue="service_not_running"
       action="rebootstrap"
-      step "${name}: daemon loaded but state='${svc_state}'; bootout+bootstrap."
-      if remediate "${label}" "${plist}" rebootstrap; then
-        result="remediated"
-        svc_state="running"
-      else
-        result="failed"
-      fi
+      step "${name}: daemon loaded but state='${svc_state}'; ${ACT}bootout+bootstrap."
+      result="$(apply_remediation "${label}" "${plist}" rebootstrap)"
+      [[ "${result}" != "remediated" ]] || svc_state="running"
     fi
   fi
 
@@ -582,12 +634,8 @@ check_one() {
     fi
     if [[ -n "${issue}" ]]; then
       action="kickstart"
-      step "${name}: ${issue} (diag_age_min=${diag_age_min}); kickstart -k."
-      if remediate "${label}" "${plist}" kickstart; then
-        result="remediated"
-      else
-        result="failed"
-      fi
+      step "${name}: ${issue} (diag_age_min=${diag_age_min}); ${ACT}kickstart -k."
+      result="$(apply_remediation "${label}" "${plist}" kickstart)"
     fi
   fi
 
@@ -602,14 +650,14 @@ check_one() {
         api_status="missing"
         issue="unregistered"
         action="rebootstrap"
-        step "${name}: '${runner_name}' not in the GitHub runners list; bootout+bootstrap."
+        step "${name}: '${runner_name}' not in the GitHub runners list; ${ACT}bootout+bootstrap."
       else
         api_status="${lookup% *}"
         busy="${lookup#* }"
         if [[ "${api_status}" == "offline" ]]; then
           issue="offline"
           action="rebootstrap"
-          step "${name}: GitHub reports '${runner_name}' offline; bootout+bootstrap."
+          step "${name}: GitHub reports '${runner_name}' offline; ${ACT}bootout+bootstrap."
         elif [[ "${busy}" == "true" ]]; then
           # Stuck-busy needs a duration, which the API does not provide, so the
           # first-seen-busy epoch is persisted across passes in STATE_DIR.
@@ -622,7 +670,7 @@ check_one() {
             if [[ "${busy_age_min}" -gt "${BUSY_TIMEOUT_MINUTES}" ]]; then
               issue="stuck_busy"
               action="kickstart"
-              step "${name}: busy for ${busy_age_min} min (> ${BUSY_TIMEOUT_MINUTES}); kickstart -k."
+              step "${name}: busy for ${busy_age_min} min (> ${BUSY_TIMEOUT_MINUTES}); ${ACT}kickstart -k."
             fi
           fi
         else
@@ -630,11 +678,7 @@ check_one() {
         fi
       fi
       if [[ -n "${issue}" ]]; then
-        if remediate "${label}" "${plist}" "${action}"; then
-          result="remediated"
-        else
-          result="failed"
-        fi
+        result="$(apply_remediation "${label}" "${plist}" "${action}")"
       fi
     fi
   fi
@@ -649,6 +693,10 @@ check_one() {
     "${api_status}" "${busy}" "${action}" "${result}"
 
   if [[ -n "${issue}" ]]; then
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      record_status "${name}" "DETECTED (${issue}; would ${action})"
+      return 1
+    fi
     alert "${name}" \
       "${PROG_NAME} on ${HOST_LABEL}: ${name} issue=${issue} action=${action} result=${result}"
     if [[ "${result}" == "remediated" ]]; then
@@ -659,7 +707,7 @@ check_one() {
     return 1
   fi
 
-  state_remove "${STATE_DIR}/${name}.alerted"
+  [[ "${DRY_RUN}" -eq 1 ]] || state_remove "${STATE_DIR}/${name}.alerted"
   record_status "${name}" "OK"
   return 0
 }
@@ -672,10 +720,12 @@ run_pass() {
   local overall=0 name
   STATUS_NAME=()
   STATUS_RESULT=()
+  JSON_RUNNERS=""
 
   discover_runners
   if [[ ${#RUNNER_NAMES[@]} -eq 0 ]]; then
     log "No runners found under ${RUNNER_ROOT}; nothing to check."
+    [[ "${JSON}" -eq 0 ]] || emit_json_pass true
     return 0
   fi
 
@@ -690,13 +740,20 @@ run_pass() {
   done
 
   local i
-  printf '\n'
-  printf '==> Health pass %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if [[ "${JSON}" -eq 0 ]]; then
+    printf '\n'
+    printf '==> Health pass %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  fi
   for name in "${RUNNER_NAMES[@]}"; do
     if ! check_one "${name}"; then
       overall=1
     fi
   done
+
+  if [[ "${JSON}" -eq 1 ]]; then
+    emit_json_pass "$([[ "${overall}" -eq 0 ]] && echo true || echo false)"
+    return "${overall}"
+  fi
 
   printf '  %-12s %s\n' "RUNNER" "STATUS"
   printf '  %-12s %s\n' "------" "------"

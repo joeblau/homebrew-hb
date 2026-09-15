@@ -60,6 +60,7 @@ existing service configuration; perform those steps after draining active jobs.
 | Container and Git checkout acceleration | Persistent Docker worker and ordinary checkout commands | No dedicated image-pull proxy, container-init snapshotting, or safe Git mirror service. |
 | Bazel/other compiler caches | Can use workflow-configured native tool caches | No Bazel remote cache service or automatic ccache/sccache configuration. |
 | Logs and health | JSON-lines logs/metrics, watchdog, disk monitoring, token and upgrade tools | No integrated step-level CPU/memory/network timeline, JUnit ingestion, flake history, dashboard, or interactive testbox. |
+| Agent-driven CI diagnosis (Codesmith) | `--json` on health/logs/cache/builder status and the read-only `runner-mcp` server, so an operator's own Claude Code/Codex can read runner state and failed-run logs ([docs](agent-tools.md)) | No hosted background agent, GitHub App, PR-fixing automation, or agent-initiated remediation; fixes stay with the operator's `runner-*` commands. |
 | Networking | Existing pf/VPN policy helper | Private routing, DNS, registry allowlists, and host isolation need deployment-specific validation. |
 
 Blacksmith documents separate systems for

@@ -85,6 +85,21 @@ runner-logs metrics --interval 60 >> ~/Library/Logs/github-runners/runner-metric
 or run it under its own `StartInterval` LaunchDaemon and ship the resulting
 file with a second `runner-logs ship --output-dir`-style collector.
 
+## Reading logs directly (tail / jobs)
+
+Two read-only views need no sink, sudo, or state file:
+
+```sh
+runner-logs jobs --limit 10               # recent Worker completions, newest first
+runner-logs tail --runner 2 --kind worker # last 200 lines of runner-2's newest Worker log
+runner-logs tail --runner 2 --kind stderr --lines 50 --json
+```
+
+`--kind` selects `runner` (listener diag), `worker` (job diag), `stdout`, or
+`stderr` (LaunchDaemon output). `--json` wraps the result for scripts and
+agents; [agent-tools.md](agent-tools.md) documents the schema and the
+`runner-mcp` server that exposes both views.
+
 ## Running under launchd
 
 A sample plist ships in

@@ -45,6 +45,7 @@ CONSOLE_PORT="${DEFAULT_CONSOLE_PORT}"
 ASSUME_YES=0
 KEEP_DATA=0
 RAW=0
+JSON=0
 
 # Derived from the chosen scope (--org / --repo).
 SCOPE_KIND=""
@@ -95,6 +96,7 @@ COMMANDS:
   start         Bootstrap/kickstart the LaunchDaemon (must be installed).
   stop          Boot out the LaunchDaemon (plist stays installed).
   status        Show daemon, health, buckets, and disk usage (no secrets).
+                --json prints the same facts as one JSON object.
   env           Print non-secret S3 settings and an explicit S3 cache action
                 workflow example. MinIO does not implement actions/cache.
   metrics       Scrape MinIO's Prometheus endpoint and report S3 request,
@@ -110,6 +112,8 @@ SCOPE (install/env — choose exactly ONE):
 OPTIONS:
   --port N              MinIO S3 API port (default: ${DEFAULT_PORT}). Fixed at install time.
   --console-port N      MinIO web console port (default: ${DEFAULT_CONSOLE_PORT}).
+  --json                (status) Emit one JSON object on stdout; see
+                        docs/agent-tools.md for the schema.
   --raw                 (metrics) Dump the raw Prometheus exposition instead
                         of the parsed summary.
   -y, --yes             (uninstall) Do not prompt for confirmation.
@@ -430,6 +434,7 @@ parse_args() {
         CONSOLE_PORT="$2"; shift 2 ;;
       --console-port=*) CONSOLE_PORT="${1#*=}"; shift ;;
       --raw)       RAW=1; shift ;;
+      --json)      JSON=1; shift ;;
       -y|--yes)    ASSUME_YES=1; shift ;;
       --keep-data) KEEP_DATA=1; shift ;;
       -h|--help)   usage; exit 0 ;;
@@ -806,11 +811,55 @@ cmd_stop() {
   fi
 }
 
+# Escape for a JSON string: backslashes, quotes, tabs; other controls dropped.
+json_escape() {
+  printf '%s' "$1" \
+    | tr -d '\000-\010\013-\037' \
+    | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/\\t/g'
+}
+
+# Machine-readable status. Never prompts for sudo (daemon_loaded_n) and never
+# prints credentials; the "buckets" list is null when MinIO's admin client is
+# unavailable, distinguishing "unknown" from "none".
+cmd_status_json() {
+  local loaded=false healthy=false installed=false
+  [[ -r "${MINIO_ENV_FILE}" ]] && installed=true
+  daemon_loaded_n && loaded=true
+  if curl -fsS -o /dev/null --max-time 2 \
+      "http://127.0.0.1:${CACHE_PORT}/minio/health/live" 2>/dev/null; then
+    healthy=true
+  fi
+  local usage_kb=null
+  if [[ -d "${CACHE_ROOT}/data" ]]; then
+    usage_kb="$(as_user du -sk "${CACHE_ROOT}/data" 2>/dev/null | awk '{print $1}' || true)"
+    [[ "${usage_kb}" =~ ^[0-9]+$ ]] || usage_kb=null
+  fi
+  local buckets=null b first=1
+  if [[ -n "${MINIO_ROOT_USER}" ]] && command -v mc >/dev/null 2>&1; then
+    buckets=""
+    while IFS= read -r b; do
+      [[ -n "${b}" ]] || continue
+      if [[ "${first}" -eq 1 ]]; then first=0; else buckets="${buckets},"; fi
+      buckets="${buckets}\"$(json_escape "${b}")\""
+    done < <(mc_admin ls cache 2>/dev/null | awk '{print $NF}' | sed 's|/$||' || true)
+    buckets="[${buckets}]"
+  fi
+  printf '{"daemon":"%s","installed":%s,"launchd_loaded":%s,"healthy":%s,"endpoint":"http://127.0.0.1:%s","console":"http://127.0.0.1:%s","data_dir":"%s","disk_usage_kb":%s,"buckets":%s}\n' \
+    "$(json_escape "${DAEMON_LABEL}")" "${installed}" "${loaded}" "${healthy}" \
+    "${CACHE_PORT}" "${CACHE_CONSOLE_PORT}" "$(json_escape "${CACHE_ROOT}/data")" \
+    "${usage_kb}" "${buckets}"
+}
+
 cmd_status() {
   detect_platform
   require_cmds curl awk sed grep uname id dscl
   detect_user
   load_config
+
+  if [[ "${JSON}" -eq 1 ]]; then
+    cmd_status_json
+    return 0
+  fi
 
   printf '\n'
   printf '==> runner-cache status\n'
