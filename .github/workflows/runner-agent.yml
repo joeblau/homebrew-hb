@@ -1,0 +1,156 @@
+# Reusable workflow: run `runner-agent` (Claude Code) on a self-hosted macOS
+# runner to fix a failed CI run or act on an @runner-agent mention.
+#
+# Callers get the trigger block from `runner-agent snippet`; every guard rail
+# (forks, bots, author association, agent branches, one attempt per run) is
+# re-checked by `runner-agent gate` inside the job, so a permissive caller
+# `if:` cannot bypass them. The agent itself never pushes: `runner-agent
+# publish` is the only step that writes to git or GitHub.
+name: runner-agent
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: JSON array of runner labels
+        type: string
+        default: '["self-hosted", "macOS"]'
+      mention:
+        description: Trigger phrase in comments
+        type: string
+        default: "@runner-agent"
+      branch-prefix:
+        description: Prefix for branches the agent creates
+        type: string
+        default: agent/
+      model:
+        description: Claude model override (empty = Claude Code default)
+        type: string
+        default: ""
+      max-turns:
+        description: Agent turn cap per invocation
+        type: number
+        default: 60
+      max-budget-usd:
+        description: Spend cap per invocation in USD
+        type: number
+        default: 5
+      allowed-tools:
+        description: Claude Code --allowedTools list
+        type: string
+        default: "Read,Edit,Write,Glob,Grep,Bash,mcp__runner__*"
+      instructions:
+        description: Extra repository-specific instructions appended to the prompt
+        type: string
+        default: ""
+      log-lines:
+        description: Failed-step log lines fetched for a CI failure
+        type: number
+        default: 300
+      allowed-associations:
+        description: Space-separated comment author associations that may trigger the agent
+        type: string
+        default: OWNER MEMBER COLLABORATOR
+      timeout-minutes:
+        description: Job timeout
+        type: number
+        default: 45
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: false
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: false
+      AGENT_GITHUB_TOKEN:
+        description: >-
+          Optional PAT or GitHub App token used instead of GITHUB_TOKEN for
+          checkout, pushes, and PRs. Needed if CI should run on the PRs the
+          agent opens (pushes made with GITHUB_TOKEN never trigger workflows).
+        required: false
+    outputs:
+      outcome:
+        description: skipped | comment | pushed | pr
+        value: ${{ jobs.agent.outputs.outcome }}
+      pr-url:
+        description: URL of the pull request the agent opened, if any
+        value: ${{ jobs.agent.outputs.pr-url }}
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: read
+
+concurrency:
+  group: runner-agent-${{ github.repository }}-${{ github.event.workflow_run.id || github.event.comment.id || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  agent:
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    outputs:
+      outcome: ${{ steps.publish.outputs.outcome || (steps.gate.outputs.skip == 'true' && 'skipped') || '' }}
+      pr-url: ${{ steps.publish.outputs.pr_url }}
+    env:
+      GH_TOKEN: ${{ secrets.AGENT_GITHUB_TOKEN || github.token }}
+      RUNNER_AGENT_MENTION: ${{ inputs.mention }}
+      RUNNER_AGENT_BRANCH_PREFIX: ${{ inputs.branch-prefix }}
+      RUNNER_AGENT_MODEL: ${{ inputs.model }}
+      RUNNER_AGENT_MAX_TURNS: ${{ inputs.max-turns }}
+      RUNNER_AGENT_MAX_BUDGET_USD: ${{ inputs.max-budget-usd }}
+      RUNNER_AGENT_ALLOWED_TOOLS: ${{ inputs.allowed-tools }}
+      RUNNER_AGENT_INSTRUCTIONS: ${{ inputs.instructions }}
+      RUNNER_AGENT_LOG_LINES: ${{ inputs.log-lines }}
+      RUNNER_AGENT_ALLOWED_ASSOCIATIONS: ${{ inputs.allowed-associations }}
+    steps:
+      - name: Preflight (claude, runner-mcp, gh, jq, git, credentials)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          command -v runner-agent >/dev/null || {
+            echo "::error::runner-agent is not installed on this runner (brew install joeblau/hb/runner-setup && runner-agent install)"; exit 1; }
+          runner-agent check
+
+      # gate needs a git remote for the one-attempt check, but not the tree.
+      - name: Minimal checkout for gate
+        uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.AGENT_GITHUB_TOKEN || github.token }}
+          fetch-depth: 1
+          persist-credentials: true
+
+      - name: Gate
+        id: gate
+        run: runner-agent gate
+
+      - name: Checkout target ref
+        if: steps.gate.outputs.skip != 'true'
+        uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.AGENT_GITHUB_TOKEN || github.token }}
+          ref: ${{ steps.gate.outputs.ref }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Run Claude Code
+        if: steps.gate.outputs.skip != 'true'
+        id: run
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: runner-agent run
+
+      - name: Publish (commit, push, PR, or comment)
+        if: steps.gate.outputs.skip != 'true'
+        id: publish
+        run: runner-agent publish
+
+      - name: Upload agent transcript
+        if: always() && steps.gate.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: runner-agent-${{ github.run_id }}
+          path: ${{ runner.temp }}/runner-agent/
+          if-no-files-found: ignore
+          retention-days: 14

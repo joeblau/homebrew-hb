@@ -23,6 +23,7 @@ For Docker builds, configure [Colima or a remote Linux builder](docs/docker-buil
 - `runner-netisolate` — pf egress policy and VPN kill-switch for runners ([docs](docs/network-isolation.md))
 - `runner-docker-builder` — fast Docker builds via a remote Linux builder or colima ([docs](docs/docker-builds.md))
 - `runner-mcp` — read-only MCP server so Claude Code/Codex can diagnose runners, jobs, caches, and failed CI runs on this Mac ([docs](docs/agent-tools.md))
+- `runner-agent` — Claude Code as a CI-fixing agent on your runners: failed runs become PRs, `@runner-agent` mentions get done, via a reusable workflow ([docs](docs/runner-agent.md))
 
 See the [performance review and Blacksmith capability map](docs/runner-performance.md)
 for corrected integrations, remaining platform gaps, sizing guidance, and a
