@@ -8,6 +8,9 @@ brew tap joeblau/hb
 
 Provision and operate GitHub Actions self-hosted runners on macOS:
 
+Installing `runner-setup` with Homebrew also installs the Docker CLI and `jq`.
+For Docker builds, configure [Colima or a remote Linux builder](docs/docker-builds.md).
+
 - `runner-setup` / `runner-cleanup` — provision and tear down runners as system LaunchDaemons
 - `runner-ephemeral` — one-job runners, re-registered fresh after every job ([docs](docs/ephemeral-runners.md))
 - `runner-prune` — scoped checkout cleanup that preserves warm caches, with a free-space floor ([docs](docs/disk-cleanup.md))

@@ -7,9 +7,11 @@ class RunnerSetup < Formula
   url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/v1.9.1.tar.gz"
   sha256 "6d4ad7420c33ffe8c33d5827cde53c618fa0340476da8d52ba945f8100699060"
   license "MIT"
+  revision 1
 
-  depends_on :macos
+  depends_on "docker"
   depends_on "jq"
+  depends_on :macos
 
   def install
     bin.install %w[
