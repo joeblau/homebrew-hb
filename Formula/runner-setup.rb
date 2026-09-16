@@ -4,10 +4,9 @@
 class RunnerSetup < Formula
   desc "Provision and tear down GitHub Actions self-hosted runners on macOS"
   homepage "https://github.com/joeblau/homebrew-hb"
-  url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/v1.9.1.tar.gz"
-  sha256 "6d4ad7420c33ffe8c33d5827cde53c618fa0340476da8d52ba945f8100699060"
+  url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/v1.10.0.tar.gz"
+  sha256 "a139986819888c45019823e0e9d2e8cbc3940955d759632453c080a5a65a21ac"
   license "MIT"
-  revision 1
 
   depends_on "docker"
   depends_on "jq"
@@ -27,6 +26,8 @@ class RunnerSetup < Formula
       runner-token
       runner-netisolate
       runner-docker-builder
+      runner-mcp
+      runner-agent
     ]
   end
 
@@ -86,8 +87,10 @@ class RunnerSetup < Formula
       runner-token
       runner-netisolate
       runner-docker-builder
+      runner-mcp
+      runner-agent
     ].each do |tool|
-      assert_match "USAGE", shell_output("#{bin}/#{tool} --help")
+      assert_match "USAGE", shell_output("#{bin}/#{tool} --help 2>&1")
     end
 
     # No registration scope chosen must fail with exit 2 and a clear message.
