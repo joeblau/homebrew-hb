@@ -26,6 +26,8 @@ class RunnerSetup < Formula
       runner-token
       runner-netisolate
       runner-docker-builder
+      runner-bazel-cache
+      runner-git-mirror
       runner-mcp
       runner-agent
     ]
@@ -87,6 +89,8 @@ class RunnerSetup < Formula
       runner-token
       runner-netisolate
       runner-docker-builder
+      runner-bazel-cache
+      runner-git-mirror
       runner-mcp
       runner-agent
     ].each do |tool|

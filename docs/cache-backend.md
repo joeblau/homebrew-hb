@@ -8,8 +8,11 @@ Actions jobs on one Mac. It runs as the invoking non-root user through the
 **MinIO is not a replacement endpoint for `actions/cache`.** GitHub's current
 cache client uses authenticated cache service RPCs, which differ from S3.
 Changing `ACTIONS_CACHE_URL` or `ACTIONS_RESULTS_URL` to a MinIO address cannot
-make that protocol work. Use an action that explicitly supports S3, or keep
-GitHub's built-in caching. See the [GitHub cache client](https://github.com/actions/toolkit/blob/main/packages/cache/src/internal/shared/cacheTwirpClient.ts).
+make that protocol work. Use an action that explicitly supports S3, keep
+GitHub's built-in caching, or install the optional
+[GitHub-protocol gateway](#github-actions-cache-protocol-gateway-optional),
+which implements those RPCs in front of MinIO. See the
+[GitHub cache client](https://github.com/actions/toolkit/blob/main/packages/cache/src/internal/shared/cacheTwirpClient.ts).
 
 ## Install and configure
 
@@ -128,7 +131,89 @@ sudo launchctl bootstrap system /Library/LaunchDaemons/com.github.runner-1.plist
 
 A `kickstart` alone restarts the loaded job definition; it does not reload an
 edited plist. Add the explicit S3 action above to opt into the local cache.
-Existing unambiguous legacy scope files are reused on reinstall.
+Existing unambiguous legacy scope files are reused on reinstall. The supported
+way to redirect `ACTIONS_CACHE_URL` / `ACTIONS_RESULTS_URL` is the managed
+[gateway](#github-actions-cache-protocol-gateway-optional) below, not manual
+overrides pointed at MinIO.
+
+## GitHub Actions cache protocol gateway (optional)
+
+`runner-cache gateway install --repo acme/monorepo` runs a second LaunchDaemon,
+`com.github.runner-cache-gateway`, alongside MinIO. It is a Python-stdlib HTTP
+server (emitted to `/opt/github-runner-cache/bin/cache-gateway.py` at install
+time) that implements the GitHub Actions cache service Twirp v2 JSON endpoints
+— `CreateCacheEntry`, `FinalizeCacheEntry`, `GetCacheEntryDownloadURL`, and
+`DeleteCacheEntry` under
+`/twirp/github.actions.results.api.v1.CacheService/` — backed by the same
+per-scope MinIO buckets. It listens on loopback only (default port 9157,
+change with `--gateway-port` on first install). Archives are stored as
+`<key>/<version>` objects in the scope bucket; the gateway answers RPCs with
+SigV4 presigned URLs, so upload and download bytes flow directly between the
+job and MinIO and never pass through the gateway process.
+
+`gateway install` mints a per-scope bearer token into the scope's 0600 env
+file (`GATEWAY_TOKEN`), reusing it on reinstall. A token authenticates gateway
+calls and maps to exactly one scope's bucket and credentials; one gateway
+serves every scope that has a token. `gateway env` prints the non-secret
+wiring on stdout:
+
+```sh
+ACTIONS_CACHE_URL=http://127.0.0.1:9157/
+ACTIONS_RESULTS_URL=http://127.0.0.1:9157/
+ACTIONS_CACHE_SERVICE_V2=true
+```
+
+and on stderr explains how to append those lines — plus
+`ACTIONS_RUNTIME_TOKEN` set to the scope's `GATEWAY_TOKEN` value — to a
+runner's `.env` file (mode 0600, next to `run.sh`), then restart that runner
+while idle. Standard `actions/cache` (v4, service v2) then stores entries in
+the local bucket. Caveats:
+
+- `ACTIONS_RUNTIME_TOKEN` is also used by GitHub's cache, artifact, and
+  results clients, so GitHub-hosted cache/artifact calls fail on a wired
+  runner. Wire only runners dedicated to local caching.
+- Every job on a wired runner inherits the token, including PR jobs. Only
+  wire runners that run trusted workflows; keep untrusted fork jobs on
+  unwired runners.
+- The explicit S3 action flow (`tespkg/actions-cache`) is unaffected and both
+  integrations can run side by side.
+
+### Branch authorization and its limits
+
+`gateway install --save-prefix PREFIX` (repeatable) writes the scope's SAVE
+policy to `config/scopes/<slug>.save-policy`: one allowed cache-key prefix per
+line, `*` alone allows every key (the default), and restore is never
+restricted — matching `actions/cache` `restore-keys` semantics, where any ref
+may read caches written by permitted keys. `CreateCacheEntry`,
+`FinalizeCacheEntry`, and `DeleteCacheEntry` require a matching prefix;
+`GetCacheEntryDownloadURL` does not. Convention: embed the branch in keys,
+e.g. `key: brew-${{ github.ref_name }}-${{ hashFiles('**/Brewfile.lock.json') }}`,
+and set `--save-prefix main-` so only keys naming the default branch can save.
+
+Be honest about what this cannot enforce:
+
+- The cache protocol carries no branch or ref field. The gateway sees only the
+  key string, so "branch authorization" is key-prefix policy by naming
+  convention. A job can claim any prefix it is allowed to use.
+- The entry `version` is an opaque client-computed hash of the key, paths, and
+  compression settings; the gateway cannot verify that an uploaded archive
+  matches the key it claims. Any job holding the runner's token can write
+  arbitrary content under an allowed prefix — cache poisoning is bounded by
+  the prefix policy, not eliminated.
+- Forks and pull requests on a wired runner share that runner's token. The
+  policy file plus runner dedication is the whole boundary; do not treat it as
+  GitHub's per-ref cache isolation.
+
+### Gateway operations and scope
+
+`gateway start` / `gateway stop` manage the daemon; `gateway status [--json]`
+reports daemon, health (`GET /healthz`), and authorized scope count without
+secrets. `runner-cache uninstall` also removes the gateway daemon and plist.
+
+Distributed operation is intentionally **not implemented**: one gateway and
+one MinIO per Mac, loopback only, no cross-host cache sharing, and no
+reachability from GitHub-hosted runners or Docker VMs. For remote runners,
+use a reachable TLS S3 endpoint with the explicit S3 action instead.
 
 ## Scope boundaries and operations
 
@@ -165,6 +250,9 @@ persist across rotation.
 | `start` / `stop` | Start or stop MinIO; `start` fails if health does not recover. |
 | `status [--json]` | Report daemon, health, buckets, and disk usage; `--json` for scripts and agents ([schema](agent-tools.md)). |
 | `metrics [--raw]` | Report S3 request/error/traffic counters, or raw Prometheus output. |
+| `gateway install (--org ORG \| --repo OWNER/REPO) [--gateway-port N] [--save-prefix P]...` | Install the GitHub-protocol cache gateway daemon and mint the scope's bearer token. |
+| `gateway env [--org ORG \| --repo OWNER/REPO]` | Print ACTIONS_CACHE_URL/ACTIONS_RESULTS_URL wiring for standard actions/cache; token stays in the 0600 scope file. |
+| `gateway start` / `gateway stop` / `gateway status [--json]` | Manage the gateway daemon. |
 | `uninstall [--yes] [--keep-data]` | Remove the daemon. `--keep-data` preserves **both data and credentials/config** for reinstall; otherwise all cache files are removed. |
 
 Local metrics are at `http://127.0.0.1:9000/minio/v2/metrics/cluster`; public

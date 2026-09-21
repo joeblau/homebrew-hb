@@ -14,10 +14,19 @@ searchable sink. It has two modes:
   not advanced and those lines are re-sent on the next pass.
 - **`runner-logs metrics`** — emits one JSON line per runner per interval to
   stdout (see the schema below).
+- **`runner-logs steps`** — samples per-runner CPU/memory with `ps` while
+  jobs run and correlates the samples with step boundaries parsed from
+  Worker logs, emitting one JSON line per step (see below).
+- **`runner-logs tests`** — ingests JUnit XML results into a JSON-lines
+  history database and reports per-suite counts and flaky tests.
+- **`runner-logs dashboard`** — writes a self-contained static HTML report
+  (runner status, recent jobs, top flaky tests).
 
 No `jq` dependency, bash 3.2 compatible. Ship mode runs read-only against
 `/opt` and needs **no sudo**; metrics mode uses sudo only for
-`launchctl print system/...`.
+`launchctl print system/...`. The `steps`, `tests`, and `dashboard` modes
+additionally need `python3` (standard library only) for the heavier parsing
+and rendering; they stay read-only against `/opt` and need no sudo either.
 
 ## Quick start
 
@@ -99,6 +108,85 @@ runner-logs tail --runner 2 --kind stderr --lines 50 --json
 `stderr` (LaunchDaemon output). `--json` wraps the result for scripts and
 agents; [agent-tools.md](agent-tools.md) documents the schema and the
 `runner-mcp` server that exposes both views.
+
+## Step timelines (steps mode)
+
+`runner-logs steps` builds a per-step resource timeline:
+
+- While running (default), every `--interval` seconds it takes one `ps`
+  sample per runner — the summed CPU % and RSS of every process whose
+  command line references the runner directory (`runner-N/bin/Runner.Worker`,
+  step scripts under `runner-N/_work/`, ...) — and appends it as a JSON line
+  to the samples file (`~/.runner-logs/steps-samples.jsonl`, override with
+  `--samples-file`). Sampling is read-only and needs no sudo.
+- Each pass also parses `Worker_*.log` step boundaries
+  (`StepsRunner] Processing step: DisplayName='...'` and `Step result: ...`
+  lines) and emits one JSON line per newly completed step, with the samples
+  that fall inside the step's time window aggregated in. Per-file progress
+  is tracked in `~/.runner-logs/steps-state.tsv`, so restarts never
+  re-emit a step.
+- `--once` skips sampling entirely and reconstructs post-hoc: every
+  completed step in every Worker log, correlated against the recorded
+  samples.
+
+```sh
+runner-logs steps --interval 5        # continuous: sample + emit
+runner-logs steps --once              # post-hoc reconstruction, all runners
+runner-logs steps --once --runner 1   # just runner-1
+```
+
+Step record schema (stdout, one JSON object per line):
+
+```json
+{"runner":"runner-1","job":"build","job_result":"Failed","step":"Run tests","result":"Failed","start":"2026-09-01T10:00:21Z","end":"2026-09-01T10:02:00Z","duration_s":99,"samples":2,"cpu_mean_pct":40.0,"cpu_peak_pct":50.0,"rss_peak_mb":300,"file":"/opt/github-runners/runner-1/_diag/Worker_20260901-100000-utc.log"}
+```
+
+`cpu_mean_pct` / `cpu_peak_pct` / `rss_peak_mb` are `null` when no recorded
+sample falls inside the step window (e.g. `--once` on a host that never ran
+`steps` continuously). Steps still open at the end of a log are not emitted
+until they close.
+
+## JUnit ingestion and flake history (tests mode)
+
+```sh
+runner-logs tests ingest --junit-glob '/opt/github-runners/runner-*/_work/**/*.xml'
+runner-logs tests ingest path/to/junit.xml another.xml
+runner-logs tests report
+runner-logs tests report --suite unit --json
+```
+
+- `tests ingest` parses JUnit XML files (positional paths and repeatable
+  `--junit-glob` globs; `**` recurses; `RUNNER_LOGS_JUNIT_GLOBS` supplies a
+  colon-separated default) and appends one JSON record per
+  (file, testsuite) to the history database
+  (`~/.runner-logs/test-history.jsonl`, override with `--history-file`).
+  Files whose path+mtime are already recorded are skipped, so ingest is
+  safe to run from cron/launchd.
+- `tests report` prints per-suite run/pass/fail/error/skip counts across all
+  recorded runs, then the flaky tests: tests whose status flips between
+  consecutive runs of the same suite, sorted by flip count (`--limit`).
+  `--json` emits `{"suites":[...],"flaky":[...]}` for scripts and agents.
+
+History record schema (one JSON object per line):
+
+```json
+{"ts":"2026-09-21T15:00:00Z","source":"/opt/github-runners/runner-1/_work/repo/junit.xml","source_mtime":1790000000,"suite":"unit","tests":2,"failures":1,"errors":0,"skipped":0,"cases":[{"name":"test_a","classname":"mod","status":"failed","time_s":0.1}]}
+```
+
+## Static dashboard (dashboard mode)
+
+```sh
+runner-logs dashboard                              # ~/.runner-logs/dashboard.html
+runner-logs dashboard --output ~/Desktop/runners.html --limit 10
+```
+
+Writes a single self-contained HTML file (inline CSS, no external assets,
+no JavaScript) with three tables: per-runner online status (inferred from
+diag logs only — a runner counts as online when its newest `Runner_*.log`
+was touched in the last 10 minutes; no sudo), recent job results and
+durations (the same data as `runner-logs jobs`), and the top flaky tests
+from the tests history database. Regenerate it on a schedule with the same
+launchd pattern as ship mode.
 
 ## Running under launchd
 
@@ -225,7 +313,10 @@ Then in Kibana (data view `github-runners-*`):
 
 - **State file:** `~/.runner-logs/offsets.tsv` (override with
   `--state-file`). Delete it to re-ship everything. One entry per log file:
-  path, inode, byte offset.
+  path, inode, byte offset. The `steps` mode keeps its own files alongside:
+  `steps-samples.jsonl` (ps samples, append-only) and `steps-state.tsv`
+  (per-Worker-file emitted-step counts); the `tests` history lives in
+  `test-history.jsonl`.
 - **Rotation:** runner `_diag` files rotate per run/session; a changed inode
   or shrunken file resets that file's offset to 0, so nothing is skipped.
 - **Duplicates:** delivery is at-least-once. After a sink outage the affected

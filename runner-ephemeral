@@ -21,6 +21,20 @@
 # KeepAlive/ThrottleInterval restarts it. It runs as the invoking (non-root)
 # user like every other runner process — no sudo, and we never set
 # RUNNER_ALLOW_RUNASROOT.
+#
+# Opt-in hardening (off by default; see docs/ephemeral-runners.md):
+#   --sandbox             run each job's runner service under a generated
+#                         sandbox-exec profile that restricts filesystem
+#                         writes to the runner tree, temp dirs, and any
+#                         --sandbox-cache-path directories
+#   --sandbox-deny-network  sandbox variant that also denies network*
+#   --sandbox-cache-path DIR  extra writable directory (repeatable)
+#   --snapshot-rollback   when the runner root sits on an APFS volume, take a
+#                         local snapshot after each registration and restore
+#                         _work from it between jobs, falling back to the
+#                         rm -rf cleanup whenever snapshots are unavailable
+#                         or fail (cleanup is never skipped)
+# Full VM/image isolation and host snapshot rollback stay out of scope.
 
 set -euo pipefail
 
@@ -39,6 +53,13 @@ LABELS="macos,macmini,self-hosted"
 NAME_ARG=""             # --name fallback; .runner's agentName wins each cycle
 PAT_FILE=""             # fallback PAT location; defaults to ${DIR}/.github_pat
 MAX_FAILURES=5
+SANDBOX=0             # --sandbox: wrap the runner service in sandbox-exec
+SANDBOX_DENY_NETWORK=0 # --sandbox-deny-network: add (deny network*)
+SANDBOX_CACHE_PATHS=() # --sandbox-cache-path (repeatable, extra writable dirs)
+SANDBOX_PROFILE_FILE=""
+SNAPSHOT_ROLLBACK=0   # --snapshot-rollback: APFS snapshot restore of _work
+SNAPSHOT_NAME=""      # com.apple.TimeMachine.YYYY-MM-DD-HHMMSS
+SNAPSHOT_DATE=""      # YYYY-MM-DD-HHMMSS (tmutil deletelocalsnapshot arg)
 
 GITHUB_PAT_VALUE=""
 RUNNER_URL=""
@@ -85,12 +106,37 @@ OPTIONS:
   --api-url URL       GitHub API base (default: ${GITHUB_API})
   --max-failures N    Consecutive re-registration failures before giving up
                       and exiting non-zero for launchd to restart (default: ${MAX_FAILURES})
+  --sandbox           Run each job's runner service under a generated
+                      sandbox-exec profile: filesystem writes are denied
+                      except inside RUNNER_DIR, temp dirs, /dev essentials,
+                      and any --sandbox-cache-path directories. sandbox-exec
+                      is deprecated but still shipped with macOS; the profile
+                      is a best-effort seatbelt, not a security boundary.
+  --sandbox-deny-network
+                      Sandbox variant that also denies ALL network operations
+                      for the sandboxed tree (implies --sandbox). NOTE: this
+                      also blocks the runner listener's own GitHub connection;
+                      runner-netisolate's pf rules are the supported network
+                      control. See docs/ephemeral-runners.md.
+  --sandbox-cache-path DIR
+                      Extra directory the sandboxed job may write to
+                      (repeatable; e.g. a shared package cache).
+  --snapshot-rollback When RUNNER_DIR sits on an APFS volume, take a local
+                      snapshot (tmutil localsnapshot) after each registration
+                      and restore _work from it between jobs. Falls back to
+                      the rm -rf cleanup whenever snapshots are unavailable
+                      or fail — cleanup is never skipped. Snapshot mount and
+                      tmutil may require NOPASSWD sudo for tmutil/mount_apfs/
+                      umount; sudo is never used for anything else here.
   -h, --help          Show this help and exit
 
 EXAMPLES:
   GITHUB_PAT=ghp_... ${PROG_NAME} --dir /opt/github-runners/runner-1 --org acme
   ${PROG_NAME} --dir /opt/github-runners/runner-2 --repo acme/monorepo \
     --labels macos,macmini,self-hosted,ephemeral
+  ${PROG_NAME} --dir /opt/github-runners/runner-3 --org acme \
+    --sandbox --sandbox-cache-path /opt/github-runners/shared-cache \
+    --snapshot-rollback
 
 SECURITY NOTE:
   The PAT needs admin:org (org runners) or repo (repo runners) scope. Prefer
@@ -149,6 +195,14 @@ parse_args() {
         [[ $# -ge 2 ]] || { err "--max-failures requires a value"; usage; exit 2; }
         MAX_FAILURES="$2"; shift 2 ;;
       --max-failures=*) MAX_FAILURES="${1#*=}"; shift ;;
+      --sandbox)     SANDBOX=1; shift ;;
+      --sandbox-deny-network)
+        SANDBOX=1; SANDBOX_DENY_NETWORK=1; shift ;;
+      --sandbox-cache-path)
+        [[ $# -ge 2 ]] || { err "--sandbox-cache-path requires a value"; usage; exit 2; }
+        SANDBOX_CACHE_PATHS+=("$2"); shift 2 ;;
+      --sandbox-cache-path=*) SANDBOX_CACHE_PATHS+=("${1#*=}"); shift ;;
+      --snapshot-rollback) SNAPSHOT_ROLLBACK=1; shift ;;
       -h|--help)   usage; exit 0 ;;
       *)
         err "Unknown argument: $1"
@@ -181,6 +235,7 @@ parse_args() {
   fi
 
   [[ -n "${PAT_FILE}" ]] || PAT_FILE="${DIR}/.github_pat"
+  [[ -n "${SANDBOX_PROFILE_FILE}" ]] || SANDBOX_PROFILE_FILE="${DIR}/.sandbox-exec.sb"
   [[ -n "${API_URL}" ]] || API_URL="${GITHUB_API}"
   while [[ "${API_URL}" == */ ]]; do API_URL="${API_URL%/}"; done
 }
@@ -302,9 +357,188 @@ shutdown() {
     kill -TERM "${CHILD_PID}" 2>/dev/null || true
     wait "${CHILD_PID}" 2>/dev/null || true
   fi
+  if [[ "${SNAPSHOT_ROLLBACK}" -eq 1 ]]; then
+    delete_workspace_snapshot || true
+  fi
   exit 0
 }
 trap shutdown TERM INT
+
+# ----------------------------------------------------------------------------
+# OPT-IN: sandboxed job execution (--sandbox). generate_sandbox_profile is a
+# pure function (arguments in, SBPL profile on stdout) so it is testable
+# without sandbox-exec. The profile is permissive by default and denies only
+# filesystem writes outside the runner tree, temp dirs, /dev essentials, and
+# operator-designated cache paths. sandbox-exec is deprecated-but-present on
+# macOS; this is a best-effort seatbelt, not a security boundary. For network
+# policy, runner-netisolate's pf anchor remains the stronger control.
+# ----------------------------------------------------------------------------
+generate_sandbox_profile() {
+  local dir="$1" deny_network="$2"
+  shift 2
+  cat <<EOF
+(version 1)
+;; Generated by runner-ephemeral --sandbox. Default-allow except file writes,
+;; which are confined to the runner tree, temp dirs, /dev essentials, and any
+;; operator-designated cache paths.
+(allow default)
+(deny file-write*)
+(allow file-write*
+  (subpath "${dir}")
+  (subpath "/private/tmp")
+  (subpath "/private/var/tmp")
+  (subpath "/private/var/folders"))
+(allow file-write*
+  (literal "/dev/null")
+  (literal "/dev/zero")
+  (literal "/dev/random")
+  (literal "/dev/urandom")
+  (literal "/dev/ptmx")
+  (literal "/dev/tty")
+  (regex #"^/dev/ttys[0-9]+$"))
+EOF
+  local cache_path
+  for cache_path in "$@"; do
+    printf '(allow file-write* (subpath "%s"))\n' "${cache_path}"
+  done
+  if [[ "${deny_network}" == "1" ]]; then
+    cat <<'EOF'
+;; Network-deny variant: blocks ALL network operations for the sandboxed
+;; tree — including the runner listener's own GitHub connection. Prefer
+;; runner-netisolate (pf) for network policy.
+(deny network*)
+EOF
+  fi
+}
+
+# Writes the generated profile to SANDBOX_PROFILE_FILE. Returns non-zero when
+# sandboxing cannot be honored, so the caller backs off instead of running an
+# unsandboxed job the operator asked to be confined.
+prepare_sandbox_profile() {
+  if ! command -v sandbox-exec >/dev/null 2>&1; then
+    warn "--sandbox requested but sandbox-exec is not available on this system."
+    return 1
+  fi
+  [[ -n "${SANDBOX_PROFILE_FILE}" ]] || SANDBOX_PROFILE_FILE="${DIR}/.sandbox-exec.sb"
+  if [[ ${#SANDBOX_CACHE_PATHS[@]} -gt 0 ]]; then
+    local cache_path
+    for cache_path in "${SANDBOX_CACHE_PATHS[@]}"; do
+      [[ -d "${cache_path}" ]] || warn "sandbox cache path does not exist: ${cache_path}"
+    done
+    generate_sandbox_profile "${DIR}" "${SANDBOX_DENY_NETWORK}" "${SANDBOX_CACHE_PATHS[@]}" \
+      > "${SANDBOX_PROFILE_FILE}" || return 1
+  else
+    generate_sandbox_profile "${DIR}" "${SANDBOX_DENY_NETWORK}" \
+      > "${SANDBOX_PROFILE_FILE}" || return 1
+  fi
+  step "sandbox-exec profile written to ${SANDBOX_PROFILE_FILE}"
+}
+
+# ----------------------------------------------------------------------------
+# OPT-IN: APFS snapshot rollback of the workspace (--snapshot-rollback). A
+# local snapshot is taken right after each successful registration (the clean
+# baseline); the next cycle restores _work from a read-only mount of that
+# snapshot. Every failure falls back to the rm -rf cleanup — a snapshot
+# failure NEVER skips cleanup. tmutil/mount_apfs/umount may need NOPASSWD
+# sudo; `sudo -n` is used so a missing sudoers entry fails fast (and falls
+# back) instead of prompting. This is host-level workspace rollback only —
+# full host/VM image snapshots remain out of scope.
+# ----------------------------------------------------------------------------
+workspace_mount_point() {
+  df -P "${DIR}" 2>/dev/null | awk 'NR == 2 { $1=$2=$3=$4=$5=""; sub(/^ +/, ""); print }'
+}
+
+workspace_device() {
+  df -P "${DIR}" 2>/dev/null | awk 'NR == 2 { print $1 }'
+}
+
+workspace_is_apfs() {
+  diskutil info "${DIR}" 2>/dev/null \
+    | grep -qiE 'File System Personality: *APFS|Type \(Bundle\): *apfs' \
+    || return 1
+}
+
+delete_workspace_snapshot() {
+  [[ -n "${SNAPSHOT_DATE}" ]] || return 0
+  tmutil deletelocalsnapshot "${SNAPSHOT_DATE}" >/dev/null 2>&1 \
+    || sudo -n tmutil deletelocalsnapshot "${SNAPSHOT_DATE}" >/dev/null 2>&1 \
+    || warn "Could not delete local snapshot ${SNAPSHOT_NAME} (Time Machine will purge it)."
+  SNAPSHOT_DATE=""
+  SNAPSHOT_NAME=""
+  return 0
+}
+
+take_workspace_snapshot() {
+  if ! command -v tmutil >/dev/null 2>&1; then
+    warn "tmutil not found; snapshot rollback unavailable."
+    return 1
+  fi
+  if ! workspace_is_apfs; then
+    warn "${DIR} is not on an APFS volume; snapshot rollback unavailable."
+    return 1
+  fi
+  local mount output date
+  mount="$(workspace_mount_point)"
+  if [[ -z "${mount}" ]]; then
+    warn "Could not determine the mount point of ${DIR}."
+    return 1
+  fi
+  if ! output="$(tmutil localsnapshot "${mount}" 2>/dev/null)"; then
+    if ! output="$(sudo -n tmutil localsnapshot "${mount}" 2>/dev/null)"; then
+      warn "tmutil localsnapshot failed (needs root or a NOPASSWD sudoers entry)."
+      return 1
+    fi
+  fi
+  date="$(printf '%s\n' "${output}" | sed -n 's/.*[Dd]ate: *//p' | head -n1)"
+  if ! [[ "${date}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}$ ]]; then
+    warn "Could not parse a snapshot date from tmutil output."
+    return 1
+  fi
+  # Keep at most one baseline snapshot at a time.
+  delete_workspace_snapshot
+  SNAPSHOT_DATE="${date}"
+  SNAPSHOT_NAME="com.apple.TimeMachine.${date}"
+  step "APFS workspace baseline snapshot: ${SNAPSHOT_NAME}"
+  return 0
+}
+
+restore_workspace_snapshot() {
+  [[ -n "${SNAPSHOT_NAME}" && -n "${SNAPSHOT_DATE}" ]] || return 1
+  workspace_is_apfs || return 1
+  local device mount_point
+  device="$(workspace_device)"
+  mount_point="${DIR}/.snapshot-mnt.$$"
+  if [[ -z "${device}" ]] || ! mkdir -p "${mount_point}"; then
+    return 1
+  fi
+  local rc=0
+  if sudo -n /sbin/mount_apfs -r -s "${SNAPSHOT_NAME}" "${device}" "${mount_point}" 2>/dev/null; then
+    if [[ -d "${mount_point}${DIR}/_work" ]]; then
+      rsync -a --delete "${mount_point}${DIR}/_work/" "${DIR}/_work/" 2>/dev/null || rc=1
+    else
+      # _work did not exist at snapshot time; the clean baseline is empty.
+      rm -rf "${DIR}/_work" 2>/dev/null || rc=1
+    fi
+    sudo -n umount "${mount_point}" 2>/dev/null || rc=1
+  else
+    rc=1
+  fi
+  rmdir "${mount_point}" 2>/dev/null || true
+  return "${rc}"
+}
+
+# Reset _work for the next cycle: snapshot restore when enabled and possible,
+# the rm -rf cleanup otherwise. Never returns success without having reset.
+reset_workspace() {
+  if [[ "${SNAPSHOT_ROLLBACK}" -eq 1 && -n "${SNAPSHOT_NAME}" ]]; then
+    if restore_workspace_snapshot; then
+      step "Workspace restored from APFS snapshot ${SNAPSHOT_NAME}."
+      return 0
+    fi
+    warn "Snapshot restore failed; falling back to rm -rf workspace cleanup."
+  fi
+  rm -rf "${DIR}/_work"
+}
 
 # ----------------------------------------------------------------------------
 # Fetch a FRESH registration token (never logged). Returns non-zero on any
@@ -365,9 +599,11 @@ read_saved_identity() {
 # ----------------------------------------------------------------------------
 # Wipe job output and registration residue so every cycle starts from a
 # reset workspace (binaries, operator configuration, and _diag logs are kept).
+# _work goes through reset_workspace, which honors --snapshot-rollback and
+# always falls back to rm -rf.
 # ----------------------------------------------------------------------------
 wipe_state() {
-  rm -rf "${DIR}/_work" || return 1
+  reset_workspace || return 1
   rm -f "${DIR}/.runner" "${DIR}/.credentials" \
         "${DIR}/.credentials_rsaparams" || return 1
   # .env/.path are operator service/toolchain configuration. Retain job hooks
@@ -431,15 +667,37 @@ run_cycle() {
   fi
   log "Registered ephemeral runner '${RUNNER_NAME}'. Waiting for one job..."
 
+  # OPT-IN: capture the clean post-registration baseline so the next cycle
+  # can restore _work from an APFS snapshot instead of deleting it.
+  if [[ "${SNAPSHOT_ROLLBACK}" -eq 1 ]]; then
+    if ! take_workspace_snapshot; then
+      warn "Snapshot unavailable; workspace resets use rm -rf cleanup this cycle."
+    fi
+  fi
+
+  # OPT-IN: sandbox the runner service. Failing to honor an explicit
+  # --sandbox request fails the cycle (with backoff) rather than running
+  # unconfined.
+  if [[ "${SANDBOX}" -eq 1 ]] && ! prepare_sandbox_profile; then
+    return 1
+  fi
+
   # runsvc.sh is the service entrypoint (translates TERM->INT); it resolves
   # .path/externals/RunnerService.js relative to CWD, so run it from ${DIR}.
   # Foreground from OUR perspective: background + wait so the TERM trap can
   # forward signals to the child.
   local run_rc=0
-  (
-    cd "${DIR}" || exit 1
-    ACTIONS_RUNNER_SVC=1 exec ./bin/runsvc.sh
-  ) &
+  if [[ "${SANDBOX}" -eq 1 ]]; then
+    (
+      cd "${DIR}" || exit 1
+      ACTIONS_RUNNER_SVC=1 exec sandbox-exec -f "${SANDBOX_PROFILE_FILE}" ./bin/runsvc.sh
+    ) &
+  else
+    (
+      cd "${DIR}" || exit 1
+      ACTIONS_RUNNER_SVC=1 exec ./bin/runsvc.sh
+    ) &
+  fi
   CHILD_PID=$!
   wait "${CHILD_PID}" && run_rc=0 || run_rc=$?
   CHILD_PID=""
@@ -488,4 +746,6 @@ main() {
   done
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

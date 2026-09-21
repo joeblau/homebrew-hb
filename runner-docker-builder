@@ -7,21 +7,30 @@
 #   runner-docker-builder setup-colima [--cpu N] [--mem GB] [--disk GB]
 #   runner-docker-builder use-desktop
 #   runner-docker-builder status
+#   runner-docker-builder gc status [--builder NAME]
+#   runner-docker-builder gc configure [--builder NAME] [GC overrides]
+#   runner-docker-builder registry-mirror setup|teardown|status [options]
 #
 # Use persistent BuildKit workers to retain layers and dependency caches.
 # Performance depends on the worker's CPU, storage, architecture, and network:
 #
-#   setup-remote   Build on a remote Linux Docker host over SSH using a
-#                  persistent docker-container BuildKit builder.
-#   setup-colima   Build locally via colima (a lightweight Lima VM) instead of
-#                  Docker Desktop, retaining local VM and BuildKit state.
-#   use-desktop    Revert to Docker Desktop's built-in builder.
-#   status         Show which builder is active and how it is reachable.
+#   setup-remote     Build on a remote Linux Docker host over SSH using a
+#                    persistent docker-container BuildKit builder.
+#   setup-colima     Build locally via colima (a lightweight Lima VM) instead of
+#                    Docker Desktop, retaining local VM and BuildKit state.
+#   use-desktop      Revert to Docker Desktop's built-in builder.
+#   status           Show which builder is active and how it is reachable.
+#   gc               Show BuildKit disk usage and manage garbage-collection
+#                    policy via a buildkitd config applied at builder creation.
+#   registry-mirror  Run a registry:2 pull-through cache and wire it into
+#                    BuildKit and the Docker daemon (loopback binding only).
 #
 # Run as the same non-root user as the runner service (see runner-setup).
 # Client/Colima configuration uses that user's directories; BuildKit state
 # lives on its Docker host. Homebrew manages CLI installations in its prefix.
-# This script never invokes sudo or changes runner LaunchDaemons.
+# This script never invokes sudo on the macOS host and never changes runner
+# LaunchDaemons. Writing buildkitd.toml inside the throwaway Colima VM uses
+# that VM's own non-interactive (passwordless) sudo via `colima ssh`.
 
 set -euo pipefail
 
@@ -31,14 +40,30 @@ set -euo pipefail
 PROG_NAME="$(basename "$0")"
 REMOTE_BUILDER_NAME="runner-remote"
 COLIMA_BUILDER_NAME="runner-colima"
+MIRROR_CONTAINER_NAME="runner-registry-mirror"
+MIRROR_VOLUME_NAME="runner-registry-mirror-data"
 
 COMMAND=""
-SSH_HOST=""            # setup-remote: ssh://user@linux-builder (or BUILDER_SSH_HOST)
+SUBCOMMAND=""          # gc: status|configure; registry-mirror: setup|teardown|status
+SSH_HOST=""            # setup-remote / registry-mirror: ssh://user@linux-builder (or BUILDER_SSH_HOST)
 PLATFORM=""            # optional CSV of target platforms for the builder
 COLIMA_CPU=4           # setup-colima defaults
 COLIMA_MEM=8           # GiB
 COLIMA_DISK=60         # GiB
 JSON=0                 # status --json
+BUILDER_NAME=""        # --builder for gc / registry-mirror
+VERBOSE=0              # gc status --verbose
+COLIMA_VM=0            # gc configure --colima-vm (VM daemon's embedded BuildKit)
+GC_KEEP_BYTES_GB=20    # gc configure: keepBytes for the default GC rules (GiB)
+GC_RESERVED_GB=10      # gc configure: reservedSpace (GiB)
+GC_MAX_USED_GB=50      # gc configure: maxUsedSpace (GiB)
+GC_KEEP_HOURS=48       # gc configure: keepDuration for cache mounts/sources (hours)
+MIRROR_PORT=5001       # registry-mirror (5000 is macOS AirPlay Receiver)
+MIRROR_BIND="127.0.0.1"
+MIRROR_UPSTREAM="https://registry-1.docker.io"
+MIRROR_CONTEXT=""      # registry-mirror --context
+MIRROR_TARGET_KIND=""  # resolved: colima | desktop | remote | other
+MIRROR_REMOVE_DATA=0   # registry-mirror teardown --remove-data
 
 # ----------------------------------------------------------------------------
 # Output helpers — progress goes to stderr.
@@ -57,6 +82,11 @@ USAGE:
   ${PROG_NAME} setup-colima [options]
   ${PROG_NAME} use-desktop
   ${PROG_NAME} status [--json]
+  ${PROG_NAME} gc status [--builder NAME] [--verbose]
+  ${PROG_NAME} gc configure [--builder NAME] [GC overrides] [--colima-vm]
+  ${PROG_NAME} registry-mirror setup [options]
+  ${PROG_NAME} registry-mirror teardown [--remove-data]
+  ${PROG_NAME} registry-mirror status
 
 COMMANDS:
   setup-remote     Point docker buildx at a remote Linux builder over SSH
@@ -71,6 +101,28 @@ COMMANDS:
   status           Show the active docker context and buildx builders.
                    --json emits one object (context, selected builder, mode,
                    builders, colima state, cache size); see docs/agent-tools.md.
+  gc status        Show BuildKit disk usage (docker buildx du) for the selected
+                   or --builder builder. --verbose lists individual cache records.
+  gc configure     Write a buildkitd GC policy (keepBytes/reservedSpace/
+                   maxUsedSpace + default rules) to the managed per-builder
+                   config under \${DOCKER_CONFIG:-~/.docker}/buildkitd/. The next
+                   builder creation applies it via docker buildx create --config.
+                   An existing builder is NEVER removed to apply it; recreate it
+                   during a maintenance window with docker buildx rm --keep-state
+                   (preserves the cache volume) followed by setup-remote/setup-colima.
+                   --colima-vm instead writes /etc/buildkit/buildkitd.toml inside
+                   the Colima VM for the VM daemon's embedded BuildKit.
+  registry-mirror setup
+                   Run a registry:2 pull-through cache container (${MIRROR_CONTAINER_NAME})
+                   on Colima or another reachable Docker target, bound to loopback
+                   (${MIRROR_BIND}:${MIRROR_PORT} by default), wire it into the managed
+                   buildkitd config and the Docker daemon's registry-mirrors, and
+                   print workflow-facing notes.
+  registry-mirror teardown
+                   Stop and remove the mirror container and its wiring. The data
+                   volume (cached blobs) is kept unless --remove-data is given.
+  registry-mirror status
+                   Show mirror container state, endpoint, upstream, and wiring.
 
 OPTIONS (setup-remote):
   --host URL          SSH URL of the Linux builder, e.g. ssh://ci@builder.local.
@@ -83,6 +135,30 @@ OPTIONS (setup-colima):
   --mem GB            Memory in GiB for the colima VM (default: ${COLIMA_MEM})
   --disk GB           Disk in GiB for the colima VM (default: ${COLIMA_DISK})
 
+OPTIONS (gc):
+  --builder NAME      Builder to query/configure (default: the selected builder)
+  --verbose           (gc status) Per-cache-record disk usage
+  --keep-bytes GB     (gc configure) keepBytes for the default GC rules (default: ${GC_KEEP_BYTES_GB})
+  --reserved-space GB (gc configure) reservedSpace, always kept (default: ${GC_RESERVED_GB})
+  --max-used-space GB (gc configure) maxUsedSpace, GC turns aggressive above it (default: ${GC_MAX_USED_GB})
+  --keep-hours N      (gc configure) keepDuration for cache mounts and sources,
+                      0 disables age-based collection (default: ${GC_KEEP_HOURS})
+  --colima-vm         (gc configure) Manage /etc/buildkit/buildkitd.toml inside the
+                      Colima VM instead of a docker-container builder config
+
+OPTIONS (registry-mirror):
+  --builder NAME      (setup) Wire the mirror into this builder's buildkitd config
+                      (default: the selected builder, if any)
+  --port N            Host-side port for the mirror (default: ${MIRROR_PORT})
+  --bind ADDR         Bind address; loopback or private/local-network addresses
+                      only (default: ${MIRROR_BIND})
+  --upstream URL      Registry to proxy (default: ${MIRROR_UPSTREAM})
+  --context CTX       Docker context to run the mirror on (default: colima when
+                      running, else the current context)
+  --host URL          Alternative: run the mirror on a remote ssh:// Docker host
+                      (mutually exclusive with --context)
+  --remove-data       (teardown) Also delete the mirror's cached-blob volume
+
 OTHER:
   --json              (status) Machine-readable output on stdout
   -h, --help          Show this help and exit
@@ -94,6 +170,10 @@ EXAMPLES:
   ${PROG_NAME} setup-colima --cpu 6 --mem 12
   ${PROG_NAME} use-desktop
   ${PROG_NAME} status
+  ${PROG_NAME} gc status --builder ${REMOTE_BUILDER_NAME}
+  ${PROG_NAME} gc configure --builder ${REMOTE_BUILDER_NAME} --max-used-space 80
+  ${PROG_NAME} registry-mirror setup
+  ${PROG_NAME} registry-mirror status
 
 LAYER CACHING:
   The named builders above pair with buildx cache backends
@@ -104,8 +184,10 @@ LAYER CACHING:
 SECURITY NOTE:
   Run as the same non-root user that runs the runner daemons. Use SSH keys
   or a service-accessible SSH agent, never passwords on the command line.
-  Registry credentials should come from CI secrets. The script does not
-  invoke sudo; Homebrew installs tooling into its configured prefix.
+  Registry credentials should come from CI secrets. The script never invokes
+  sudo on the macOS host (gc configure --colima-vm uses the Colima VM's own
+  non-interactive sudo); Homebrew installs tooling into its configured prefix.
+  The registry mirror binds to loopback/local-network addresses only.
 EOF
 }
 
@@ -114,13 +196,27 @@ EOF
 # ----------------------------------------------------------------------------
 parse_args() {
   if [[ $# -lt 1 ]]; then
-    err "Missing command (setup-remote | setup-colima | use-desktop | status)"
+    err "Missing command (setup-remote | setup-colima | use-desktop | status | gc | registry-mirror)"
     usage
     exit 2
   fi
   COMMAND="$1"; shift
   case "${COMMAND}" in
     setup-remote|setup-colima|use-desktop|status) ;;
+    gc|registry-mirror)
+      if [[ $# -lt 1 ]]; then
+        err "${COMMAND} requires a subcommand"
+        usage
+        exit 2
+      fi
+      SUBCOMMAND="$1"; shift
+      case "${COMMAND}:${SUBCOMMAND}" in
+        gc:status|gc:configure|registry-mirror:setup|registry-mirror:teardown|registry-mirror:status) ;;
+        *)
+          err "Unknown ${COMMAND} subcommand: ${SUBCOMMAND}"
+          usage
+          exit 2 ;;
+      esac ;;
     -h|--help) usage; exit 0 ;;
     *)
       err "Unknown command: ${COMMAND}"
@@ -150,6 +246,45 @@ parse_args() {
         [[ $# -ge 2 ]] || { err "--disk requires a value"; usage; exit 2; }
         COLIMA_DISK="$2"; shift 2 ;;
       --disk=*)    COLIMA_DISK="${1#*=}"; shift ;;
+      --builder)
+        [[ $# -ge 2 ]] || { err "--builder requires a value"; usage; exit 2; }
+        BUILDER_NAME="$2"; shift 2 ;;
+      --builder=*) BUILDER_NAME="${1#*=}"; shift ;;
+      --keep-bytes)
+        [[ $# -ge 2 ]] || { err "--keep-bytes requires a value"; usage; exit 2; }
+        GC_KEEP_BYTES_GB="$2"; shift 2 ;;
+      --keep-bytes=*) GC_KEEP_BYTES_GB="${1#*=}"; shift ;;
+      --reserved-space)
+        [[ $# -ge 2 ]] || { err "--reserved-space requires a value"; usage; exit 2; }
+        GC_RESERVED_GB="$2"; shift 2 ;;
+      --reserved-space=*) GC_RESERVED_GB="${1#*=}"; shift ;;
+      --max-used-space)
+        [[ $# -ge 2 ]] || { err "--max-used-space requires a value"; usage; exit 2; }
+        GC_MAX_USED_GB="$2"; shift 2 ;;
+      --max-used-space=*) GC_MAX_USED_GB="${1#*=}"; shift ;;
+      --keep-hours)
+        [[ $# -ge 2 ]] || { err "--keep-hours requires a value"; usage; exit 2; }
+        GC_KEEP_HOURS="$2"; shift 2 ;;
+      --keep-hours=*) GC_KEEP_HOURS="${1#*=}"; shift ;;
+      --colima-vm)   COLIMA_VM=1; shift ;;
+      --port)
+        [[ $# -ge 2 ]] || { err "--port requires a value"; usage; exit 2; }
+        MIRROR_PORT="$2"; shift 2 ;;
+      --port=*)    MIRROR_PORT="${1#*=}"; shift ;;
+      --bind)
+        [[ $# -ge 2 ]] || { err "--bind requires a value"; usage; exit 2; }
+        MIRROR_BIND="$2"; shift 2 ;;
+      --bind=*)    MIRROR_BIND="${1#*=}"; shift ;;
+      --upstream)
+        [[ $# -ge 2 ]] || { err "--upstream requires a value"; usage; exit 2; }
+        MIRROR_UPSTREAM="$2"; shift 2 ;;
+      --upstream=*) MIRROR_UPSTREAM="${1#*=}"; shift ;;
+      --context)
+        [[ $# -ge 2 ]] || { err "--context requires a value"; usage; exit 2; }
+        MIRROR_CONTEXT="$2"; shift 2 ;;
+      --context=*) MIRROR_CONTEXT="${1#*=}"; shift ;;
+      --remove-data) MIRROR_REMOVE_DATA=1; shift ;;
+      --verbose)   VERBOSE=1; shift ;;
       --json)      JSON=1; shift ;;
       -h|--help)   usage; exit 0 ;;
       *)
@@ -162,6 +297,11 @@ parse_args() {
   # SSH host may come from the environment if not given on the CLI.
   if [[ -z "${SSH_HOST}" && -n "${BUILDER_SSH_HOST:-}" ]]; then
     SSH_HOST="${BUILDER_SSH_HOST}"
+  fi
+
+  if [[ -n "${BUILDER_NAME}" && ! "${BUILDER_NAME}" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]]; then
+    err "--builder must be a valid builder name (got: '${BUILDER_NAME}')"
+    exit 2
   fi
 
   case "${COMMAND}" in
@@ -185,7 +325,62 @@ parse_args() {
         fi
       done
       ;;
+    gc)
+      if [[ "${SUBCOMMAND}" == configure ]]; then
+        local g
+        for g in "${GC_KEEP_BYTES_GB}" "${GC_RESERVED_GB}" "${GC_MAX_USED_GB}"; do
+          if ! [[ "${g}" =~ ^[0-9]+$ ]] || [[ "${g}" -lt 1 ]]; then
+            err "--keep-bytes/--reserved-space/--max-used-space must be positive integers (got: '${g}')"
+            exit 2
+          fi
+        done
+        if ! [[ "${GC_KEEP_HOURS}" =~ ^[0-9]+$ ]]; then
+          err "--keep-hours must be a non-negative integer (got: '${GC_KEEP_HOURS}')"
+          exit 2
+        fi
+      fi
+      ;;
+    registry-mirror)
+      if [[ -n "${SSH_HOST}" ]]; then
+        if [[ -n "${MIRROR_CONTEXT}" ]]; then
+          err "--host and --context are mutually exclusive"
+          exit 2
+        fi
+        if [[ "${SSH_HOST}" != ssh://* ]]; then
+          err "--host must be an ssh:// URL (got: '${SSH_HOST}')"
+          exit 2
+        fi
+      fi
+      if ! [[ "${MIRROR_PORT}" =~ ^[0-9]+$ ]] \
+        || [[ "${MIRROR_PORT}" -lt 1 || "${MIRROR_PORT}" -gt 65535 ]]; then
+        err "--port must be an integer between 1 and 65535 (got: '${MIRROR_PORT}')"
+        exit 2
+      fi
+      if [[ "${MIRROR_UPSTREAM}" != http://* && "${MIRROR_UPSTREAM}" != https://* ]]; then
+        err "--upstream must be an http(s):// URL (got: '${MIRROR_UPSTREAM}')"
+        exit 2
+      fi
+      if ! is_local_bind "${MIRROR_BIND}"; then
+        err "--bind '${MIRROR_BIND}' is not a loopback or local-network address; refusing to expose the mirror publicly"
+        exit 2
+      fi
+      ;;
   esac
+}
+
+# The pull-through cache has no authentication of its own; it may only be
+# bound to loopback or private/local-network addresses.
+is_local_bind() {
+  case "$1" in
+    localhost|127.*|::1|10.*|192.168.*|169.254.*|*.local) return 0 ;;
+    172.*)
+      local second="${1#172.}"
+      second="${second%%.*}"
+      if [[ "${second}" =~ ^[0-9]+$ ]] && [[ "${second}" -ge 16 && "${second}" -le 31 ]]; then
+        return 0
+      fi ;;
+  esac
+  return 1
 }
 
 # ----------------------------------------------------------------------------
@@ -200,7 +395,7 @@ detect_platform() {
 
 require_cmds() {
   local missing=() c
-  for c in uname whoami sed awk head mkdir ln cut; do
+  for c in uname whoami sed awk head mkdir ln cut cat mktemp rm dirname; do
     command -v "${c}" >/dev/null 2>&1 || missing+=("${c}")
   done
   if [[ ${#missing[@]} -gt 0 ]]; then
@@ -272,6 +467,9 @@ use_builder_default() {
 
 # Reuse only matching builders. Never remove a builder or its warm cache merely
 # because setup was rerun with a different endpoint or an obsolete driver.
+# A managed buildkitd config written by `gc configure` / `registry-mirror setup`
+# is applied here at creation time via --config; when the mirror is wired the
+# builder shares the daemon's network so it can reach the loopback mirror.
 ensure_container_builder() {
   local name="$1" endpoint="$2" details existing_driver existing_endpoint
   if details="$(docker buildx inspect "${name}" 2>/dev/null)"; then
@@ -290,6 +488,15 @@ ensure_container_builder() {
     fi
   else
     local -a create_args=(create --name "${name}" --driver docker-container)
+    local cfg_file
+    cfg_file="$(buildkitd_config_path "${name}")"
+    if [[ -f "${cfg_file}" ]]; then
+      create_args+=(--config "${cfg_file}")
+      if [[ -f "$(mirror_marker_path "${name}")" ]]; then
+        create_args+=(--driver-opt network=host)
+      fi
+      step "Applying managed buildkitd config: ${cfg_file}"
+    fi
     if [[ -n "${PLATFORM}" ]]; then
       create_args+=(--platform "${PLATFORM}")
     fi
@@ -488,6 +695,494 @@ status() {
 }
 
 # ----------------------------------------------------------------------------
+# gc — BuildKit disk usage and garbage-collection policy
+# ----------------------------------------------------------------------------
+# Managed per-builder state lives under ${DOCKER_CONFIG:-~/.docker}/buildkitd/:
+#   <builder>.gc      GC policy values: "keep_bytes_gb reserved_gb max_used_gb keep_hours"
+#   <builder>.mirror  Registry mirror port, when wired by registry-mirror setup
+#   <builder>.toml    Generated buildkitd config, passed to buildx create --config
+buildkitd_config_dir() {
+  printf '%s/buildkitd' "${DOCKER_CONFIG:-${HOME}/.docker}"
+}
+
+buildkitd_config_path() {
+  printf '%s/%s.toml' "$(buildkitd_config_dir)" "$1"
+}
+
+mirror_marker_path() {
+  printf '%s/%s.mirror' "$(buildkitd_config_dir)" "$1"
+}
+
+mirror_env_path() {
+  printf '%s/registry-mirror.env' "$(buildkitd_config_dir)"
+}
+
+# Print a buildkitd.toml on stdout: GC policy plus an optional loopback
+# registry-mirror stanza. reservedSpace/maxUsedSpace need BuildKit v0.20+;
+# the gcpolicy rules are honored by all versions (older daemons ignore
+# unknown keys).
+render_buildkitd_config() {
+  local keep_bytes_gb="$1" reserved_gb="$2" max_used_gb="$3" keep_hours="$4" mirror_port="${5:-}"
+  cat <<EOF
+# Managed by ${PROG_NAME}; change via "gc configure" or "registry-mirror setup".
+[worker.oci]
+  gc = true
+  reservedSpace = "${reserved_gb}GB"
+  maxUsedSpace = "${max_used_gb}GB"
+
+  [[worker.oci.gcpolicy]]
+    keepBytes = $((keep_bytes_gb * 1073741824))
+    filters = ["type==source.local", "type==exec.cachemount", "type==source.git.checkout"]
+    keepDuration = $((keep_hours * 3600))
+
+  [[worker.oci.gcpolicy]]
+    all = true
+    keepBytes = $((keep_bytes_gb * 1073741824))
+EOF
+  if [[ -n "${mirror_port}" ]]; then
+    cat <<EOF
+
+[registry."docker.io"]
+  mirrors = ["127.0.0.1:${mirror_port}"]
+  http = true
+EOF
+  fi
+}
+
+# Regenerate a builder's buildkitd.toml from its stored GC and mirror state.
+write_buildkitd_config() {
+  local builder="$1" dir cfg kbgb rsgb mugb kh mirror_port=""
+  dir="$(buildkitd_config_dir)"
+  cfg="${dir}/${builder}.toml"
+  if [[ -f "${dir}/${builder}.gc" ]]; then
+    read -r kbgb rsgb mugb kh < "${dir}/${builder}.gc"
+  else
+    kbgb="${GC_KEEP_BYTES_GB}"; rsgb="${GC_RESERVED_GB}"; mugb="${GC_MAX_USED_GB}"; kh="${GC_KEEP_HOURS}"
+  fi
+  if [[ -f "${dir}/${builder}.mirror" ]]; then
+    mirror_port="$(cat "${dir}/${builder}.mirror")"
+  fi
+  mkdir -p "${dir}"
+  render_buildkitd_config "${kbgb}" "${rsgb}" "${mugb}" "${kh}" "${mirror_port}" > "${cfg}"
+  printf '%s\n' "${cfg}"
+}
+
+setup_hint() {
+  case "$1" in
+    "${COLIMA_BUILDER_NAME}") printf 'setup-colima' ;;
+    *)                        printf 'setup-remote --host %s' "${SSH_HOST:-ssh://user@linux-builder}" ;;
+  esac
+}
+
+# The builder to act on: --builder, else the currently selected builder.
+resolve_builder() {
+  local name="${BUILDER_NAME}"
+  if [[ -z "${name}" ]]; then
+    if ! command -v docker >/dev/null 2>&1; then
+      err "docker CLI not found and no --builder given."
+      exit 1
+    fi
+    name="$(docker buildx inspect 2>/dev/null | awk '$1 == "Name:" {print $2; exit}' || true)"
+  fi
+  if [[ -z "${name}" ]]; then
+    err "No builder is selected; pass --builder NAME."
+    exit 2
+  fi
+  printf '%s\n' "${name}"
+}
+
+gc_status() {
+  if ! command -v docker >/dev/null 2>&1; then
+    err "docker CLI not found. Install it with: brew install docker"
+    exit 1
+  fi
+  local builder
+  builder="$(resolve_builder)"
+  log "BuildKit disk usage for builder '${builder}'"
+  local -a du_args=(du --builder "${builder}")
+  if [[ "${VERBOSE}" -eq 1 ]]; then
+    du_args+=(--verbose)
+  fi
+  if ! docker buildx "${du_args[@]}"; then
+    err "Could not query disk usage. Is builder '${builder}' provisioned and its daemon reachable?"
+    exit 1
+  fi
+  local cfg
+  cfg="$(buildkitd_config_path "${builder}")"
+  if [[ -f "${cfg}" ]]; then
+    step "managed GC policy: ${cfg} (applied at builder creation)"
+  else
+    step "no managed GC policy; set one with: ${PROG_NAME} gc configure --builder ${builder}"
+  fi
+}
+
+gc_configure() {
+  if [[ "${COLIMA_VM}" -eq 1 ]]; then
+    gc_configure_colima_vm
+    return
+  fi
+  local builder dir cfg
+  builder="$(resolve_builder)"
+  dir="$(buildkitd_config_dir)"
+  mkdir -p "${dir}"
+  printf '%s %s %s %s\n' "${GC_KEEP_BYTES_GB}" "${GC_RESERVED_GB}" "${GC_MAX_USED_GB}" "${GC_KEEP_HOURS}" \
+    > "${dir}/${builder}.gc"
+  cfg="$(write_buildkitd_config "${builder}")"
+  log "Wrote BuildKit GC policy for builder '${builder}': ${cfg}"
+  step "reservedSpace=${GC_RESERVED_GB}GB maxUsedSpace=${GC_MAX_USED_GB}GB keepBytes=${GC_KEEP_BYTES_GB}GB keepDuration=${GC_KEEP_HOURS}h"
+  # GC config is creation-time only. Never remove or recreate an existing
+  # builder here: its BuildKit cache must survive until the operator schedules
+  # a maintenance window (docker buildx rm --keep-state preserves the volume).
+  if command -v docker >/dev/null 2>&1 && docker buildx inspect "${builder}" >/dev/null 2>&1; then
+    warn "Builder '${builder}' already exists; the new policy applies only to newly created builders."
+    warn "The existing builder and its cache are unchanged. To apply, during a maintenance window:"
+    warn "  docker buildx rm --keep-state ${builder}   # preserves the BuildKit cache volume"
+    warn "  ${PROG_NAME} $(setup_hint "${builder}")   # recreates '${builder}' with --config"
+  else
+    step "Builder '${builder}' will be created with this policy by the next ${PROG_NAME} $(setup_hint "${builder}")."
+  fi
+}
+
+# The Colima VM docker daemon's embedded BuildKit (plain `docker build` on the
+# default builder) reads /etc/buildkit/buildkitd.toml inside the VM. The file
+# is root-owned, so the write uses the VM's non-interactive sudo via colima ssh;
+# no sudo is ever invoked on the macOS host.
+gc_configure_colima_vm() {
+  if ! command -v colima >/dev/null 2>&1; then
+    err "colima not found. Install it with: brew install colima"
+    exit 1
+  fi
+  if ! colima status default >/dev/null 2>&1; then
+    err "colima default VM is not running; start it with ${PROG_NAME} setup-colima first."
+    exit 1
+  fi
+  local tmp
+  tmp="$(mktemp -t buildkitd)"
+  render_buildkitd_config "${GC_KEEP_BYTES_GB}" "${GC_RESERVED_GB}" "${GC_MAX_USED_GB}" "${GC_KEEP_HOURS}" > "${tmp}"
+  log "Writing /etc/buildkit/buildkitd.toml inside the colima VM"
+  step "reservedSpace=${GC_RESERVED_GB}GB maxUsedSpace=${GC_MAX_USED_GB}GB keepBytes=${GC_KEEP_BYTES_GB}GB keepDuration=${GC_KEEP_HOURS}h"
+  if ! colima ssh -- sudo -n sh -c 'mkdir -p /etc/buildkit && tee /etc/buildkit/buildkitd.toml >/dev/null' < "${tmp}"; then
+    rm -f "${tmp}"
+    err "Failed to write buildkitd.toml inside the colima VM."
+    exit 1
+  fi
+  rm -f "${tmp}"
+  warn "Restart Colima between jobs to apply the policy: colima stop && colima start"
+}
+
+# ----------------------------------------------------------------------------
+# registry-mirror — registry:2 pull-through cache on loopback
+# ----------------------------------------------------------------------------
+# Where the mirror container runs. --host (ssh://) and --context are explicit;
+# otherwise prefer a running colima VM, else the current context. TARGET_ARGS
+# may stay empty (current context), so all expansions use the bash-3.2-safe
+# ${arr[@]+...} guard under set -u.
+TARGET_ARGS=()
+
+resolve_mirror_target() {
+  TARGET_ARGS=()
+  if [[ -n "${SSH_HOST}" ]]; then
+    TARGET_ARGS=(--host "${SSH_HOST}")
+    MIRROR_TARGET_KIND=remote
+  elif [[ -n "${MIRROR_CONTEXT}" ]]; then
+    TARGET_ARGS=(--context "${MIRROR_CONTEXT}")
+    case "${MIRROR_CONTEXT}" in
+      colima)                MIRROR_TARGET_KIND=colima ;;
+      desktop-linux|default) MIRROR_TARGET_KIND=desktop ;;
+      *)                     MIRROR_TARGET_KIND=other ;;
+    esac
+  elif command -v colima >/dev/null 2>&1 && colima status default >/dev/null 2>&1 \
+    && docker --context colima info >/dev/null 2>&1; then
+    TARGET_ARGS=(--context colima)
+    MIRROR_TARGET_KIND=colima
+  else
+    local ctx
+    ctx="$(docker context show 2>/dev/null || true)"
+    case "${ctx}" in
+      colima)                MIRROR_TARGET_KIND=colima ;;
+      desktop-linux|default) MIRROR_TARGET_KIND=desktop ;;
+      *)                     MIRROR_TARGET_KIND=other ;;
+    esac
+  fi
+}
+
+docker_mirror() {
+  docker ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"} "$@"
+}
+
+# Load the endpoint recorded by registry-mirror setup when the operator did not
+# pass --host/--context again (teardown/status).
+load_mirror_env() {
+  local env_file key value
+  env_file="$(mirror_env_path)"
+  [[ -f "${env_file}" ]] || return 1
+  while IFS='=' read -r key value; do
+    case "${key}" in
+      PORT)    MIRROR_PORT="${value}" ;;
+      BIND)    MIRROR_BIND="${value}" ;;
+      UPSTREAM) MIRROR_UPSTREAM="${value}" ;;
+      TARGET)
+        if [[ -z "${SSH_HOST}" && -z "${MIRROR_CONTEXT}" ]]; then
+          case "${value}" in
+            ssh://*) SSH_HOST="${value}" ;;
+            *)       MIRROR_CONTEXT="${value}" ;;
+          esac
+        fi ;;
+    esac
+  done < "${env_file}"
+}
+
+mirror_url() {
+  local host="${MIRROR_BIND}"
+  [[ "${host}" == localhost ]] && host="127.0.0.1"
+  printf 'http://%s:%s' "${host}" "${MIRROR_PORT}"
+}
+
+# Add or remove a registry-mirrors entry in a daemon.json without disturbing
+# other keys (including credentials-adjacent settings the file may hold).
+json_merge_registry_mirror() {
+  local path="$1" url="$2" mode="$3"
+  mkdir -p "$(dirname "${path}")"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "${path}" "${url}" "${mode}" <<'PYEOF'
+import json, os, sys
+path, url, mode = sys.argv[1], sys.argv[2], sys.argv[3]
+data = {}
+if os.path.exists(path):
+    with open(path) as fh:
+        try:
+            data = json.load(fh)
+        except ValueError:
+            data = {}
+mirrors = [m for m in data.get("registry-mirrors", []) if m != url]
+if mode == "add":
+    mirrors.append(url)
+if mirrors:
+    data["registry-mirrors"] = mirrors
+else:
+    data.pop("registry-mirrors", None)
+with open(path, "w") as fh:
+    json.dump(data, fh, indent=2)
+    fh.write("\n")
+PYEOF
+  elif [[ "${mode}" == add && ! -s "${path}" ]]; then
+    printf '{\n  "registry-mirrors": ["%s"]\n}\n' "${url}" > "${path}"
+  else
+    warn "python3 not found; edit ${path} manually to ${mode} \"${url}\" in \"registry-mirrors\"."
+    return 1
+  fi
+}
+
+# daemon.json for the resolved target, when it is host-writable. Colima renders
+# ${COLIMA_HOME}/docker/daemon.json into the VM; Docker Desktop reads the user
+# config. Remote/other daemons are out of reach and get manual instructions.
+daemon_json_path() {
+  case "${MIRROR_TARGET_KIND}" in
+    colima)  printf '%s/docker/daemon.json' "${COLIMA_HOME:-${HOME}/.colima}" ;;
+    desktop) printf '%s/daemon.json' "${DOCKER_CONFIG:-${HOME}/.docker}" ;;
+    *)       printf '' ;;
+  esac
+}
+
+daemon_restart_hint() {
+  case "${MIRROR_TARGET_KIND}" in
+    colima)  printf 'colima stop && colima start' ;;
+    desktop) printf 'restart Docker Desktop' ;;
+    *)       printf 'restart the Docker daemon on that host' ;;
+  esac
+}
+
+wire_buildkit_mirror() {
+  local builder=""
+  if [[ -n "${BUILDER_NAME}" ]]; then
+    builder="${BUILDER_NAME}"
+  else
+    builder="$(docker buildx inspect 2>/dev/null | awk '$1 == "Name:" {print $2; exit}' || true)"
+  fi
+  if [[ -z "${builder}" ]]; then
+    warn "No buildx builder selected; BuildKit mirror wiring skipped."
+    warn "Rerun with --builder NAME to wire the mirror into a builder's buildkitd config."
+    return 0
+  fi
+  printf '%s\n' "${MIRROR_PORT}" > "$(mirror_marker_path "${builder}")"
+  local cfg
+  cfg="$(write_buildkitd_config "${builder}")"
+  log "Wired mirror into BuildKit config for '${builder}': ${cfg}"
+  step "docker.io resolves via 127.0.0.1:${MIRROR_PORT}; builders are created with --driver-opt network=host to reach it"
+  if docker buildx inspect "${builder}" >/dev/null 2>&1; then
+    warn "Builder '${builder}' already exists; the mirror applies only to newly created builders."
+    warn "The existing builder and its cache are unchanged. To apply, during a maintenance window:"
+    warn "  docker buildx rm --keep-state ${builder}   # preserves the BuildKit cache volume"
+    warn "  ${PROG_NAME} $(setup_hint "${builder}")   # recreates '${builder}' with --config"
+  else
+    step "Builder '${builder}' will be created with the mirror by the next ${PROG_NAME} $(setup_hint "${builder}")."
+  fi
+}
+
+wire_daemon_mirror() {
+  local path url
+  path="$(daemon_json_path)"
+  url="$(mirror_url)"
+  if [[ -z "${path}" ]]; then
+    warn "Docker daemon mirror is not auto-configured for target '${MIRROR_TARGET_KIND}'."
+    warn "On that Docker host, add to daemon.json: {\"registry-mirrors\": [\"${url}\"]}, then $(daemon_restart_hint)."
+    return 0
+  fi
+  if json_merge_registry_mirror "${path}" "${url}" add; then
+    log "Docker daemon registry mirror: ${url} in ${path}"
+    warn "Daemon config changes need a restart between jobs: $(daemon_restart_hint)"
+  fi
+}
+
+emit_mirror_instructions() {
+  cat >&2 <<EOF
+
+WORKFLOW-FACING NOTES:
+  - Builds through the persistent builder use the mirror transparently once the
+    builder is recreated with its managed buildkitd config (see above).
+  - Plain 'docker pull' / 'docker build' use the mirror after the daemon
+    restart noted above.
+  - No workflow YAML changes are required; keep passing --builder as before.
+  - The mirror caches blobs from ${MIRROR_UPSTREAM} and serves them over HTTP
+    on ${MIRROR_BIND}:${MIRROR_PORT}; it never accepts pushes.
+  - Verify later with: ${PROG_NAME} registry-mirror status
+EOF
+}
+
+registry_mirror_setup() {
+  require_docker
+  resolve_mirror_target
+  log "Setting up pull-through cache '${MIRROR_CONTAINER_NAME}' -> ${MIRROR_UPSTREAM} (target: ${MIRROR_TARGET_KIND})"
+  if ! docker_mirror info >/dev/null 2>&1; then
+    err "Docker daemon is not reachable for the selected target."
+    exit 1
+  fi
+
+  local running=""
+  running="$(docker_mirror inspect --format '{{.State.Running}}' "${MIRROR_CONTAINER_NAME}" 2>/dev/null || true)"
+  if [[ "${running}" == "true" ]]; then
+    step "Reusing running mirror container and its cached blobs"
+  elif [[ "${running}" == "false" ]]; then
+    docker_mirror start "${MIRROR_CONTAINER_NAME}" >/dev/null
+    step "Started existing mirror container"
+  else
+    docker_mirror run -d --name "${MIRROR_CONTAINER_NAME}" --restart=always \
+      -p "${MIRROR_BIND}:${MIRROR_PORT}:5000" \
+      -e "REGISTRY_PROXY_REMOTEURL=${MIRROR_UPSTREAM}" \
+      -v "${MIRROR_VOLUME_NAME}:/var/lib/registry" \
+      registry:2 >/dev/null
+    step "Started registry:2 pull-through cache on ${MIRROR_BIND}:${MIRROR_PORT}"
+  fi
+
+  mkdir -p "$(buildkitd_config_dir)"
+  {
+    printf 'PORT=%s\n' "${MIRROR_PORT}"
+    printf 'BIND=%s\n' "${MIRROR_BIND}"
+    printf 'UPSTREAM=%s\n' "${MIRROR_UPSTREAM}"
+    if [[ -n "${SSH_HOST}" ]]; then
+      printf 'TARGET=%s\n' "${SSH_HOST}"
+    elif [[ "${MIRROR_TARGET_KIND}" == colima || -n "${MIRROR_CONTEXT}" ]]; then
+      printf 'TARGET=%s\n' "${MIRROR_CONTEXT:-colima}"
+    fi
+  } > "$(mirror_env_path)"
+
+  wire_buildkit_mirror
+  wire_daemon_mirror
+  emit_mirror_instructions
+}
+
+registry_mirror_teardown() {
+  if ! command -v docker >/dev/null 2>&1; then
+    err "docker CLI not found. Install it with: brew install docker"
+    exit 1
+  fi
+  load_mirror_env || true
+  resolve_mirror_target
+  log "Tearing down pull-through cache '${MIRROR_CONTAINER_NAME}' (target: ${MIRROR_TARGET_KIND})"
+
+  local present=""
+  present="$(docker_mirror inspect --format '{{.State.Running}}' "${MIRROR_CONTAINER_NAME}" 2>/dev/null || true)"
+  if [[ -n "${present}" ]]; then
+    docker_mirror rm -f "${MIRROR_CONTAINER_NAME}" >/dev/null
+    step "Removed mirror container"
+    if [[ "${MIRROR_REMOVE_DATA}" -eq 1 ]]; then
+      docker_mirror volume rm "${MIRROR_VOLUME_NAME}" >/dev/null
+      step "Removed cached-blob volume '${MIRROR_VOLUME_NAME}'"
+    else
+      warn "Cached-blob volume '${MIRROR_VOLUME_NAME}' kept; add --remove-data to delete it."
+    fi
+  else
+    step "Mirror container not present on this target"
+  fi
+
+  local dir f b
+  dir="$(buildkitd_config_dir)"
+  for f in "${dir}"/*.mirror; do
+    [[ -e "${f}" ]] || continue
+    b="$(basename "${f}" .mirror)"
+    rm -f "${f}"
+    write_buildkitd_config "${b}" >/dev/null
+    step "Removed mirror from BuildKit config for '${b}' (recreate the builder to apply)"
+  done
+
+  local path url
+  path="$(daemon_json_path)"
+  url="$(mirror_url)"
+  if [[ -n "${path}" && -f "${path}" ]] && grep -q 'registry-mirrors' "${path}" 2>/dev/null; then
+    if json_merge_registry_mirror "${path}" "${url}" remove; then
+      step "Removed registry-mirrors entry from ${path}"
+      warn "Daemon config changes need a restart between jobs: $(daemon_restart_hint)"
+    fi
+  fi
+
+  rm -f "$(mirror_env_path)"
+  log "Registry mirror teardown complete."
+}
+
+registry_mirror_status() {
+  if ! command -v docker >/dev/null 2>&1; then
+    err "docker CLI not found. Install it with: brew install docker"
+    exit 1
+  fi
+  load_mirror_env || true
+  resolve_mirror_target
+  log "registry mirror (target: ${MIRROR_TARGET_KIND})"
+
+  local running=""
+  running="$(docker_mirror inspect --format '{{.State.Running}}' "${MIRROR_CONTAINER_NAME}" 2>/dev/null || true)"
+  case "${running}" in
+    true)  step "container '${MIRROR_CONTAINER_NAME}': running" ;;
+    false) step "container '${MIRROR_CONTAINER_NAME}': stopped" ;;
+    *)     step "container '${MIRROR_CONTAINER_NAME}': not present" ;;
+  esac
+  step "endpoint: $(mirror_url) (upstream: ${MIRROR_UPSTREAM})"
+  step "data volume: ${MIRROR_VOLUME_NAME}"
+
+  local dir f b wired=0
+  dir="$(buildkitd_config_dir)"
+  for f in "${dir}"/*.mirror; do
+    [[ -e "${f}" ]] || continue
+    b="$(basename "${f}" .mirror)"
+    step "buildkit wired: ${b} ($(buildkitd_config_path "${b}"))"
+    wired=1
+  done
+  if [[ "${wired}" -eq 0 ]]; then
+    step "buildkit wired: none"
+  fi
+
+  local path url
+  path="$(daemon_json_path)"
+  url="$(mirror_url)"
+  if [[ -n "${path}" && -f "${path}" ]] && grep -qF "${url}" "${path}" 2>/dev/null; then
+    step "daemon mirror: ${url} in ${path}"
+  elif [[ -n "${path}" ]]; then
+    step "daemon mirror: not configured in ${path}"
+  else
+    step "daemon mirror: not manageable for target '${MIRROR_TARGET_KIND}'"
+  fi
+}
+
+# ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
 main() {
@@ -500,7 +1195,20 @@ main() {
     setup-colima) setup_colima ;;
     use-desktop)  use_desktop ;;
     status)       status ;;
+    gc)
+      case "${SUBCOMMAND}" in
+        status)    gc_status ;;
+        configure) gc_configure ;;
+      esac ;;
+    registry-mirror)
+      case "${SUBCOMMAND}" in
+        setup)    registry_mirror_setup ;;
+        teardown) registry_mirror_teardown ;;
+        status)   registry_mirror_status ;;
+      esac ;;
   esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

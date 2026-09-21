@@ -7,6 +7,18 @@
 #   runner-cache install (--org ORG | --repo OWNER/REPO) [--port N] [--console-port N]
 #   runner-cache env [--org ORG | --repo OWNER/REPO]
 #   runner-cache start|stop|status|metrics|uninstall
+#   runner-cache gateway install (--org ORG | --repo OWNER/REPO) [--gateway-port N] [--save-prefix P]...
+#   runner-cache gateway env [--org ORG | --repo OWNER/REPO]
+#   runner-cache gateway start|stop|status
+#
+# The optional 'gateway' family runs a GitHub Actions cache-service (Twirp v2,
+# JSON) HTTP gateway on loopback in front of the same per-scope MinIO buckets,
+# so standard actions/cache works against local storage. Upload/download bytes
+# flow directly between the job and MinIO via SigV4 presigned URLs. Per-scope
+# bearer tokens (0600, minted at 'gateway install') authenticate gateway calls;
+# a per-scope key-prefix policy restricts which keys may SAVE (restore stays
+# open, per actions/cache restore-keys semantics). Distributed/multi-host
+# operation is intentionally out of scope.
 #
 # Installs a local S3-compatible object store (MinIO, via Homebrew) and runs it
 # as a system LaunchDaemon (com.github.runner-cache) as the INVOKING non-root
@@ -37,11 +49,21 @@ LOG_DIR="${CACHE_ROOT}/logs"
 DEFAULT_PORT=9000
 DEFAULT_CONSOLE_PORT=9001
 
+# GitHub-protocol cache gateway (optional; additive to the S3 action flow).
+GATEWAY_LABEL="com.github.runner-cache-gateway"
+GATEWAY_PLIST_DEST="${LAUNCH_DAEMON_DIR}/${GATEWAY_LABEL}.plist"
+GATEWAY_SERVER_PATH="${CACHE_ROOT}/bin/cache-gateway.py"
+GATEWAY_WRAPPER_PATH="${CACHE_ROOT}/bin/run-cache-gateway.sh"
+DEFAULT_GATEWAY_PORT=9157
+
 COMMAND=""
+GATEWAY_SUB=""
 ORG=""
 REPO=""
 PORT="${DEFAULT_PORT}"
 CONSOLE_PORT="${DEFAULT_CONSOLE_PORT}"
+GATEWAY_PORT="${DEFAULT_GATEWAY_PORT}"
+SAVE_PREFIXES=()
 ASSUME_YES=0
 KEEP_DATA=0
 RAW=0
@@ -101,6 +123,18 @@ COMMANDS:
                 workflow example. MinIO does not implement actions/cache.
   metrics       Scrape MinIO's Prometheus endpoint and report S3 request,
                 error, and transfer counters (not cache hit rates).
+  gateway       GitHub-protocol cache gateway in front of MinIO:
+                  gateway install   Mint a per-scope bearer token, write the
+                                    Twirp v2 server + LaunchDaemon
+                                    (${GATEWAY_LABEL}), and start it.
+                                    --save-prefix P restricts which key
+                                    prefixes may SAVE (repeatable; default *).
+                  gateway env       Print ACTIONS_CACHE_URL / ACTIONS_RESULTS_URL
+                                    wiring for standard actions/cache (token
+                                    stays in the 0600 scope file).
+                  gateway start|stop|status
+                                    Manage the gateway daemon. status --json
+                                    emits one JSON object.
   uninstall     Boot out + remove the daemon and delete ${CACHE_ROOT}
                 (asks for confirmation; --keep-data preserves data + credentials).
   -h, --help    Show this help and exit.
@@ -112,6 +146,12 @@ SCOPE (install/env — choose exactly ONE):
 OPTIONS:
   --port N              MinIO S3 API port (default: ${DEFAULT_PORT}). Fixed at install time.
   --console-port N      MinIO web console port (default: ${DEFAULT_CONSOLE_PORT}).
+  --gateway-port N      Gateway HTTP port (default: ${DEFAULT_GATEWAY_PORT}).
+                        Fixed at first 'gateway install'; must differ from the
+                        MinIO ports. Loopback only.
+  --save-prefix P       (gateway install) Allow SAVE only for cache keys with
+                        this prefix; repeatable. Default policy is '*' (all
+                        keys). Restore is never restricted.
   --json                (status) Emit one JSON object on stdout; see
                         docs/agent-tools.md for the schema.
   --raw                 (metrics) Dump the raw Prometheus exposition instead
@@ -122,6 +162,8 @@ OPTIONS:
 EXAMPLES:
   ${PROG_NAME} install --repo acme/monorepo
   ${PROG_NAME} env --repo acme/monorepo
+  ${PROG_NAME} gateway install --repo acme/monorepo --save-prefix 'main-'
+  ${PROG_NAME} gateway env --repo acme/monorepo
   ${PROG_NAME} status
   ${PROG_NAME} metrics
   ${PROG_NAME} uninstall --yes --keep-data
@@ -409,11 +451,26 @@ parse_args() {
     ""|-h|--help|help)
       usage; exit 0 ;;
     install|env|start|stop|status|metrics|uninstall) ;;
+    gateway) ;;
     *)
       err "Unknown command: ${COMMAND}"
       usage
       exit 2 ;;
   esac
+
+  if [[ "${COMMAND}" == "gateway" ]]; then
+    GATEWAY_SUB="${1:-}"
+    if [[ $# -gt 0 ]]; then shift; fi
+    case "${GATEWAY_SUB}" in
+      -h|--help|help)
+        usage; exit 0 ;;
+      install|start|stop|status|env) ;;
+      *)
+        err "Unknown gateway command: '${GATEWAY_SUB:-<missing>}' (want install|start|stop|status|env)"
+        usage
+        exit 2 ;;
+    esac
+  fi
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -433,6 +490,16 @@ parse_args() {
         [[ $# -ge 2 ]] || { err "--console-port requires a value"; usage; exit 2; }
         CONSOLE_PORT="$2"; shift 2 ;;
       --console-port=*) CONSOLE_PORT="${1#*=}"; shift ;;
+      --gateway-port)
+        [[ $# -ge 2 ]] || { err "--gateway-port requires a value"; usage; exit 2; }
+        GATEWAY_PORT="$2"; shift 2 ;;
+      --gateway-port=*) GATEWAY_PORT="${1#*=}"; shift ;;
+      --save-prefix)
+        [[ $# -ge 2 && -n "$2" ]] || { err "--save-prefix requires a non-empty value"; usage; exit 2; }
+        SAVE_PREFIXES+=("$2"); shift 2 ;;
+      --save-prefix=*)
+        [[ -n "${1#*=}" ]] || { err "--save-prefix requires a non-empty value"; usage; exit 2; }
+        SAVE_PREFIXES+=("${1#*=}"); shift ;;
       --raw)       RAW=1; shift ;;
       --json)      JSON=1; shift ;;
       -y|--yes)    ASSUME_YES=1; shift ;;
@@ -472,6 +539,26 @@ parse_args() {
       fi
       validate_scope_names
       ;;
+    gateway)
+      case "${GATEWAY_SUB}" in
+        install)
+          validate_scope_choice
+          if ! [[ "${GATEWAY_PORT}" =~ ^[0-9]+$ ]] || [[ ${#GATEWAY_PORT} -gt 5 ]] \
+              || [[ "$((10#${GATEWAY_PORT}))" -lt 1024 || "$((10#${GATEWAY_PORT}))" -gt 65535 ]]; then
+            err "--gateway-port must be an unprivileged TCP port (1024-65535) (got: '${GATEWAY_PORT}')"
+            exit 2
+          fi
+          GATEWAY_PORT="$((10#${GATEWAY_PORT}))"
+          ;;
+        env)
+          if [[ -n "${ORG}" && -n "${REPO}" ]]; then
+            err "Choose only one of --org or --repo."
+            exit 2
+          fi
+          validate_scope_names
+          ;;
+      esac
+      ;;
   esac
 }
 
@@ -504,12 +591,12 @@ bootout_system() {
 }
 
 daemon_loaded() {
-  sudo launchctl print "system/${DAEMON_LABEL}" >/dev/null 2>&1
+  sudo launchctl print "system/${1:-${DAEMON_LABEL}}" >/dev/null 2>&1
 }
 
 # Non-interactive variant for read-only commands (status): never prompts.
 daemon_loaded_n() {
-  sudo -n launchctl print "system/${DAEMON_LABEL}" >/dev/null 2>&1
+  sudo -n launchctl print "system/${1:-${DAEMON_LABEL}}" >/dev/null 2>&1
 }
 
 wait_healthy() {
@@ -517,6 +604,18 @@ wait_healthy() {
   for ((i = 0; i < 30; i++)); do
     if curl -fsS -o /dev/null --max-time 2 \
         "http://127.0.0.1:${CACHE_PORT}/minio/health/live" 2>/dev/null; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+wait_gateway_healthy() {
+  local i
+  for ((i = 0; i < 30; i++)); do
+    if curl -fsS -o /dev/null --max-time 2 \
+        "http://127.0.0.1:${GATEWAY_PORT}/healthz" 2>/dev/null; then
       return 0
     fi
     sleep 1
@@ -948,6 +1047,9 @@ EOF
     ACTIONS_CACHE_URL / ACTIONS_RESULTS_URL at it or change the runner's
     ACTIONS_CACHE_SERVICE_V2 / ACTIONS_RUNTIME_TOKEN. Standard actions/cache,
     setup-* caches, and Docker type=gha continue to use GitHub's cache service.
+    To serve standard actions/cache from this Mac instead, install the
+    GitHub-protocol gateway: ${PROG_NAME} gateway install (see
+    '${PROG_NAME} gateway env' and docs/cache-backend.md).
     If earlier instructions added those variables to a runner plist, remove
     the overrides and reload that LaunchDaemon when the runner is idle.
     See docs/cache-backend.md for credential setup and migration details.
@@ -1023,6 +1125,9 @@ cmd_uninstall() {
     fi
     log "About to PERMANENTLY remove:"
     printf '     - %s\n' "${PLIST_DEST}" >&2
+    if [[ -e "${GATEWAY_PLIST_DEST}" ]]; then
+      printf '     - %s (cache gateway)\n' "${GATEWAY_PLIST_DEST}" >&2
+    fi
     if [[ "${KEEP_DATA}" -eq 1 ]]; then
       printf '     - %s (logs and wrapper removed; data + credentials kept)\n' "${CACHE_ROOT}" >&2
     else
@@ -1047,6 +1152,15 @@ cmd_uninstall() {
     step "Removing ${PLIST_DEST}"
     sudo rm -f "${PLIST_DEST}"
   fi
+  # The gateway is additive state; uninstall removes it too.
+  if daemon_loaded "${GATEWAY_LABEL}"; then
+    step "Booting out system/${GATEWAY_LABEL}"
+    bootout_system "${GATEWAY_LABEL}"
+  fi
+  if [[ -e "${GATEWAY_PLIST_DEST}" ]]; then
+    step "Removing ${GATEWAY_PLIST_DEST}"
+    sudo rm -f "${GATEWAY_PLIST_DEST}"
+  fi
   if [[ -d "${CACHE_ROOT}" ]]; then
     if [[ "${KEEP_DATA}" -eq 1 ]]; then
       step "Removing runtime files; preserving ${CACHE_ROOT}/data and config"
@@ -1061,6 +1175,786 @@ cmd_uninstall() {
 }
 
 # ----------------------------------------------------------------------------
+# gateway — GitHub Actions cache service (Twirp v2 JSON) in front of MinIO.
+# The Python server is emitted into ${CACHE_ROOT}/bin at install time because
+# the Homebrew formula only ships the runner-* scripts. Stdlib only; loopback
+# only; per-scope bearer tokens; SigV4 presigned URLs so archive bytes flow
+# directly between the job and MinIO.
+# ----------------------------------------------------------------------------
+write_gateway_server() {
+  as_user bash -c 'cat > "$1" && chmod 700 "$1"' _ "${GATEWAY_SERVER_PATH}" <<'PYEOF'
+#!/usr/bin/env python3
+"""GitHub Actions cache service (Twirp v2, JSON) gateway to local MinIO.
+
+Generated by `runner-cache gateway install` — do not edit; re-run the install.
+
+Endpoints under /twirp/github.actions.results.api.v1.CacheService/:
+CreateCacheEntry, FinalizeCacheEntry, GetCacheEntryDownloadURL,
+DeleteCacheEntry. Archives live in each scope's MinIO bucket as
+"<key>/<version>"; upload/download bytes flow directly between the job and
+MinIO via SigV4 presigned URLs minted here with the scope's own credentials.
+
+Authentication: Authorization: Bearer <per-scope token> minted by
+`runner-cache gateway install` into the scope's 0600 env file under
+GATEWAY_SCOPES_DIR. Each token maps to exactly one scope (bucket + keypair).
+
+SAVE authorization: per-scope key-prefix policy in <slug>.save-policy; restore
+is always allowed (actions/cache restore-keys semantics). The protocol carries
+no branch/ref and the "version" is an opaque client-computed hash, so policy
+can only be enforced on key prefixes — see docs/cache-backend.md.
+"""
+
+import hashlib
+import hmac
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+REGION = "us-east-1"
+S3_SERVICE = "s3"
+TWIRP_PREFIX = "/twirp/github.actions.results.api.v1.CacheService/"
+PRESIGN_TTL_SECONDS = 3600
+MAX_RPC_BODY_BYTES = 4 * 1024 * 1024
+
+LISTEN_HOST = "127.0.0.1"
+LISTEN_PORT = int(os.environ.get("GATEWAY_PORT", "9157"))
+SCOPES_DIR = os.environ.get("GATEWAY_SCOPES_DIR", "")
+S3_ENDPOINT = os.environ.get("GATEWAY_S3_ENDPOINT",
+                             "http://127.0.0.1:9000").rstrip("/")
+
+
+class TwirpError(Exception):
+    def __init__(self, code, msg, status):
+        super().__init__(msg)
+        self.code = code
+        self.msg = msg
+        self.status = status
+
+
+# --- scope / policy loading -------------------------------------------------
+
+def parse_env_file(path):
+    values = {}
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, raw = line.partition("=")
+            raw = raw.strip()
+            if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
+                raw = raw[1:-1]
+            values[key.strip()] = raw
+    return values
+
+
+def load_save_prefixes(path):
+    if not os.path.isfile(path):
+        return ["*"]
+    prefixes = []
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                prefixes.append(line)
+    return prefixes or ["*"]
+
+
+def load_scopes(scopes_dir):
+    scopes = []
+    if not os.path.isdir(scopes_dir):
+        return scopes
+    for name in sorted(os.listdir(scopes_dir)):
+        if not name.endswith(".env"):
+            continue
+        env = parse_env_file(os.path.join(scopes_dir, name))
+        token = env.get("GATEWAY_TOKEN", "")
+        if not token:
+            continue
+        slug = name[:-len(".env")]
+        scopes.append({
+            "slug": slug,
+            "bucket": env.get("BUCKET", ""),
+            "access": env.get("ACCESS_KEY", ""),
+            "secret": env.get("SECRET_KEY", ""),
+            "token": token,
+            "save_prefixes": load_save_prefixes(
+                os.path.join(scopes_dir, slug + ".save-policy")),
+        })
+    return scopes
+
+
+def find_scope(scopes, token):
+    if not token:
+        return None
+    for scope in scopes:
+        if hmac.compare_digest(scope["token"], token):
+            return scope
+    return None
+
+
+def save_allowed(prefixes, key):
+    return any(p == "*" or key.startswith(p) for p in prefixes)
+
+
+# --- SigV4 (MinIO path-style addressing on loopback) -------------------------
+
+def _hmac_sha256(key, msg):
+    return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+
+def _signing_key(secret, datestamp):
+    key = _hmac_sha256(("AWS4" + secret).encode("utf-8"), datestamp)
+    for part in (REGION, S3_SERVICE, "aws4_request"):
+        key = _hmac_sha256(key, part)
+    return key
+
+
+def _canonical_query(params):
+    return "&".join(
+        "%s=%s" % (urllib.parse.quote(str(k), safe=""),
+                   urllib.parse.quote(str(v), safe=""))
+        for k, v in sorted(params))
+
+
+def _object_path(bucket, object_key=None):
+    path = "/" + urllib.parse.quote(bucket, safe="")
+    if object_key is not None:
+        path += "/" + urllib.parse.quote(object_key, safe="/")
+    return path
+
+
+def presign_url(method, scope, object_key, ttl=PRESIGN_TTL_SECONDS):
+    """Presigned URL handed to the job so bytes flow directly to/from MinIO."""
+    now = datetime.now(timezone.utc)
+    amzdate = now.strftime("%Y%m%dT%H%M%SZ")
+    datestamp = amzdate[:8]
+    host = urllib.parse.urlsplit(S3_ENDPOINT).netloc
+    cred_scope = "%s/%s/%s/aws4_request" % (datestamp, REGION, S3_SERVICE)
+    path = _object_path(scope["bucket"], object_key)
+    params = [
+        ("X-Amz-Algorithm", "AWS4-HMAC-SHA256"),
+        ("X-Amz-Credential", "%s/%s" % (scope["access"], cred_scope)),
+        ("X-Amz-Date", amzdate),
+        ("X-Amz-Expires", str(ttl)),
+        ("X-Amz-SignedHeaders", "host"),
+    ]
+    canonical = "\n".join([
+        method, path, _canonical_query(params),
+        "host:%s\n" % host, "host", "UNSIGNED-PAYLOAD",
+    ])
+    to_sign = "\n".join([
+        "AWS4-HMAC-SHA256", amzdate, cred_scope,
+        hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+    ])
+    signature = hmac.new(_signing_key(scope["secret"], datestamp),
+                         to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+    return "%s%s?%s&X-Amz-Signature=%s" % (
+        S3_ENDPOINT, path, _canonical_query(params), signature)
+
+
+def s3_request(scope, method, object_key=None, query=None, body=b""):
+    """Direct signed S3 call for existence checks, listing, and deletes."""
+    now = datetime.now(timezone.utc)
+    amzdate = now.strftime("%Y%m%dT%H%M%SZ")
+    datestamp = amzdate[:8]
+    host = urllib.parse.urlsplit(S3_ENDPOINT).netloc
+    cred_scope = "%s/%s/%s/aws4_request" % (datestamp, REGION, S3_SERVICE)
+    path = _object_path(scope["bucket"], object_key)
+    canonical_q = _canonical_query(list((query or {}).items()))
+    payload_hash = hashlib.sha256(body).hexdigest()
+    headers = [
+        ("host", host),
+        ("x-amz-content-sha256", payload_hash),
+        ("x-amz-date", amzdate),
+    ]
+    canonical_headers = "".join("%s:%s\n" % (k, v) for k, v in headers)
+    signed_headers = ";".join(k for k, _ in headers)
+    canonical = "\n".join([method, path, canonical_q, canonical_headers,
+                           signed_headers, payload_hash])
+    to_sign = "\n".join([
+        "AWS4-HMAC-SHA256", amzdate, cred_scope,
+        hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+    ])
+    signature = hmac.new(_signing_key(scope["secret"], datestamp),
+                         to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+    url = S3_ENDPOINT + path + ("?" + canonical_q if canonical_q else "")
+    request = urllib.request.Request(
+        url, data=body if method in ("PUT", "POST") else None, method=method)
+    request.add_header(
+        "Authorization",
+        "AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s"
+        % (scope["access"], cred_scope, signed_headers, signature))
+    request.add_header("X-Amz-Date", amzdate)
+    request.add_header("X-Amz-Content-Sha256", payload_hash)
+    try:
+        with urllib.request.urlopen(request, timeout=30) as resp:
+            return resp.status, resp.read(), resp.headers
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read(), exc.headers
+
+
+# --- cache service RPCs -------------------------------------------------------
+
+def object_name(key, version):
+    return "%s/%s" % (key, version)
+
+
+def body_field(body, *names):
+    for name in names:
+        value = body.get(name)
+        if value is not None:
+            return value
+    return None
+
+
+def validate_key_version(body):
+    key = body_field(body, "key") or ""
+    version = body_field(body, "version") or ""
+    if not key or not version:
+        raise TwirpError("invalid_argument", "key and version are required", 400)
+    if key.startswith("/") or "\x00" in key or ".." in version \
+            or "\x00" in version:
+        raise TwirpError("invalid_argument", "unacceptable key or version", 400)
+    return key, version
+
+
+def require_save(scope, key):
+    if not save_allowed(scope["save_prefixes"], key):
+        raise TwirpError(
+            "permission_denied",
+            "key does not match any allowed SAVE prefix for this scope", 403)
+
+
+def rpc_create_cache_entry(scope, body):
+    key, version = validate_key_version(body)
+    require_save(scope, key)
+    status, _, _ = s3_request(scope, "HEAD", object_name(key, version))
+    if status == 200:
+        return {"ok": False}
+    url = presign_url("PUT", scope, object_name(key, version))
+    return {"ok": True, "signed_upload_url": url, "signedUploadUrl": url}
+
+
+def rpc_finalize_cache_entry(scope, body):
+    key, version = validate_key_version(body)
+    require_save(scope, key)
+    status, _, headers = s3_request(scope, "HEAD", object_name(key, version))
+    if status != 200:
+        raise TwirpError("not_found",
+                         "no uploaded archive for this key/version", 404)
+    actual = int(headers.get("Content-Length", "-1"))
+    try:
+        expected = int(body_field(body, "size_bytes", "sizeBytes") or -1)
+    except (TypeError, ValueError):
+        expected = -1
+    if expected >= 0 and actual != expected:
+        s3_request(scope, "DELETE", object_name(key, version))
+        raise TwirpError(
+            "invalid_argument",
+            "uploaded size %d does not match size_bytes %d"
+            % (actual, expected), 400)
+    return {"ok": True, "entry_id": str(actual), "entryId": str(actual)}
+
+
+def rpc_get_download_url(scope, body):
+    key, version = validate_key_version(body)
+    status, _, _ = s3_request(scope, "HEAD", object_name(key, version))
+    if status == 200:
+        url = presign_url("GET", scope, object_name(key, version))
+        return {"ok": True, "matched_key": key, "matchedKey": key,
+                "signed_download_url": url, "signedDownloadUrl": url}
+    restore_keys = body_field(body, "restore_keys", "restoreKeys") or []
+    if not isinstance(restore_keys, list):
+        restore_keys = []
+    for restore_key in restore_keys:
+        hit = newest_matching_object(scope, str(restore_key), version)
+        if hit:
+            matched_key = hit[0]
+            url = presign_url("GET", scope, object_name(matched_key, version))
+            return {"ok": True, "matched_key": matched_key,
+                    "matchedKey": matched_key,
+                    "signed_download_url": url, "signedDownloadUrl": url}
+    return {"ok": False}
+
+
+def newest_matching_object(scope, restore_key, version):
+    status, payload, _ = s3_request(scope, "GET", None,
+                                    {"list-type": "2", "prefix": restore_key,
+                                     "max-keys": "1000"})
+    if status != 200:
+        return None
+    suffix = "/" + version
+    best = None
+    root = ET.fromstring(payload)
+    for contents in root.iter():
+        if not contents.tag.endswith("Contents"):
+            continue
+        name = modified = None
+        for child in contents:
+            if child.tag.endswith("Key"):
+                name = child.text
+            elif child.tag.endswith("LastModified"):
+                modified = child.text
+        if not name or not name.endswith(suffix):
+            continue
+        candidate_key = name[:-len(suffix)]
+        if not candidate_key.startswith(restore_key):
+            continue
+        if best is None or (modified or "") > best[1]:
+            best = (candidate_key, modified or "")
+    return best
+
+
+def rpc_delete_cache_entry(scope, body):
+    key, version = validate_key_version(body)
+    require_save(scope, key)
+    s3_request(scope, "DELETE", object_name(key, version))
+    return {"ok": True}
+
+
+RPC_HANDLERS = {
+    "CreateCacheEntry": rpc_create_cache_entry,
+    "FinalizeCacheEntry": rpc_finalize_cache_entry,
+    "GetCacheEntryDownloadURL": rpc_get_download_url,
+    "DeleteCacheEntry": rpc_delete_cache_entry,
+}
+
+
+# --- HTTP plumbing ------------------------------------------------------------
+
+class GatewayHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "runner-cache-gateway"
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("gateway: " + (fmt % args) + "\n")
+
+    def _send_json(self, status, payload):
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/healthz":
+            self._send_json(200, {"ok": True})
+        else:
+            self._send_json(404, {"code": "not_found", "msg": "unknown path"})
+
+    def do_POST(self):
+        if not self.path.startswith(TWIRP_PREFIX):
+            self._send_json(404, {"code": "not_found", "msg": "unknown path"})
+            return
+        method = self.path[len(TWIRP_PREFIX):]
+        handler = RPC_HANDLERS.get(method)
+        if handler is None:
+            self._send_json(404, {"code": "not_found",
+                                  "msg": "unknown rpc: " + method})
+            return
+        auth = self.headers.get("Authorization", "")
+        token = auth[len("Bearer "):].strip() if auth.startswith("Bearer ") \
+            else ""
+        scope = find_scope(load_scopes(SCOPES_DIR), token)
+        if scope is None:
+            self._send_json(401, {"code": "unauthenticated",
+                                  "msg": "invalid or missing bearer token"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length > MAX_RPC_BODY_BYTES:
+            self._send_json(400, {"code": "invalid_argument",
+                                  "msg": "request body too large"})
+            return
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except (ValueError, UnicodeDecodeError):
+            self._send_json(400, {"code": "invalid_argument",
+                                  "msg": "body must be JSON"})
+            return
+        try:
+            self._send_json(200, handler(scope, body))
+        except TwirpError as exc:
+            self._send_json(exc.status, {"code": exc.code, "msg": exc.msg})
+        except Exception as exc:  # keep the daemon alive; report Twirp internal
+            self._send_json(500, {"code": "internal", "msg": str(exc)})
+
+
+def main():
+    if not SCOPES_DIR:
+        sys.stderr.write("GATEWAY_SCOPES_DIR is not set; refusing to start.\n")
+        return 1
+    server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), GatewayHandler)
+    sys.stderr.write("cache gateway listening on http://%s:%d (scopes: %s)\n"
+                     % (LISTEN_HOST, LISTEN_PORT, SCOPES_DIR))
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+PYEOF
+}
+
+write_gateway_wrapper() {
+  as_user bash -c 'cat > "$1" && chmod 755 "$1"' _ "${GATEWAY_WRAPPER_PATH}" <<'EOF'
+#!/usr/bin/env bash
+# Generated by runner-cache gateway install — do not edit; re-run the install.
+set -euo pipefail
+CACHE_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=/dev/null
+. "${CACHE_ROOT}/config/minio.env"
+export GATEWAY_PORT GATEWAY_SCOPES_DIR GATEWAY_S3_ENDPOINT
+GATEWAY_SCOPES_DIR="${CACHE_ROOT}/config/scopes"
+GATEWAY_S3_ENDPOINT="http://127.0.0.1:${CACHE_PORT}"
+exec /usr/bin/env python3 "${CACHE_ROOT}/bin/cache-gateway.py"
+EOF
+}
+
+# Mint (or reuse) the per-scope gateway bearer token inside the scope's 0600
+# env file; never echoed. Prints nothing.
+ensure_gateway_token() {
+  local sf="$1" token
+  token="$(. "${sf}"; printf '%s' "${GATEWAY_TOKEN:-}")"
+  if [[ -n "${token}" ]]; then
+    step "Reusing existing gateway token for scope '${SCOPE_SLUG}' (never displayed)"
+    return 0
+  fi
+  token="$(gen_secret)"
+  printf 'GATEWAY_TOKEN="%s"\n' "${token}" \
+    | as_user bash -c 'umask 077; cat >> "$1"; chmod 600 "$1"' _ "${sf}"
+  step "Gateway bearer token minted into ${sf} (0600, never displayed)"
+}
+
+# Write (or reuse) the per-scope SAVE key-prefix policy. Restore is never
+# restricted, matching actions/cache restore-keys semantics.
+ensure_gateway_policy() {
+  local policy_file="${SCOPES_DIR}/${SCOPE_SLUG}.save-policy"
+  if [[ ${#SAVE_PREFIXES[@]} -gt 0 ]]; then
+    local p
+    {
+      printf '%s\n' '# Allowed SAVE key prefixes for this scope (one per line).'
+      printf '%s\n' '# Restore is always allowed. A lone * allows every key.'
+      for p in "${SAVE_PREFIXES[@]}"; do printf '%s\n' "${p}"; done
+    } | write_secret_file "${policy_file}"
+    step "SAVE key-prefix policy written to ${policy_file} (${#SAVE_PREFIXES[@]} prefix(es))"
+  elif [[ ! -f "${policy_file}" ]]; then
+    printf '%s\n' \
+      '# Allowed SAVE key prefixes for this scope (one per line).' \
+      '# Restore is always allowed. A lone * allows every key.' \
+      '*' | write_secret_file "${policy_file}"
+    step "Default SAVE policy (*, allow all) written to ${policy_file};"
+    step "restrict with: ${PROG_NAME} gateway install --save-prefix PREFIX ..."
+  else
+    step "Reusing existing SAVE policy ${policy_file}"
+  fi
+}
+
+# Persist the gateway port in minio.env (non-secret); first install wins.
+ensure_gateway_port_config() {
+  local requested="$1"
+  if grep -q '^GATEWAY_PORT=' "${MINIO_ENV_FILE}" 2>/dev/null; then
+    if [[ "${requested}" != "${GATEWAY_PORT}" ]]; then
+      warn "Gateway port is already fixed at ${GATEWAY_PORT} from the first"
+      warn "gateway install; ignoring --gateway-port. Reinstall to change it."
+    fi
+  else
+    GATEWAY_PORT="${requested}"
+    printf 'GATEWAY_PORT="%s"\n' "${GATEWAY_PORT}" \
+      | as_user bash -c 'cat >> "$1"; chmod 600 "$1"' _ "${MINIO_ENV_FILE}"
+  fi
+}
+
+cmd_gateway_install() {
+  detect_platform
+  require_cmds curl openssl awk grep uname id sudo launchctl plutil dscl shasum python3
+  detect_user
+  if [[ ! -r "${MINIO_ENV_FILE}" ]]; then
+    err "Cache backend is not installed. Run first:"
+    err "  ${PROG_NAME} install --org ORG   (or --repo OWNER/REPO)"
+    exit 1
+  fi
+  resolve_scope
+  local sf
+  sf="$(scope_file "${SCOPE_SLUG}")"
+  if [[ ! -r "${sf}" ]]; then
+    err "Scope '${SCOPE_SLUG}' is not provisioned. Run ${PROG_NAME} install with"
+    err "the same scope first, then retry gateway install."
+    exit 1
+  fi
+  local requested_port="${GATEWAY_PORT}"
+  load_config
+  if [[ "${requested_port}" == "${CACHE_PORT}" || "${requested_port}" == "${CACHE_CONSOLE_PORT}" ]]; then
+    err "--gateway-port must differ from the MinIO ports (${CACHE_PORT}/${CACHE_CONSOLE_PORT})."
+    exit 2
+  fi
+  ensure_sudo
+  WORK_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/runner-cache-gateway.XXXXXX")"
+
+  ensure_gateway_port_config "${requested_port}"
+  ensure_gateway_token "${sf}"
+  ensure_gateway_policy
+
+  step "Writing ${GATEWAY_SERVER_PATH}"
+  write_gateway_server
+  step "Writing ${GATEWAY_WRAPPER_PATH}"
+  write_gateway_wrapper
+
+  log "Writing LaunchDaemon ${GATEWAY_PLIST_DEST}"
+  local tmp_plist="${WORK_TMPDIR}/${GATEWAY_LABEL}.plist"
+  cat > "${tmp_plist}" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${GATEWAY_LABEL}</string>
+  <key>UserName</key>
+  <string>${REAL_USER}</string>
+  <key>WorkingDirectory</key>
+  <string>${CACHE_ROOT}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${GATEWAY_WRAPPER_PATH}</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>${REAL_HOME}</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>${LOG_DIR}/gateway-stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>${LOG_DIR}/gateway-stderr.log</string>
+</dict>
+</plist>
+EOF
+
+  if ! plutil -lint "${tmp_plist}" >/dev/null 2>&1; then
+    err "Generated gateway plist failed plutil -lint."
+    exit 1
+  fi
+
+  bootout_system "${GATEWAY_LABEL}"
+  sudo rm -f "${GATEWAY_PLIST_DEST}"
+  sudo cp "${tmp_plist}" "${GATEWAY_PLIST_DEST}"
+  sudo chown root:wheel "${GATEWAY_PLIST_DEST}"
+  sudo chmod 644 "${GATEWAY_PLIST_DEST}"
+
+  as_user touch "${LOG_DIR}/gateway-stdout.log" "${LOG_DIR}/gateway-stderr.log" \
+    || warn "Could not pre-create gateway log files in ${LOG_DIR}; launchd will create them."
+
+  step "Bootstrapping system/${GATEWAY_LABEL}"
+  if ! sudo launchctl bootstrap system "${GATEWAY_PLIST_DEST}"; then
+    sleep 2
+    if ! sudo launchctl bootstrap system "${GATEWAY_PLIST_DEST}"; then
+      err "launchctl bootstrap failed for ${GATEWAY_LABEL}."
+      exit 1
+    fi
+  fi
+  sudo launchctl enable "system/${GATEWAY_LABEL}" 2>/dev/null || true
+  sudo launchctl kickstart -k "system/${GATEWAY_LABEL}" 2>/dev/null || true
+
+  step "Waiting for the gateway to answer on 127.0.0.1:${GATEWAY_PORT}"
+  if ! wait_gateway_healthy; then
+    err "Gateway did not become healthy within 30s. Check ${LOG_DIR}/gateway-stderr.log"
+    err "and: sudo launchctl print system/${GATEWAY_LABEL}"
+    exit 1
+  fi
+
+  printf '\n'
+  log "Cache gateway running as ${REAL_USER} (system/${GATEWAY_LABEL})."
+  log "Twirp endpoint: http://127.0.0.1:${GATEWAY_PORT}/twirp/github.actions.results.api.v1.CacheService/"
+  log "Next step:      ${PROG_NAME} gateway env $( [[ "${SCOPE_KIND}" == "org" ]] && printf -- '--org %s' "${SCOPE}" || printf -- '--repo %s' "${SCOPE}" )"
+}
+
+cmd_gateway_start() {
+  detect_platform
+  require_cmds sudo launchctl curl
+  detect_user
+  if [[ ! -f "${GATEWAY_PLIST_DEST}" ]]; then
+    err "Gateway not installed (no ${GATEWAY_PLIST_DEST})."
+    err "Run: ${PROG_NAME} gateway install --org ORG (or --repo OWNER/REPO)"
+    exit 1
+  fi
+  load_config
+  ensure_sudo
+  if daemon_loaded "${GATEWAY_LABEL}"; then
+    log "Reloading system/${GATEWAY_LABEL}"
+    sudo launchctl kickstart -k "system/${GATEWAY_LABEL}"
+  else
+    log "Bootstrapping system/${GATEWAY_LABEL}"
+    sudo launchctl bootstrap system "${GATEWAY_PLIST_DEST}"
+    sudo launchctl enable "system/${GATEWAY_LABEL}" 2>/dev/null || true
+  fi
+  if wait_gateway_healthy; then
+    log "Gateway is healthy on 127.0.0.1:${GATEWAY_PORT}."
+  else
+    err "Gateway did not become healthy; check ${LOG_DIR}/gateway-stderr.log"
+    return 1
+  fi
+}
+
+cmd_gateway_stop() {
+  detect_platform
+  require_cmds sudo launchctl
+  detect_user
+  ensure_sudo
+  if daemon_loaded "${GATEWAY_LABEL}"; then
+    log "Booting out system/${GATEWAY_LABEL} (plist stays installed)"
+    bootout_system "${GATEWAY_LABEL}"
+    log "Stopped."
+  else
+    log "system/${GATEWAY_LABEL} is not loaded; nothing to stop."
+  fi
+}
+
+# Scopes authorized on the gateway (have a minted GATEWAY_TOKEN). Never prints
+# token values; only a count.
+gateway_authorized_scope_count() {
+  local f count=0
+  shopt -s nullglob
+  for f in "${SCOPES_DIR}"/*.env; do
+    if grep -q '^GATEWAY_TOKEN=' "${f}" 2>/dev/null; then
+      count=$((count + 1))
+    fi
+  done
+  shopt -u nullglob
+  printf '%s' "${count}"
+}
+
+cmd_gateway_status() {
+  detect_platform
+  require_cmds curl awk grep
+  detect_user
+  load_config
+
+  local installed=false loaded=false healthy=false
+  [[ -f "${GATEWAY_PLIST_DEST}" || -r "${GATEWAY_SERVER_PATH}" ]] && installed=true
+  daemon_loaded_n "${GATEWAY_LABEL}" && loaded=true
+  if curl -fsS -o /dev/null --max-time 2 \
+      "http://127.0.0.1:${GATEWAY_PORT}/healthz" 2>/dev/null; then
+    healthy=true
+  fi
+  local scopes
+  scopes="$(gateway_authorized_scope_count)"
+
+  if [[ "${JSON}" -eq 1 ]]; then
+    printf '{"daemon":"%s","installed":%s,"launchd_loaded":%s,"healthy":%s,"url":"http://127.0.0.1:%s/","authorized_scopes":%s}\n' \
+      "$(json_escape "${GATEWAY_LABEL}")" "${installed}" "${loaded}" "${healthy}" \
+      "${GATEWAY_PORT}" "${scopes}"
+    return 0
+  fi
+
+  printf '\n'
+  printf '==> runner-cache gateway status\n'
+  printf '  %-18s %s\n' "Daemon:" "${GATEWAY_LABEL}"
+  printf '  %-18s %s\n' "installed:" "${installed}"
+  if [[ "${loaded}" == "true" ]]; then
+    printf '  %-18s %s\n' "launchd:" "loaded"
+  else
+    printf '  %-18s %s\n' "launchd:" "NOT loaded (or requires sudo to inspect)"
+  fi
+  if [[ "${healthy}" == "true" ]]; then
+    printf '  %-18s %s\n' "health:" "OK (http://127.0.0.1:${GATEWAY_PORT}/healthz)"
+  else
+    printf '  %-18s %s\n' "health:" "DOWN (http://127.0.0.1:${GATEWAY_PORT})"
+  fi
+  printf '  %-18s %s\n' "Twirp endpoint:" "http://127.0.0.1:${GATEWAY_PORT}/twirp/github.actions.results.api.v1.CacheService/"
+  printf '  %-18s %s\n' "Authorized scopes:" "${scopes}"
+  printf '\n'
+}
+
+# gateway env — ACTIONS_* wiring for standard actions/cache on stdout; token
+# handling and runner wiring instructions on stderr (token value never shown).
+cmd_gateway_env() {
+  detect_platform
+  require_cmds uname id dscl shasum awk tr
+  detect_user
+  pick_scope
+  local sf token
+  sf="$(scope_file "${SCOPE_SLUG}")"
+  if [[ ! -r "${sf}" ]]; then
+    err "Scope '${SCOPE_SLUG}' is not installed. Run install with the same scope."
+    exit 1
+  fi
+  token="$(. "${sf}"; printf '%s' "${GATEWAY_TOKEN:-}")"
+  if [[ -z "${token}" ]]; then
+    err "Scope '${SCOPE_SLUG}' has no gateway token. Run:"
+    err "  ${PROG_NAME} gateway install with the same scope."
+    exit 1
+  fi
+  load_config
+
+  cat <<EOF
+ACTIONS_CACHE_URL=http://127.0.0.1:${GATEWAY_PORT}/
+ACTIONS_RESULTS_URL=http://127.0.0.1:${GATEWAY_PORT}/
+ACTIONS_CACHE_SERVICE_V2=true
+EOF
+
+  cat >&2 <<EOF
+
+==> Scope '${SCOPE_SLUG}' is served by the gateway on 127.0.0.1:${GATEWAY_PORT}.
+    The bearer token is GATEWAY_TOKEN in ${sf} (0600, never displayed).
+
+==> To route standard actions/cache on a runner through this gateway, add the
+    stdout lines above — plus ACTIONS_RUNTIME_TOKEN set to that GATEWAY_TOKEN
+    value — to the runner's .env file (same directory as run.sh, mode 0600),
+    then restart that runner while it is idle. Example:
+
+      umask 077
+      {
+        ${PROG_NAME} gateway env $( [[ "${SCOPE_KIND}" == "org" ]] && printf -- '--org %s' "${SCOPE}" || printf -- '--repo %s' "${SCOPE}" ) 2>/dev/null
+        . "${sf}" && printf 'ACTIONS_RUNTIME_TOKEN=%s\n' "\${GATEWAY_TOKEN}"
+      } >> /path/to/actions-runner/.env
+
+    Warnings:
+    - ACTIONS_RUNTIME_TOKEN is also used by GitHub's cache/artifact/results
+      clients. Overriding it means those GitHub-hosted calls fail on this
+      runner; use gateway wiring only on runners dedicated to local caching.
+    - Every job on that runner inherits this token, including PR jobs. Only
+      wire trusted workflows; keep fork PRs on unwired runners.
+    - SAVE is restricted by the scope's key-prefix policy
+      (${SCOPES_DIR}/${SCOPE_SLUG}.save-policy); restore stays open.
+    - Workflows using the explicit S3 action (tespkg/actions-cache) are
+      unaffected and keep working in parallel.
+    See docs/cache-backend.md for the branch-authorization limits.
+EOF
+}
+
+cmd_gateway() {
+  case "${GATEWAY_SUB}" in
+    install) cmd_gateway_install ;;
+    start)   cmd_gateway_start ;;
+    stop)    cmd_gateway_stop ;;
+    status)  cmd_gateway_status ;;
+    env)     cmd_gateway_env ;;
+  esac
+}
+
+# ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
 main() {
@@ -1072,6 +1966,7 @@ main() {
     status)    cmd_status ;;
     env)       cmd_env ;;
     metrics)   cmd_metrics ;;
+    gateway)   cmd_gateway ;;
     uninstall) cmd_uninstall ;;
   esac
 }

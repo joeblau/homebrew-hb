@@ -20,7 +20,11 @@ class LifecycleTests(unittest.TestCase):
 
     def shell(self, script, body, **env):
         # Evaluate the function definitions, excluding the sole CLI entrypoint.
-        definitions = (REPO / script).read_text().rsplit('main "$@"', 1)[0]
+        text = (REPO / script).read_text()
+        if '\nif [[ "${BASH_SOURCE[0]}"' in text:
+            definitions = text.rsplit('\nif [[ "${BASH_SOURCE[0]}"', 1)[0]
+        else:
+            definitions = text.rsplit('main "$@"', 1)[0]
         return subprocess.run(["/bin/bash", "-c", definitions + '\ntrap - EXIT\n' + body],
                               env=dict(os.environ, TEST_ROOT=str(self.root), **env),
                               text=True, capture_output=True)
