@@ -15,7 +15,10 @@
 # LaunchDaemons) stays inside those scripts — this controller uses no sudo.
 #
 # Runs a single scaling tick by default (pair it with a launchd StartInterval
-# service), or loops with --daemon. Every decision — timestamp, queue depth,
+# service), or loops with --daemon. Scale-up provisions a bounded batch per
+# tick: matching queued demand minus ready idle capacity, the --min deficit,
+# clamped by --scale-up-batch and the per-host --capacity-budget. Every
+# decision — timestamp, queue depth, requested/attempted/actual capacity,
 # action, reason — is appended to a stable decision log, and a lockfile ensures
 # only one scale operation is ever in flight. See docs/autoscaling.md for the
 # launchd plist, the multi-host primary/standby model, and rate-limit math.
@@ -33,6 +36,7 @@ DEFAULT_INTERVAL=60
 DEFAULT_MIN=1
 DEFAULT_MAX=4
 DEFAULT_SCALE_UP_THRESHOLD=1
+DEFAULT_SCALE_UP_BATCH=1
 DEFAULT_COOLDOWN_MINUTES=30
 DEFAULT_LABELS="macos,macmini,self-hosted"
 LOCK_STALE_SECONDS=3600     # break a lock older than this (holder died mid-op)
@@ -48,6 +52,8 @@ INTERVAL="${DEFAULT_INTERVAL}"
 MIN_RUNNERS="${DEFAULT_MIN}"
 MAX_RUNNERS="${DEFAULT_MAX}"
 SCALE_UP_THRESHOLD="${DEFAULT_SCALE_UP_THRESHOLD}"
+SCALE_UP_BATCH="${DEFAULT_SCALE_UP_BATCH}"
+CAPACITY_BUDGET=""             # defaults to --max after parsing
 COOLDOWN_MINUTES="${DEFAULT_COOLDOWN_MINUTES}"
 LABELS="${DEFAULT_LABELS}"
 
@@ -109,6 +115,14 @@ OPTIONS:
   --max N               Never scale above N runners (default: ${DEFAULT_MAX}).
   --scale-up-threshold N
                         Scale up at N matching queued jobs (default: ${DEFAULT_SCALE_UP_THRESHOLD}).
+  --scale-up-batch N    Maximum runners to provision in one tick (default: ${DEFAULT_SCALE_UP_BATCH}).
+                        Bounds burst scale-up; demand beyond the batch waits
+                        for the next tick.
+  --capacity-budget N   Conservative per-host ceiling on runner processes
+                        (default: the --max value). Scale-up never grows the
+                        local fleet beyond this, regardless of observed demand.
+                        This is a runner-PROCESS budget, not physical compute —
+                        each runner shares the same Mac's CPU/RAM/disk.
   --cooldown-minutes N  Scale down only after N minutes with an empty queue
                         and no busy runner (default: ${DEFAULT_COOLDOWN_MINUTES}).
   --labels CSV          Labels for newly provisioned runners; should match the
@@ -125,11 +139,17 @@ EXAMPLES:
 
 SCALING MODEL:
   scale UP   runners < min OR matching queued jobs >= threshold, with room
-             below max. Provision one runner, filling the first numbering gap.
+             below max and the capacity budget. Provisions a bounded batch:
+             max(min deficit, queued demand minus ready idle local runners),
+             clamped by --scale-up-batch and remaining capacity, filling
+             numbering gaps first. Ready capacity means registered, online,
+             and idle by exact runner name — directories alone do not count.
   scale DOWN queue empty, every local runner confirmed online and idle by its
              exact registered name, cooldown elapsed, AND runners > min.
+             Removes one runner per tick.
   API failures, malformed JSON, incomplete pagination, or mixed local scopes
-  block the tick. Each decision is logged; one host-level lock serializes it.
+  block the tick. Unknown idle capacity limits a scale-up to one runner.
+  Each decision is logged; one host-level lock serializes it.
 
 SECURITY NOTE:
   GITHUB_PAT is never placed on a command line: curl reads the Authorization
@@ -193,6 +213,14 @@ parse_args() {
         [[ $# -ge 2 ]] || { err "--scale-up-threshold requires a value"; usage; exit 2; }
         SCALE_UP_THRESHOLD="$2"; shift 2 ;;
       --scale-up-threshold=*) SCALE_UP_THRESHOLD="${1#*=}"; shift ;;
+      --scale-up-batch)
+        [[ $# -ge 2 ]] || { err "--scale-up-batch requires a value"; usage; exit 2; }
+        SCALE_UP_BATCH="$2"; shift 2 ;;
+      --scale-up-batch=*) SCALE_UP_BATCH="${1#*=}"; shift ;;
+      --capacity-budget)
+        [[ $# -ge 2 ]] || { err "--capacity-budget requires a value"; usage; exit 2; }
+        CAPACITY_BUDGET="$2"; shift 2 ;;
+      --capacity-budget=*) CAPACITY_BUDGET="${1#*=}"; shift ;;
       --cooldown-minutes)
         [[ $# -ge 2 ]] || { err "--cooldown-minutes requires a value"; usage; exit 2; }
         COOLDOWN_MINUTES="$2"; shift 2 ;;
@@ -224,8 +252,11 @@ parse_args() {
     exit 2
   fi
 
+  # The per-host capacity budget defaults to --max when not set explicitly.
+  [[ -n "${CAPACITY_BUDGET}" ]] || CAPACITY_BUDGET="${MAX_RUNNERS}"
+
   local v name
-  for name in INTERVAL MIN_RUNNERS MAX_RUNNERS SCALE_UP_THRESHOLD COOLDOWN_MINUTES; do
+  for name in INTERVAL MIN_RUNNERS MAX_RUNNERS SCALE_UP_THRESHOLD SCALE_UP_BATCH CAPACITY_BUDGET COOLDOWN_MINUTES; do
     v="${!name}"
     if ! [[ "${v}" =~ ^[0-9]+$ ]]; then
       err "${name} must be a non-negative integer (got: '${v}')"
@@ -234,6 +265,14 @@ parse_args() {
   done
   if [[ "${SCALE_UP_THRESHOLD}" -lt 1 ]]; then
     err "--scale-up-threshold must be at least 1 queued job."
+    exit 2
+  fi
+  if [[ "${SCALE_UP_BATCH}" -lt 1 ]]; then
+    err "--scale-up-batch must be at least 1."
+    exit 2
+  fi
+  if [[ "${CAPACITY_BUDGET}" -lt "${MIN_RUNNERS}" ]]; then
+    err "--capacity-budget (${CAPACITY_BUDGET}) must be at least --min (${MIN_RUNNERS})."
     exit 2
   fi
   if [[ "${INTERVAL}" -lt 1 ]]; then
@@ -582,6 +621,27 @@ $(list_runner_indices)
 EOF
 }
 
+# Ready idle capacity: local runners confirmed registered, online, and idle by
+# their exact agentName. Directories alone never count; a runner missing from
+# the API list (offline, re-registering, or failed registration) is not usable
+# capacity, and other hosts' runners in the same scope are never matched.
+count_ready_idle() {
+  local json="$1" idx name count=0
+  while IFS= read -r idx; do
+    [[ -n "${idx}" ]] || continue
+    name="$(jq -er '.agentName | select(type == "string" and length > 0)' \
+      "${RUNNER_ROOT}/runner-${idx}/.runner" 2>/dev/null)" || continue
+    if printf '%s' "${json}" | jq -e --arg name "${name}" '
+      [.[] | select(.name == $name)] | length == 1 and
+      (.[0].busy == false) and (.[0].status == "online")' >/dev/null; then
+      count=$((count + 1))
+    fi
+  done <<EOF
+$(list_runner_indices)
+EOF
+  printf '%s\n' "${count}"
+}
+
 # ----------------------------------------------------------------------------
 # Idle-since state (cooldown tracking), persisted between ticks.
 # ----------------------------------------------------------------------------
@@ -599,13 +659,61 @@ save_idle_since() {
 # ----------------------------------------------------------------------------
 # Scaling operations (delegated to runner-setup / runner-cleanup)
 # ----------------------------------------------------------------------------
+# Bounded batch size for one scale-up tick: the larger of the --min deficit
+# and the matching queued demand beyond ready idle capacity, clamped by
+# --scale-up-batch and the room below --max and the per-host capacity budget.
+# The runner list is needed to offset demand by idle capacity; if it cannot be
+# fetched the state is unknown, so fail closed to a single-runner tick.
+plan_scale_up_batch() {
+  local depth="$1" current="$2"
+  local min_deficit=0 demand=0
+  if [[ "${current}" -lt "${MIN_RUNNERS}" ]]; then
+    min_deficit=$((MIN_RUNNERS - current))
+  fi
+  if [[ "${depth}" -ge "${SCALE_UP_THRESHOLD}" ]]; then
+    local rjson="" idle
+    if rjson="$(api_list "${SCOPE_API}/actions/runners" runners)"; then
+      idle="$(count_ready_idle "${rjson}")"
+      demand=$((depth - idle))
+      [[ "${demand}" -ge 0 ]] || demand=0
+    else
+      warn "Could not fetch the runner list; idle capacity is unknown, so this tick provisions at most one runner."
+      demand=1
+    fi
+  fi
+  local wanted="${min_deficit}"
+  [[ "${demand}" -le "${wanted}" ]] || wanted="${demand}"
+  local cap="${MAX_RUNNERS}"
+  [[ "${CAPACITY_BUDGET}" -ge "${cap}" ]] || cap="${CAPACITY_BUDGET}"
+  local room=$((cap - current))
+  [[ "${room}" -ge 0 ]] || room=0
+  local batch="${wanted}"
+  [[ "${batch}" -le "${SCALE_UP_BATCH}" ]] || batch="${SCALE_UP_BATCH}"
+  [[ "${batch}" -le "${room}" ]] || batch="${room}"
+  printf '%s\n' "${batch}"
+}
+
 do_scale_up() {
   local depth="$1" current="$2"
   hold_for_maintenance && return 0
-  local next=1
-  # runner-setup fills 1..N: stop at the first missing index so gaps do not
-  # accidentally provision multiple runners or repeatedly target an old one.
-  while [[ -d "${RUNNER_ROOT}/runner-${next}" ]]; do next=$((next + 1)); done
+  local batch
+  batch="$(plan_scale_up_batch "${depth}" "${current}")"
+  if [[ "${batch}" -lt 1 ]]; then
+    log_decision "${depth}" "${current}" "none" \
+      "queued demand is already covered by ready idle capacity, or the fleet is at its max/capacity budget"
+    return 0
+  fi
+  # runner-setup provisions 1..N and skips already-configured runners, so
+  # targeting the batch-th missing index adds exactly `batch` runners and
+  # fills numbering gaps first instead of appending past them.
+  local target=0 found=0 idx=1
+  while [[ "${found}" -lt "${batch}" ]]; do
+    if [[ ! -d "${RUNNER_ROOT}/runner-${idx}" ]]; then
+      found=$((found + 1))
+      target="${idx}"
+    fi
+    idx=$((idx + 1))
+  done
   local token
   if ! token="$(fetch_token registration-token)"; then
     log_decision "${depth}" "${current}" "error" "scale-up aborted: could not mint a registration token"
@@ -613,7 +721,7 @@ do_scale_up() {
   fi
   hold_for_maintenance && return 0
   log_decision "${depth}" "${current}" "scale-up" \
-    "minimum capacity or queued-job threshold requires one runner; provisioning runner-${next} via runner-setup"
+    "requested=${batch} attempted=${batch}: minimum capacity or queued-job demand unmet by ready idle runners; provisioning missing indices through runner-${target} via runner-setup"
 
   local -a scope_args=()
   if [[ -n "${ORG}" ]]; then
@@ -622,14 +730,23 @@ do_scale_up() {
     scope_args=(--repo "${REPO}")
   fi
   [[ "${EPHEMERAL}" -eq 0 ]] || scope_args+=(--ephemeral)
-  # runner-setup provisions 1..N and skips already-configured runners, so
-  # targeting the first missing index configures one new runner. The token travels
-  # via the environment — never a ps-visible argument.
-  if ! GITHUB_PAT="${GITHUB_PAT}" RUNNER_TOKEN="${token}" "${RUNNER_SETUP_BIN}" \
-      "${scope_args[@]}" --runners "${next}" --labels "${LABELS}"; then
-    log_decision "${depth}" "${current}" "error" "runner-setup failed while scaling to ${next} runner(s)"
+  # The token travels via the environment — never a ps-visible argument.
+  local rc=0 after actual
+  GITHUB_PAT="${GITHUB_PAT}" RUNNER_TOKEN="${token}" "${RUNNER_SETUP_BIN}" \
+      "${scope_args[@]}" --runners "${target}" --labels "${LABELS}" || rc=$?
+  # Partial failure: runner-setup continues past a failed runner and reports
+  # nonzero, so measure what actually materialized. Directories created by a
+  # failed registration still do not count as ready idle capacity later.
+  after="$(count_runners)"
+  actual=$((after - current))
+  [[ "${actual}" -ge 0 ]] || actual=0
+  if [[ "${rc}" -ne 0 ]]; then
+    log_decision "${depth}" "${after}" "error" \
+      "runner-setup failed during batch scale-up: requested=${batch} attempted=${batch} actual=${actual} new runner(s)"
     return 1
   fi
+  log_decision "${depth}" "${after}" "scale-up-complete" \
+    "requested=${batch} attempted=${batch} actual=${actual} new runner(s) provisioned"
   save_idle_since 0
   return 0
 }
@@ -743,7 +860,7 @@ main() {
   WORK_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/runner-autoscale.XXXXXX")"
 
   if [[ "${DAEMON}" -eq 1 ]]; then
-    log "Autoscale controller starting: scope=${SCOPE_SLUG} interval=${INTERVAL}s min=${MIN_RUNNERS} max=${MAX_RUNNERS} threshold=${SCALE_UP_THRESHOLD} cooldown=${COOLDOWN_MINUTES}m"
+    log "Autoscale controller starting: scope=${SCOPE_SLUG} interval=${INTERVAL}s min=${MIN_RUNNERS} max=${MAX_RUNNERS} batch=${SCALE_UP_BATCH} budget=${CAPACITY_BUDGET} threshold=${SCALE_UP_THRESHOLD} cooldown=${COOLDOWN_MINUTES}m"
     log "Decision log: ${LOG_FILE}"
     while true; do
       run_tick || warn "Scaling tick failed; will retry at the next interval."

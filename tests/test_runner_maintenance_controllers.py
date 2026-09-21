@@ -208,6 +208,27 @@ do_scale_up 1 0
         self.assertIn("decision hold", self.events())
         self.assertNotIn("provision", self.events())
 
+    def test_autoscale_batch_scale_up_respects_hold(self):
+        self.hold()
+        result = self.shell("runner-autoscale", "do_scale_up 5 0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.events().count("decision hold"), 1)
+        self.assertNotIn("api", self.events())
+        self.assertNotIn("provision", self.events())
+
+    def test_autoscale_burst_uses_runner_list_and_bounded_batch(self):
+        result = self.shell("runner-autoscale", r'''
+SCALE_UP_BATCH=2
+fetch_queue_depth() { trace queue-api; echo 5; }
+run_tick
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("runners-api", self.events())
+        self.assertIn("token-api registration-token", self.events())
+        self.assertIn("provision", self.events())
+        # Depth 5 is clamped to the batch of 2, logged as requested/attempted.
+        self.assertIn("requested=2 attempted=2", self.events())
+
 
 if __name__ == "__main__":
     unittest.main()

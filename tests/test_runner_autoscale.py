@@ -177,6 +177,128 @@ log_decision() {{ printf '%s:%s\\n' "$3" "$4" >> "${{RUNNER_ROOT}}/decisions"; }
         result = self.run_shell('fetch_queue_depth() { echo 0; }; do_scale_down() { echo unsafe; }; run_tick')
         self.assertNotIn("unsafe", result.stdout)
 
+    def fake_setup(self, script='printf "%s\\n" "$*"\n'):
+        fake = self.root / "setup"
+        fake.write_text("#!/bin/bash\n" + script)
+        fake.chmod(0o755)
+        return fake
+
+    def online_runners_api(self, rows):
+        self.api("/repos/acme/repo/actions/runners?per_page=100&page=1", "runners", rows)
+
+    def test_burst_provisions_bounded_batch_in_one_tick(self):
+        self.queue(queued=[{"id": 40}])
+        self.api("/repos/acme/repo/actions/runs/40/jobs?filter=latest&per_page=100&page=1", "jobs", [
+            {"id": j, "status": "queued", "labels": ["macos"]} for j in (1, 2, 3)])
+        self.online_runners_api([])
+        fake = self.fake_setup()
+        result = self.run_shell(
+            f'fetch_token() {{ echo example; }}; RUNNER_SETUP_BIN={shlex.quote(str(fake))}; run_tick',
+            args="--repo acme/repo --min 0 --max 6 --scale-up-batch 2 --cooldown-minutes 0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--runners 2", result.stdout)
+
+    def test_scale_up_batch_must_be_positive(self):
+        result = self.run_shell(":", args="--repo acme/repo --scale-up-batch 0")
+        self.assertEqual(result.returncode, 2)
+
+    def test_capacity_budget_below_min_rejected(self):
+        result = self.run_shell(":", args="--repo acme/repo --min 3 --max 4 --capacity-budget 2")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--capacity-budget", result.stderr)
+
+    def test_idle_capacity_offsets_burst_demand(self):
+        self.runner(1)
+        self.online_runners_api([{"name": "mac-runner-1", "status": "online", "busy": False}])
+        fake = self.fake_setup()
+        result = self.run_shell(
+            f'fetch_token() {{ echo example; }}; RUNNER_SETUP_BIN={shlex.quote(str(fake))}; do_scale_up 3 1',
+            args="--repo acme/repo --min 0 --max 6 --scale-up-batch 5 --cooldown-minutes 0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # Demand 3 minus 1 ready idle runner = 2 new runners (indices 2 and 3).
+        self.assertIn("--runners 3", result.stdout)
+
+    def test_idle_capacity_covering_demand_skips_scale_up(self):
+        self.runner(1)
+        self.online_runners_api([{"name": "mac-runner-1", "status": "online", "busy": False}])
+        fake = self.fake_setup()
+        result = self.run_shell(
+            f'fetch_token() {{ echo example; }}; RUNNER_SETUP_BIN={shlex.quote(str(fake))}; do_scale_up 1 1')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("--runners", result.stdout)
+        self.assertIn("none", (self.root / "decisions").read_text())
+
+    def test_unregistered_directory_is_not_ready_capacity(self):
+        self.runner(1)
+        self.online_runners_api([])  # registration gap: not in the API list
+        fake = self.fake_setup()
+        result = self.run_shell(
+            f'fetch_token() {{ echo example; }}; RUNNER_SETUP_BIN={shlex.quote(str(fake))}; do_scale_up 2 1',
+            args="--repo acme/repo --min 0 --max 6 --scale-up-batch 4 --cooldown-minutes 0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--runners 3", result.stdout)
+
+    def test_busy_and_foreign_runners_do_not_offset_demand(self):
+        self.runner(1)
+        self.online_runners_api([
+            {"name": "mac-runner-1", "status": "online", "busy": True},
+            {"name": "other-mac-runner-1", "status": "online", "busy": False},
+        ])
+        fake = self.fake_setup()
+        result = self.run_shell(
+            f'fetch_token() {{ echo example; }}; RUNNER_SETUP_BIN={shlex.quote(str(fake))}; do_scale_up 2 1',
+            args="--repo acme/repo --min 0 --max 6 --scale-up-batch 4 --cooldown-minutes 0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--runners 3", result.stdout)
+
+    def test_batch_is_clamped_by_max_and_capacity_budget(self):
+        for i in (1, 2, 3):
+            self.runner(i)
+        self.online_runners_api([])
+        fake = self.fake_setup()
+        quoted = shlex.quote(str(fake))
+        # Room below --max 4 is one runner even with depth 5 and batch 5.
+        result = self.run_shell(
+            f'fetch_token() {{ echo example; }}; RUNNER_SETUP_BIN={quoted}; do_scale_up 5 3',
+            args="--repo acme/repo --min 0 --max 4 --scale-up-batch 5 --cooldown-minutes 0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--runners 4", result.stdout)
+        # A per-host budget below --max wins: fleet of 2 at budget 2 adds nothing.
+        result = self.run_shell(
+            f'fetch_token() {{ echo example; }}; RUNNER_SETUP_BIN={quoted}; do_scale_up 5 2',
+            args="--repo acme/repo --min 0 --max 6 --scale-up-batch 5 --capacity-budget 2 --cooldown-minutes 0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("--runners", result.stdout)
+
+    def test_minimum_reconciled_in_one_batch_across_numbering_gaps(self):
+        self.runner(1)
+        self.runner(3)
+        fake = self.fake_setup()
+        result = self.run_shell(
+            f'fetch_token() {{ echo example; }}; RUNNER_SETUP_BIN={shlex.quote(str(fake))}; do_scale_up 0 2',
+            args="--repo acme/repo --min 4 --max 6 --scale-up-batch 4 --cooldown-minutes 0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # Deficit is 2; targeting index 4 makes runner-setup fill gaps 2 and 4.
+        self.assertIn("--runners 4", result.stdout)
+
+    def test_runner_list_failure_limits_batch_to_one(self):
+        fake = self.fake_setup()  # runner-list endpoint deliberately unregistered
+        result = self.run_shell(
+            f'fetch_token() {{ echo example; }}; RUNNER_SETUP_BIN={shlex.quote(str(fake))}; do_scale_up 5 0',
+            args="--repo acme/repo --min 0 --max 8 --scale-up-batch 4 --cooldown-minutes 0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--runners 1", result.stdout)
+
+    def test_partial_provisioning_failure_logs_requested_attempted_actual(self):
+        fake = self.fake_setup(f'mkdir -p {shlex.quote(str(self.root))}/runner-1\nexit 1\n')
+        result = self.run_shell(
+            f'fetch_token() {{ echo example; }}; RUNNER_SETUP_BIN={shlex.quote(str(fake))}; do_scale_up 0 0',
+            args="--repo acme/repo --min 2 --max 6 --scale-up-batch 2 --cooldown-minutes 0")
+        self.assertNotEqual(result.returncode, 0)
+        decisions = (self.root / "decisions").read_text()
+        self.assertIn("error", decisions)
+        self.assertIn("requested=2 attempted=2 actual=1", decisions)
+
 
 if __name__ == "__main__":
     unittest.main()

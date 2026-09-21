@@ -14,6 +14,12 @@ GITHUB_PAT_FILE=/etc/github-runner-autoscale-pat \
   runner-autoscale --org acme \
     --queue-repo acme/api --queue-repo acme/web \
     --daemon --interval 120 --min 1 --max 4
+
+# Always-on Mac mini with a warm pool and bounded burst batches: keep 2 ready
+# runners, allow up to 3 new slots per tick, never exceed 6 runner processes.
+GITHUB_PAT_FILE=/etc/github-runner-autoscale-pat \
+  runner-autoscale --repo acme/monorepo \
+    --min 2 --max 6 --scale-up-batch 3 --capacity-budget 6
 ```
 
 ## Queue observation
@@ -41,18 +47,32 @@ are additionally bounded to 100 pages per endpoint.
 ## Decisions and lifecycle
 
 Each tick takes a local `mkdir` lock, checks registration scope, observes the
-queue, and makes at most one change:
+queue, and makes at most one change — a bounded scale-up batch or a single
+removal:
 
 - **Scale up:** below `--min`, or at least `--scale-up-threshold` matching jobs
-  are queued (default **1**), provided the fleet is below `--max`. A new
-  short-lived registration token is minted for this operation. The controller
-  asks `runner-setup` for the first missing runner index, so an existing
-  `runner-1, runner-3` fleet gets `runner-2` and cannot accidentally add two
-  runners by treating directory count as the highest index.
+  are queued (default **1**), provided the fleet is below `--max` and the
+  per-host `--capacity-budget`. One tick provisions a **bounded batch**: the
+  larger of the `--min` deficit and the queued demand not already covered by
+  ready idle local runners, clamped by `--scale-up-batch` (default **1**, the
+  legacy one-runner-per-tick behavior) and the remaining room under `--max`
+  and the capacity budget. Ready idle capacity means a local runner confirmed
+  registered, online, and not busy by its exact `agentName` in the runner
+  list — a directory alone never counts, and offline, re-registering, or
+  unregistered directories do not offset demand. If the runner list cannot be
+  fetched, idle capacity is unknown and the tick fails closed to a single
+  runner. A new short-lived registration token is minted for each operation
+  and reused for every runner in the batch. The controller asks `runner-setup`
+  for the batch-th missing runner index, so an existing `runner-1, runner-3`
+  fleet fills `runner-2` first, and a batch restores sparse numbering instead
+  of appending past gaps. The decision log records requested, attempted, and
+  actual new capacity; a `runner-setup` failure after partial provisioning is
+  logged with what materialized and fails the tick.
 - **Scale down:** the matching queue is empty, every local runner is confirmed
   online and idle, and the fleet has exceeded `--cooldown-minutes` of idle time
   (default **30**) while above `--min`. It mints a removal token and removes
-  the highest-numbered runner. The cooldown resets after removal.
+  the highest-numbered runner — one per tick. The cooldown resets after
+  removal. Batching never applies to scale-down.
 - **Hold:** when bounds, cooldown, or observed work do not justify a change.
   Missing, offline, malformed, or unregistered runner identities block removal.
 
@@ -68,10 +88,13 @@ The runner list is paginated, including when the organization has more than
 
 State and decisions live in `/opt/github-runners/.autoscale/`. Each log line
 includes timestamp, matching queued-job count, current/min/max capacity,
-action (`scale-up`, `scale-down`, `none`, `skip`, `error`), and reason. API
-queue failures and failed setup/cleanup return nonzero; daemon mode retries
-at the next interval. Failed runner-list queries hold capacity. Locks older
-than one hour are treated as stale; operations should finish within that limit.
+action (`scale-up`, `scale-up-complete`, `scale-down`, `none`, `skip`,
+`error`), and reason. Scale-up lines carry `requested`, `attempted`, and
+`actual` new-runner counts, so partial provisioning is visible after the
+fact. API queue failures and failed setup/cleanup return nonzero; daemon mode
+retries at the next interval. Failed runner-list queries hold capacity and
+limit any scale-up in that tick to one runner. Locks older than one hour are
+treated as stale; operations should finish within that limit.
 
 ## Prerequisites and launchd
 
@@ -139,26 +162,59 @@ read-only permission. A cached interactive sudo session is temporary.
 
 ## Capacity, API budget, and limits
 
-Start with a warm minimum and size `--max` from measured CPU, memory, and disk
-pressure. Each extra runner is another process on the same Mac; it does not
-add hardware or reserve CPU/RAM for a job. Scale-up creates at most one runner
-per tick, including when restoring the minimum. Registration and provisioning
-latency remain in addition to the poll interval.
+**Runner-process capacity is not physical compute capacity.** Each extra
+runner is another process on the same Mac; it does not add hardware or
+reserve CPU/RAM/disk for a job. Size `--max` from measured CPU, memory, and
+disk pressure, and set `--capacity-budget` (default: the `--max` value) to a
+conservative per-host ceiling that scale-up never exceeds regardless of
+observed demand. The budget is the operator's statement of what this Mac can
+actually absorb; `--max` remains the fleet-size policy bound.
 
-On an empty queue a tick uses two run-list requests per watched repository,
-plus the runner-list pages. Add a jobs request for each active workflow run,
-extra requests for all additional pages, and a token request for a scaling
-event. For `R` repositories with no runs and one runner-list page, the idle
-budget is approximately `(3600 / interval) × (2R + 1)` requests/hour.
-Busy matrix workflows can cost substantially more; select the interval and
-repository list to fit the token's actual GitHub rate limit. HTTP failures
-hold capacity; the controller does not infer that a rate-limited queue is empty.
+**Ready capacity on always-on Macs.** Keep a warm pool with `--min` so queued
+jobs land on already-registered runners instead of waiting for provisioning.
+Only registered, online runners count as ready: a burst tick subtracts ready
+idle local runners (exact `agentName`, `online`, not `busy` in the runner
+list) from matching queued demand before provisioning, so demand already
+covered by idle slots adds nothing. Directories that are offline,
+mid-registration, or failed registration never count as ready slots, and a
+`--min` reconciliation that finds missing indices restores them in the same
+bounded batch. A runner-list API failure makes idle capacity unknown, and the
+tick conservatively provisions at most one runner.
 
-Use one controller per scope and give the local root a single registration
-scope. There is no cross-host capacity reconciliation or distributed lock.
-Other Macs can run fixed fleets; disable the primary before enabling a
-standby controller. If runners can serve an unwatched repository, that work
-will not trigger scale-up; configure every eligible repository explicitly.
+**Bounded batches for bursts.** `--scale-up-batch N` (default **1**) lets one
+tick add up to N runners — for example draining a 6-job matrix burst in two
+ticks at batch 3 instead of six 60-second ticks. The batch is always clamped
+by the unmet demand, the `--min` deficit, and the room under `--max` and
+`--capacity-budget`, so a misread queue cannot provision beyond host bounds.
+Scale-down is unaffected: it still removes at most one idle runner per tick
+after the cooldown.
+
+**Polling interval and the explicit API request budget.** On an empty queue a
+tick uses two run-list requests per watched repository, plus the runner-list
+pages; a scaling tick adds one runner-list fetch (for idle-capacity
+accounting) and one token request. Add a jobs request for each active
+workflow run, extra requests for all additional pages. For `R` repositories
+with no runs and one runner-list page, the idle budget is approximately
+`(3600 / interval) × (2R + 1)` requests/hour — halving `--interval` from 60
+to 30 doubles that cost. Prefer raising `--scale-up-batch` over shortening
+the interval: batching drains bursts without increasing the steady-state
+request rate. Busy matrix workflows can cost substantially more; select the
+interval and repository list to fit the token's actual GitHub rate limit.
+HTTP failures hold capacity; the controller does not infer that a
+rate-limited queue is empty. If measurements later justify it,
+`workflow_job` webhooks could replace polling for queue events — that would
+need a new receiving service and is deliberately out of scope here.
+
+**Multi-host primary/standby.** Use one controller per scope and give the
+local root a single registration scope. There is no cross-host capacity
+reconciliation or distributed lock: every active controller observes the same
+queue, so each host's `--scale-up-batch`, `--max`, and `--capacity-budget`
+are the only bounds on how much of that demand it provisions — divide fleet
+capacity across hosts with those knobs and never leave two controllers
+unbounded on the same scope. Other Macs can run fixed fleets; disable the
+primary before enabling a standby controller. If runners can serve an
+unwatched repository, that work will not trigger scale-up; configure every
+eligible repository explicitly.
 
 Label matching cannot infer runner-group repository access policy, workflow
 concurrency restrictions, or approvals. Those can keep jobs waiting even
