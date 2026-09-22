@@ -13,7 +13,7 @@ addresses them as follows:
 
 | Finding | Remediation and regression evidence |
 | --- | --- |
-| 1 | Release packaging must use the v1.11.0 archive and its verified SHA-256; Python 3.14 is now an explicit formula dependency. Archive installation is the final release gate. |
+| 1 | The formula uses the v1.11.0 archive and its verified SHA-256, with Python 3.14 as an explicit dependency. Homebrew reinstall from the tagged archive and all formula tests passed. |
 | 2 | Allocation keys use a delimiter excluded from runner/job names; duplicate allocations are rejected. Collision and repeat-allocation regressions pass. |
 | 3 | Both RAM and SSD `_out` are copied before cleanup. Failed copies preserve scratch and block resets across restarts until the operator recovers outputs. Both modes have regressions. |
 | 4 | Every workload runs in an owned process group, cleaned on success, failure, and cancellation even after its shell exits. Real background-child regression tests pass. |
@@ -27,6 +27,8 @@ addresses them as follows:
 | 12 | Actions snippet generation rejects virtual-host-only configuration; documentation explains that the action selects addressing automatically and does not consume `RUNNER_CACHE_PATH_STYLE`. |
 
 Validation: `python3 -m unittest discover -s tests` passed **400 tests**.
+`brew reinstall --build-from-source joeblau/hb/runner-setup`, `brew test`,
+and `brew style` passed against the v1.11.0 formula.
 The pre-existing MCP missing-command failure was also fixed: an explicit
 `RUNNER_MCP_BIN_DIR` now prevents unintended fallback to installed host tools.
 These checks are local fixtures and targeted compiler/process tests. They do
