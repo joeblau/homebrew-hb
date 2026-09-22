@@ -28,6 +28,7 @@ class RunnerSetup < Formula
       runner-netisolate
       runner-docker-builder
       runner-bazel-cache
+      runner-sccache
       runner-git-mirror
       runner-mcp
       runner-agent
@@ -92,6 +93,7 @@ class RunnerSetup < Formula
       runner-netisolate
       runner-docker-builder
       runner-bazel-cache
+      runner-sccache
       runner-git-mirror
       runner-mcp
       runner-agent
