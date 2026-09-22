@@ -21,6 +21,7 @@ class RunnerSetup < Formula
       runner-health
       runner-cache
       runner-logs
+      runner-bench
       runner-upgrade
       runner-autoscale
       runner-token
@@ -84,6 +85,7 @@ class RunnerSetup < Formula
       runner-health
       runner-cache
       runner-logs
+      runner-bench
       runner-upgrade
       runner-autoscale
       runner-token

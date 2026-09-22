@@ -7,6 +7,8 @@ for fast startup, warm storage, workload sizing, and job visibility. Its
 also includes Apple Silicon macOS runners; the comparison is not Linux-only.
 No representative CI workload has been benchmarked on this checkout's host,
 so this review does not establish speedup numbers or optimal fleet sizing.
+The `runner-bench` harness (below) automates the benchmark procedure; the
+acceptance table stays `pending` until a staging Mac runs it.
 
 ## Fixes from this review
 
@@ -102,23 +104,118 @@ runners and registries. Use lockfile, OS, architecture, and compiler-version
 cache keys; separate writable caches by project/trust boundary. Avoid saving
 huge directories if compression and transfer cost more than recreating them.
 
+## Benchmark harness (runner-bench)
+
+`runner-bench` runs one pinned, representative workload repeatedly under
+controlled cache scenarios, samples resources while it runs, appends one JSON
+record per workload instance (plus one host-wide record per repetition) to a
+raw results file, and renders median/p95 comparison summaries. It runs as the
+invoking user: no sudo, no `/opt`, no launchd. Cold state comes from a
+disposable cache directory inside the benchmark workdir — production caches
+(`~/Library/Caches`, runner caches, BuildKit state) are never purged to
+obtain a baseline.
+
+### Pin the workload
+
+The `--cmd` workload is the benchmark. Pin everything inside it: source
+revision (clone a tagged ref or a fixed commit from a local mirror), toolchain
+(record it with `--toolchain`, e.g. `'rustc 1.80.1, Xcode 26.0, arm64'`),
+and target architecture (the recorded host block carries `arch` and
+`hw.model`). Keep the command, `--results-dir`, and the machine's resource
+limits identical between baseline and candidate runs — `report` warns when
+the compared groups recorded different commands or hosts.
+
+```sh
+BENCH='git clone -q file:///opt/mirrors/monorepo.git src && cd src &&
+  git checkout -q v2026.09.0 &&
+  bench_phase() { printf "RUNNER_BENCH_PHASE %s %s\n" "$1" "$(date +%s)"; } &&
+  bench_phase checkout &&
+  ./ci/restore-deps.sh && bench_phase restore &&
+  ./ci/build.sh        && bench_phase build &&
+  ./ci/test.sh         && bench_phase test &&
+  ./ci/save-cache.sh   && bench_phase save'
+```
+
+### Measure each scenario
+
+```sh
+runner-bench run --scenario cold   --label baseline --reps 5 --cmd "$BENCH" \
+  --toolchain 'rustc 1.80.1, arm64'
+runner-bench run --scenario warm   --label baseline --reps 5 --cmd "$BENCH"
+runner-bench run --scenario edited --label baseline --reps 5 --cmd "$BENCH"
+runner-bench run --scenario warm   --label baseline --reps 5 --concurrency 2 \
+  --cmd "$BENCH"
+# repeat all of the above with --label candidate after changing configuration
+runner-bench report --baseline baseline --candidate candidate
+```
+
+- `cold` wipes only `--cache-dir` (default `<workdir>/.bench-cache`, exposed
+  to the workload as `RUNNER_BENCH_CACHE_DIR`) before each repetition and
+  refuses any cache dir outside the workdir. Point the workload's dependency
+  caches at it.
+- `warm` runs unchanged; `edited` appends one small deterministic line to
+  `--edit-file` per repetition to simulate a small source edit.
+- `--concurrency N` runs N identical copies in `WORKDIR/slot-N`. Per-job
+  records (`scope: "job"`, one per slot) stay separate from the host-wide
+  record (`scope: "host"`), so overlapping jobs are distinguishable.
+
+### What is recorded
+
+Every record carries the host block (model, CPU count, RAM, arch, macOS,
+machine label), label/scenario/concurrency/repetition, queue delay (when
+`--queued-at` or `RUNNER_BENCH_QUEUED_AT` supplies the queue timestamp — take
+it from the GitHub API's run/job `created_at` on a real runner), full
+duration, per-phase durations from `RUNNER_BENCH_PHASE` markers, peak/mean
+CPU and peak RSS from process-tree samples, host swap growth and disk-usage
+growth, cache hit/miss/restore/save counters the workload writes to
+`RUNNER_BENCH_STATS_FILE`, and disposable-cache growth. Measurements that
+cannot be collected (queue delay without `--queued-at`, disk I/O rates,
+absent cache counters) are named in each record's `unsupported` array and
+shown as `unavailable` in reports — never invented.
+
+Raw results, samples, and workload logs are retained under `--results-dir`
+(`runner-bench.jsonl`, `samples/`, `logs/`). A failed workload is recorded
+with its exit code and the run continues (final exit 1); interrupting
+(SIGINT/SIGTERM) kills the whole workload process trees, records `cancelled`
+results, and exits 130 — no orphan processes.
+
+`report` groups by (label, scenario, concurrency), prints median/p95/min/max
+with the sample size stated, warns below five repetitions, and with
+`--baseline`/`--candidate` prints measured deltas plus `REGRESSION:` flags
+when failures, cancellations, swap growth, or cache growth increase. No
+speedup is claimed where either side lacks measurements.
+
+For real CI jobs (as opposed to this synthetic harness), `runner-logs steps`
+already emits per-step CPU/RSS timelines and `runner-logs jobs`/ship mode
+emit job durations and results from the same fleet, so harness numbers and
+production numbers can be compared in one aggregator.
+
 ## Benchmark and acceptance procedure
 
 1. Pin source revision, OS/toolchain versions, target architecture, test data,
    and output destination. Capture current full-job and queue times before
-   switching configuration.
+   switching configuration (`runner-bench run --label baseline ...`; queue
+   delay via `--queued-at`).
 2. Measure a cold cache using disposable test state, an unchanged warm run,
-   and a warm run with a small source edit. Repeat each at least five times;
-   keep production cache contents intact.
+   and a warm run with a small source edit (`--scenario cold|warm|edited`).
+   Repeat each at least five times (`--reps 5`); keep production cache
+   contents intact — `runner-bench` only ever wipes the disposable cache dir
+   inside its workdir.
 3. Record checkout, dependency restore/install, compilation, tests, cache
-   save, artifact upload, queue delay, disk growth, and peak RAM/swap. Include
-   multiple jobs at the chosen fleet limit.
+   save, artifact upload, queue delay, disk growth, and peak RAM/swap —
+   `RUNNER_BENCH_PHASE` markers cover the phases; the sampler covers RAM,
+   swap, CPU, and disk growth. Include multiple jobs at the chosen fleet
+   limit (`--concurrency N`).
 4. Exercise unavailable cache/builder/API, a cancelled job, supervisor
-   restart, and a reboot on a staging Mac. Confirm useful failure reporting,
-   retained logs, and that cleanup never affects a neighboring active job.
-5. Compare medians and tail latency. Adopt the configuration that improves
-   end-to-end results without increasing failures, swapping, or unbounded
-   cache growth. Fill the table with measured values before claiming parity.
+   restart, and a reboot on a staging Mac. A cancelled `runner-bench` run
+   must record `cancelled` results and leave no orphan processes; confirm
+   useful failure reporting, retained logs, and that cleanup never affects a
+   neighboring active job.
+5. Compare medians and tail latency (`runner-bench report --baseline ...
+   --candidate ...`). Adopt the configuration that improves end-to-end
+   results without increasing failures, swapping, or unbounded cache growth —
+   the report flags exactly those regressions. Fill the table with measured
+   values before claiming parity.
 
 | Scenario | Queue wait | Full job median | Full job p95 | Jobs/hour | Peak RAM/swap | Cache restore/save |
 | --- | --- | --- | --- | --- | --- | --- |
