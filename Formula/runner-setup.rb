@@ -4,8 +4,8 @@
 class RunnerSetup < Formula
   desc "Provision and tear down GitHub Actions self-hosted runners on macOS"
   homepage "https://github.com/joeblau/homebrew-hb"
-  url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/v1.11.0.tar.gz"
-  sha256 "2db66a8c43ab26badfa58e6285c13f528140e4b9eb69328a9305adbbe26b6326"
+  url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/v1.12.0.tar.gz"
+  sha256 "cf6c9d19121fefed56368a5fa3f1011d8ffd1514b2895532828c4983012f9eb2"
   license "MIT"
 
   depends_on "docker"
@@ -59,6 +59,11 @@ class RunnerSetup < Formula
 
       Runners register as <machine-name>-runner-N by default, so several Macs
       can join one scope without name clashes. Override with --name-prefix.
+
+      Enable Colima at boot and wait for Docker before accepting jobs:
+        runner-setup --org ORG_NAME --runners N --colima
+      Existing same-scope runners need no new registration token. Enable this
+      between jobs; preserve your existing scope and runner count.
 
       Remove runners later (use a *removal* token to also deregister on GitHub):
         runner-cleanup --all --token REMOVE_TOKEN
