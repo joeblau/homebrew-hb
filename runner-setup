@@ -42,6 +42,7 @@ NAME_PREFIX=""        # GitHub runner-name prefix; defaults to this machine's na
 NAME_PREFIX_SET=0     # 1 once --name-prefix was given (even if empty)
 EPHEMERAL=0           # 1 => LaunchDaemon runs runner-ephemeral, not runsvc.sh
 EPHEMERAL_BIN=""      # resolved absolute path of the runner-ephemeral supervisor
+TOOL_CACHE_DIR=""     # --tool-cache-dir override; default is per-runner DIR/_toolcache
 
 # Derived from the chosen registration scope (--org / --repo / --url).
 RUNNER_URL=""
@@ -118,6 +119,18 @@ OPTIONS:
                         mode-600 .github_pat file per runner dir) with
                         admin:org (org runners) or repo (repo runners) scope.
                         See docs/ephemeral-runners.md.
+  --tool-cache-dir DIR  Persistent tool cache location exported to every runner
+                        as AGENT_TOOLSDIRECTORY (the runner also exposes it to
+                        job steps as RUNNER_TOOL_CACHE; the setup-* actions
+                        install there). Default: a per-runner
+                        RUNNER_DIR/_toolcache, OUTSIDE the disposable _work
+                        tree, so ephemeral job resets keep installed tools and
+                        two runners never write a shared cache. Must be an
+                        absolute path outside any runner's _work. Pointing
+                        several runners at ONE shared DIR is at your own risk:
+                        setup-* actions tolerate concurrent reads, but
+                        concurrent first-time installs of the same tool
+                        version can race.
   -h, --help            Show this help and exit
 
 EXAMPLES:
@@ -196,6 +209,10 @@ parse_args() {
         NAME_PREFIX="$2"; NAME_PREFIX_SET=1; shift 2 ;;
       --name-prefix=*) NAME_PREFIX="${1#*=}"; NAME_PREFIX_SET=1; shift ;;
       --ephemeral) EPHEMERAL=1; shift ;;
+      --tool-cache-dir)
+        [[ $# -ge 2 ]] || { err "--tool-cache-dir requires a value"; usage; exit 2; }
+        TOOL_CACHE_DIR="$2"; shift 2 ;;
+      --tool-cache-dir=*) TOOL_CACHE_DIR="${1#*=}"; shift ;;
       -h|--help)   usage; exit 0 ;;
       *)
         err "Unknown argument: $1"
@@ -230,6 +247,25 @@ parse_args() {
   if ! [[ "${RUNNERS}" =~ ^[0-9]+$ ]] || [[ "${RUNNERS}" -lt 1 ]]; then
     err "--runners must be a positive integer (got: '${RUNNERS}')"
     exit 2
+  fi
+
+  # The tool cache must live outside any runner's disposable _work tree:
+  # ephemeral resets delete _work, so a cache inside it cannot persist.
+  if [[ -n "${TOOL_CACHE_DIR}" ]]; then
+    while [[ "${TOOL_CACHE_DIR}" == */ && "${TOOL_CACHE_DIR}" != "/" ]]; do
+      TOOL_CACHE_DIR="${TOOL_CACHE_DIR%/}"
+    done
+    case "${TOOL_CACHE_DIR}" in
+      /*) ;;
+      *)
+        err "--tool-cache-dir must be an absolute path (got: '${TOOL_CACHE_DIR}')"
+        exit 2 ;;
+    esac
+    case "${TOOL_CACHE_DIR}" in
+      */_work|*/_work/*)
+        err "--tool-cache-dir must live outside every runner's _work directory."
+        exit 2 ;;
+    esac
   fi
 
   # Resolve the registration URL and a scope slug. The slug is only used to spot
@@ -608,6 +644,18 @@ configure_runner() {
   sudo chown -R "${REAL_USER}:${REAL_GROUP}" "${dir}"
   xattr -rc "${dir}" 2>/dev/null || true
 
+  # --- Persistent tool cache, owned by the runner user. --------------------
+  # Default: per-runner ${dir}/_toolcache, OUTSIDE the disposable _work tree,
+  # so ephemeral job resets keep installed tools and runners never share a
+  # writable cache. Exported as AGENT_TOOLSDIRECTORY in the LaunchDaemon below
+  # (runner-ephemeral also exports it, which covers older installed plists).
+  local tool_cache_dir="${TOOL_CACHE_DIR:-${dir}/_toolcache}"
+  if ! as_user mkdir -p "${tool_cache_dir}"; then
+    err "Could not create tool cache directory ${tool_cache_dir} for ${name}."
+    record_status "${name}" "FAILED (tool cache dir)"
+    return 1
+  fi
+
   # --- Configure unattended. MUST run as the invoking user (not root). -----
   # On success config.sh registers the runner with GitHub and writes .runner +
   # .credentials into ${dir}. We MUST NOT proceed to install a LaunchDaemon when
@@ -770,6 +818,8 @@ ${args_xml}  </array>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>ACTIONS_RUNNER_SVC</key>
     <string>1</string>
+    <key>AGENT_TOOLSDIRECTORY</key>
+    <string>${tool_cache_dir}</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -880,6 +930,13 @@ main() {
 
   log "Provisioning ${RUNNERS} runner(s) under ${RUNNER_ROOT}"
   PROVISIONING_STARTED=1
+
+  if [[ -n "${TOOL_CACHE_DIR}" ]]; then
+    warn "--tool-cache-dir points every provisioned runner at ONE shared tool"
+    warn "cache (${TOOL_CACHE_DIR}). setup-* actions tolerate concurrent reads,"
+    warn "but concurrent first-time installs of the same tool version can race;"
+    warn "the per-runner default (RUNNER_DIR/_toolcache) avoids this."
+  fi
 
   # --ephemeral: the LaunchDaemons launch the runner-ephemeral supervisor, so
   # it must exist as an absolute path BEFORE any plist is written. Prefer the

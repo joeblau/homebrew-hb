@@ -23,11 +23,12 @@
 #   run      Verify the archive before shutting down the selection. Upgrade
 #            the first outdated runner as canary, moving its old install to
 #            runner-N.prev and swapping in new binaries while preserving
-#            .runner/.credentials/_work (so the GitHub registration and
-#            labels survive untouched), re-bootstrap, and verify health by
-#            waiting for fresh logs to print 'Listening for Jobs'. If the canary
-#            fails, its previous binaries are restored; other selected runners
-#            stay stopped. Current-version runners are also restarted.
+#            .runner/.credentials/_work/_toolcache (so the GitHub registration,
+#            labels, and persistent tool cache survive untouched), re-bootstrap,
+#            and verify health by waiting for fresh logs to print 'Listening for
+#            Jobs'. If the canary fails, its previous binaries are restored;
+#            other selected runners stay stopped. Current-version runners are
+#            also restarted.
 #
 #   shutdown / start preserve registration and coordinate maintenance with the
 #            watchdog and autoscaler. repair re-registers one runner whose
@@ -809,20 +810,28 @@ rollback_runner() {
   fi
 
   if [[ -d "${dir}" ]]; then
-    # Upgrade moved _work out of .prev. Put it back before deleting the new
-    # install, including for an operator rollback after a successful upgrade.
-    if [[ -e "${dir}/_work" || -L "${dir}/_work" ]]; then
-      if [[ -e "${prev}/_work" || -L "${prev}/_work" ]]; then
-        err "Both installations contain _work; refusing to overwrite either workspace."
-        record_status "${name}" "FAILED (rollback: workspace conflict)"
+    # Upgrade moved _work and the persistent tool cache out of .prev. Put them
+    # back before deleting the new install, including for an operator rollback
+    # after a successful upgrade. Preflight BOTH conflict checks before moving
+    # anything, so a conflict never leaves half the state moved.
+    local sub
+    for sub in _work _toolcache; do
+      if [[ -e "${dir}/${sub}" || -L "${dir}/${sub}" ]] \
+          && [[ -e "${prev}/${sub}" || -L "${prev}/${sub}" ]]; then
+        err "Both installations contain ${sub}; refusing to overwrite either."
+        record_status "${name}" "FAILED (rollback: ${sub} conflict)"
         return 1
       fi
-      if ! as_user mv "${dir}/_work" "${prev}/_work"; then
-        err "Could not restore _work to ${prev}; both installations are retained."
-        record_status "${name}" "FAILED (rollback: preserve _work)"
-        return 1
+    done
+    for sub in _work _toolcache; do
+      if [[ -e "${dir}/${sub}" || -L "${dir}/${sub}" ]]; then
+        if ! as_user mv "${dir}/${sub}" "${prev}/${sub}"; then
+          err "Could not restore ${sub} to ${prev}; both installations are retained."
+          record_status "${name}" "FAILED (rollback: preserve ${sub})"
+          return 1
+        fi
       fi
-    fi
+    done
     if ! archive_diagnostics "${name}" "${dir}"; then
       record_status "${name}" "FAILED (rollback: preserve diagnostics)"
       return 1
@@ -869,9 +878,10 @@ rollback_runner() {
 
 # ----------------------------------------------------------------------------
 # Upgrade one runner (e.g. "runner-1") to the already-downloaded version.
-# Preserves the registration state (.runner/.credentials*/.path/.env) and the
-# _work directory, so the runner keeps its GitHub identity and labels — no
-# re-registration token is needed.
+# Preserves the registration state (.runner/.credentials*/.path/.env), the
+# _work directory, and the persistent per-runner tool cache (_toolcache,
+# AGENT_TOOLSDIRECTORY), so the runner keeps its GitHub identity, labels, and
+# installed tool versions — no re-registration token is needed.
 # NOTE: called under `if ! ...`, so set -e is INACTIVE — check statuses.
 # ----------------------------------------------------------------------------
 upgrade_runner() {
@@ -942,6 +952,16 @@ upgrade_runner() {
     if ! as_user mv "${prev}/_work" "${dir}/_work"; then
       err "Could not preserve _work for ${name}; rolling back."
       log_event "${PROG_NAME} upgrade ${name} FAILED (preserve _work)"
+      rollback_runner "${name}"
+      return 1
+    fi
+  fi
+  # The persistent per-runner tool cache lives outside _work; carry it over
+  # the same way so the upgraded runner keeps its installed tool versions.
+  if [[ -d "${prev}/_toolcache" ]]; then
+    if ! as_user mv "${prev}/_toolcache" "${dir}/_toolcache"; then
+      err "Could not preserve _toolcache for ${name}; rolling back."
+      log_event "${PROG_NAME} upgrade ${name} FAILED (preserve _toolcache)"
       rollback_runner "${name}"
       return 1
     fi

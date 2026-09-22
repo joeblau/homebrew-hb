@@ -12,9 +12,21 @@
 #   1. reads the previous registration's name/URL from .runner (before wiping),
 #   2. fetches a FRESH registration token from the GitHub API using GITHUB_PAT,
 #   3. wipes _work and all registration residue (.runner/.credentials/...),
+#      keeping the persistent tool cache (see TOOL CACHE below),
 #   4. re-registers with `config.sh --unattended --ephemeral` (same name/labels/
 #      url), so GitHub auto-removes the runner after it finishes ONE job,
 #   5. runs bin/runsvc.sh in the foreground; when it exits (job done), loops.
+#
+# TOOL CACHE: the runner's HostContext resolves its tool cache (RUNNER_TOOL_CACHE
+# in job steps, used by the setup-* actions) from the first of the
+# RUNNER_TOOL_CACHE / RUNNER_TOOLSDIRECTORY / AGENT_TOOLSDIRECTORY environment
+# variables, otherwise _work/_tool (verified against actions/runner
+# src/Runner.Common/HostContext.cs, WellKnownDirectory.Tools). Ephemeral resets
+# delete _work, so this supervisor exports AGENT_TOOLSDIRECTORY pointing at a
+# persistent, per-runner location OUTSIDE _work (default: RUNNER_DIR/_toolcache),
+# and migrates a legacy _work/_tool cache to it once, between jobs. An operator
+# preset of either env var wins; a shared location is at the operator's risk
+# (setup-* actions are not safe against concurrent first-time installs).
 #
 # Re-registration failures back off exponentially; after --max-failures
 # consecutive failures the script exits non-zero so launchd's
@@ -60,6 +72,7 @@ SANDBOX_PROFILE_FILE=""
 SNAPSHOT_ROLLBACK=0   # --snapshot-rollback: APFS snapshot restore of _work
 SNAPSHOT_NAME=""      # com.apple.TimeMachine.YYYY-MM-DD-HHMMSS
 SNAPSHOT_DATE=""      # YYYY-MM-DD-HHMMSS (tmutil deletelocalsnapshot arg)
+TOOL_CACHE_DIR=""     # resolved persistent tool cache (AGENT_TOOLSDIRECTORY)
 
 GITHUB_PAT_VALUE=""
 RUNNER_URL=""
@@ -129,6 +142,25 @@ OPTIONS:
                       tmutil may require NOPASSWD sudo for tmutil/mount_apfs/
                       umount; sudo is never used for anything else here.
   -h, --help          Show this help and exit
+
+PERSISTENT TOOL CACHE:
+  Ephemeral resets delete _work, which would also delete the default tool
+  cache (_work/_tool) used by the setup-* actions. This supervisor therefore
+  exports AGENT_TOOLSDIRECTORY so the runner (and the RUNNER_TOOL_CACHE it
+  gives each job step) points at a persistent cache OUTSIDE _work:
+
+    1. RUNNER_TOOL_CACHE, if already set (operator override)
+    2. AGENT_TOOLSDIRECTORY, if already set (operator override)
+    3. RUNNER_DIR/_toolcache  (per-runner default — never shared, so
+       concurrent jobs on different runners cannot corrupt each other's
+       tool installs)
+
+  The path must be absolute and must NOT live under RUNNER_DIR/_work. A
+  legacy _work/_tool cache is migrated (moved, never merged) to the
+  configured location between jobs while the service is stopped. With
+  --sandbox, a tool cache outside RUNNER_DIR is automatically writable.
+  Eviction: runner-prune --all --offline --purge-caches. See
+  docs/ephemeral-runners.md.
 
 EXAMPLES:
   GITHUB_PAT=ghp_... ${PROG_NAME} --dir /opt/github-runners/runner-1 --org acme
@@ -420,12 +452,24 @@ prepare_sandbox_profile() {
     return 1
   fi
   [[ -n "${SANDBOX_PROFILE_FILE}" ]] || SANDBOX_PROFILE_FILE="${DIR}/.sandbox-exec.sb"
+  local -a writable=()
   if [[ ${#SANDBOX_CACHE_PATHS[@]} -gt 0 ]]; then
     local cache_path
     for cache_path in "${SANDBOX_CACHE_PATHS[@]}"; do
       [[ -d "${cache_path}" ]] || warn "sandbox cache path does not exist: ${cache_path}"
+      writable+=("${cache_path}")
     done
-    generate_sandbox_profile "${DIR}" "${SANDBOX_DENY_NETWORK}" "${SANDBOX_CACHE_PATHS[@]}" \
+  fi
+  # The persistent tool cache must stay writable for sandboxed jobs even when
+  # the operator pointed it outside the runner tree.
+  if [[ -n "${TOOL_CACHE_DIR}" ]]; then
+    case "${TOOL_CACHE_DIR}/" in
+      "${DIR}/"*) ;;  # already writable via the runner-tree subpath rule
+      *) writable+=("${TOOL_CACHE_DIR}") ;;
+    esac
+  fi
+  if [[ ${#writable[@]} -gt 0 ]]; then
+    generate_sandbox_profile "${DIR}" "${SANDBOX_DENY_NETWORK}" "${writable[@]}" \
       > "${SANDBOX_PROFILE_FILE}" || return 1
   else
     generate_sandbox_profile "${DIR}" "${SANDBOX_DENY_NETWORK}" \
@@ -597,12 +641,69 @@ read_saved_identity() {
 }
 
 # ----------------------------------------------------------------------------
+# Persistent tool cache (AGENT_TOOLSDIRECTORY). The runner's
+# HostContext.GetDirectory(WellKnownDirectory.Tools) uses the first of
+# RUNNER_TOOL_CACHE / RUNNER_TOOLSDIRECTORY / AGENT_TOOLSDIRECTORY and falls
+# back to _work/_tool (verified against actions/runner,
+# src/Runner.Common/HostContext.cs; JobRunner.cs creates the directory and
+# exposes it to steps as RUNNER_TOOL_CACHE). Ephemeral resets delete _work, so
+# the cache must live outside it. The default is the PER-RUNNER
+# ${DIR}/_toolcache: two runners never write the same cache, so no
+# concurrent-install corruption is possible. An operator preset points at a
+# shared location at the operator's risk.
+# ----------------------------------------------------------------------------
+resolve_tool_cache_dir() {
+  local dir="${RUNNER_TOOL_CACHE:-${AGENT_TOOLSDIRECTORY:-${DIR}/_toolcache}}"
+  while [[ "${dir}" == */ && "${dir}" != "/" ]]; do dir="${dir%/}"; done
+  case "${dir}" in
+    /*) ;;
+    *)
+      err "Tool cache directory must be an absolute path (got: '${dir}')."
+      return 1 ;;
+  esac
+  case "${dir}/" in
+    "${DIR}/_work/"*)
+      err "Tool cache directory must live OUTSIDE ${DIR}/_work (got: '${dir}');"
+      err "ephemeral resets delete _work, so a cache inside it cannot persist."
+      return 1 ;;
+  esac
+  TOOL_CACHE_DIR="${dir}"
+  export AGENT_TOOLSDIRECTORY="${TOOL_CACHE_DIR}"
+  return 0
+}
+
+# Idle-only migration: wipe_state runs between jobs while the runner service
+# is stopped, so this move can never race a running job. A legacy _work/_tool
+# is moved to the configured location only when that location does not exist
+# yet (never merged); otherwise the legacy copy is left for the regular _work
+# reset. Rollback path: stop the supervisor, unset AGENT_TOOLSDIRECTORY, and
+# move _toolcache back to _work/_tool — migration never deletes the cache.
+migrate_tool_cache() {
+  local legacy="${DIR}/_work/_tool"
+  [[ -e "${legacy}" || -L "${legacy}" ]] || return 0
+  if [[ -L "${legacy}" ]]; then
+    warn "Legacy tool cache ${legacy} is a symlink; not migrating (it resets with _work)."
+    return 0
+  fi
+  [[ -d "${legacy}" ]] || return 0
+  if [[ -e "${TOOL_CACHE_DIR}" || -L "${TOOL_CACHE_DIR}" ]]; then
+    warn "Tool cache ${TOOL_CACHE_DIR} already exists; not merging legacy ${legacy} (it resets with _work)."
+    return 0
+  fi
+  mkdir -p "$(dirname "${TOOL_CACHE_DIR}")" || return 1
+  mv "${legacy}" "${TOOL_CACHE_DIR}" || return 1
+  step "Migrated legacy _work/_tool cache to ${TOOL_CACHE_DIR}"
+}
+
+# ----------------------------------------------------------------------------
 # Wipe job output and registration residue so every cycle starts from a
-# reset workspace (binaries, operator configuration, and _diag logs are kept).
-# _work goes through reset_workspace, which honors --snapshot-rollback and
-# always falls back to rm -rf.
+# reset workspace (binaries, operator configuration, the persistent tool
+# cache, and _diag logs are kept). _work goes through reset_workspace, which
+# honors --snapshot-rollback and always falls back to rm -rf.
 # ----------------------------------------------------------------------------
 wipe_state() {
+  resolve_tool_cache_dir || return 1
+  migrate_tool_cache || return 1
   reset_workspace || return 1
   rm -f "${DIR}/.runner" "${DIR}/.credentials" \
         "${DIR}/.credentials_rsaparams" || return 1
@@ -620,6 +721,13 @@ RUNNER_NAME=""
 RUNNER_GROUP=""
 
 run_cycle() {
+  # Resolve and export the persistent tool cache first, so a misconfigured
+  # AGENT_TOOLSDIRECTORY fails the cycle (backoff) instead of wasting a
+  # registration token or running a job whose cache cannot persist.
+  if ! resolve_tool_cache_dir; then
+    return 1
+  fi
+
   read_saved_identity
   step "Identity: '${RUNNER_NAME}' @ ${RUNNER_URL} (labels: ${LABELS})"
 

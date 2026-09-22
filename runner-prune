@@ -53,7 +53,8 @@ OPTIONS:
   --runners-dir DIR  Fleet root (default: ${RUNNERS_DIR}).
   --all              Clean all runner checkouts; requires --offline.
   --offline          Confirm every runner and other cache consumer is stopped.
-  --purge-caches     Also evict shared package caches; requires --all --offline.
+  --purge-caches     Also evict shared package caches and per-runner tool
+                     caches (runner-N/_toolcache); requires --all --offline.
   --min-free-gb N    Free-space floor in GiB (default: ${DEFAULT_MIN_FREE_GB}).
   --dry-run          Report paths/sizes; delete nothing.
   -h, --help         Show this help and exit.
@@ -304,7 +305,7 @@ purge_work_dirs() {
 # ----------------------------------------------------------------------------
 purge_caches() {
   if [[ "${PURGE_CACHES}" -ne 1 ]]; then
-    step "Keeping package caches warm (offline eviction: --all --offline --purge-caches)."
+    step "Keeping package and tool caches warm (offline eviction: --all --offline --purge-caches)."
     return 0
   fi
   log "Clearing tool caches under ${REAL_HOME}"
@@ -324,6 +325,18 @@ purge_caches() {
       rc=1
     fi
   done
+  # Persistent per-runner tool caches (AGENT_TOOLSDIRECTORY, default
+  # runner-N/_toolcache outside _work) are evicted only in this acknowledged
+  # offline window. Operator-chosen shared locations outside the fleet root
+  # are the operator's responsibility.
+  local tool_cache
+  shopt -s nullglob
+  for tool_cache in "${RUNNERS_DIR}"/runner-*/_toolcache; do
+    if ! remove_path "${tool_cache}" "tool cache"; then
+      rc=1
+    fi
+  done
+  shopt -u nullglob
   return "${rc}"
 }
 
