@@ -59,7 +59,8 @@ see the deleted-registration recovery section below.
 3. Mark and stop every selected runner, confirming its LaunchDaemon unloads.
    A shutdown failure stops the operation before any binary upgrade begins.
 4. Upgrade the first outdated runner as a canary. Retain registration and
-   migration files, `.path`, `.env`, `.service`, `.github_pat`, and `_work`.
+   migration files, `.path`, `.env`, `.service`, `.github_pat`, `_work`, and
+   the persistent per-runner tool cache (`_toolcache`).
    Prepare launchd log paths and the executable service wrapper before startup.
 5. Wait for readiness from the fresh diagnostic logs. The default timeout is
    **300 seconds**, allowing GitHub's four-minute session-conflict retry window;
@@ -124,7 +125,9 @@ Repair targets one runner. It:
   clear obsolete local registration. It makes no server deletion request.
 - Reconfigures the existing binary with its saved URL, name, work directory,
   runner group, ephemeral setting, and automatic-update setting. `--runnergroup`
-  can override the saved group. `.env`, `.path`, `_work`, and the plist are kept.
+  can override the saved group. `.env`, `.path`, `_work`, `_toolcache`, and the
+  plist are kept — repair rewrites only the plist's `ProgramArguments`, so the
+  configured `AGENT_TOOLSDIRECTORY` cache location survives re-registration.
 - Avoids `--replace`, so a same-name runner on another machine is not silently
   displaced. Resolve a reported name collision before retrying.
 - Starts the existing service and verifies readiness. If registration fails,
@@ -206,9 +209,11 @@ runner-upgrade rollback --runner 2
 runner-upgrade rollback --all --yes
 ```
 
-Rollback confirms the service stopped, moves the current `_work` back into
-`runner-N.prev`, and restores that installation. If both directories contain
-`_work`, it refuses to overwrite either. Startup diagnostics are archived under
+Rollback confirms the service stopped, moves the current `_work` and
+`_toolcache` back into `runner-N.prev`, and restores that installation. If both
+directories contain `_work` or `_toolcache`, it refuses to overwrite either
+(both conflicts are checked before anything is moved). Startup diagnostics are
+archived under
 `/opt/github-runners/.upgrade-diagnostics/` before any failed installation is
 removed. Prior diagnostics are archived before starting the restored version,
 so old readiness text cannot make an unconfirmed rollback look healthy.

@@ -25,7 +25,8 @@ launchd (system/com.github.runner-N, KeepAlive, ThrottleInterval=10)
        loop:
          1. read name/url from .runner (previous registration's identity)
          2. POST /orgs/ORG/actions/runners/registration-token  (fresh token, GITHUB_PAT)
-         3. wipe _work/ and .runner/.credentials* (keep operator .env/.path)
+         3. wipe _work/ and .runner/.credentials* (keep operator .env/.path
+            and the persistent _toolcache — see below)
          4. config.sh --unattended --ephemeral --replace (same name/labels/url)
          5. bin/runsvc.sh in the foreground  →  runs ONE job  →  exits
          → loop again
@@ -75,6 +76,69 @@ The PAT is passed through curl's standard-input configuration as an
 The short-lived registration token is passed to `config.sh` as an argument
 (`config.sh` has no env alternative), so it is briefly visible in `ps` to other
 local users — the same trade-off `runner-setup` already makes.
+
+## Persistent tool cache
+
+Plain `_work` wipes also deleted `_work/_tool`, so every `actions/setup-*`
+step re-downloaded its toolchain after each ephemeral reset. The tool cache
+now lives **outside** `_work` and survives job resets.
+
+**Runner contract (verification basis).** The runner resolves its tool cache
+directory from the first set of `RUNNER_TOOL_CACHE`, `RUNNER_TOOLSDIRECTORY`,
+`AGENT_TOOLSDIRECTORY`, falling back to `_work/_tool` — see
+[`HostContext.GetDirectory(WellKnownDirectory.Tools)`](https://github.com/actions/runner/blob/main/src/Runner.Common/HostContext.cs)
+in actions/runner. `JobRunner` creates that directory and exposes it to every
+job step as `RUNNER_TOOL_CACHE` (and as the `runner.tool_cache` context),
+which is exactly where the `setup-*` actions install and look up tools (the
+`AGENT_TOOLSDIRECTORY` override is also what the setup-* READMEs document for
+self-hosted runners). `runsvc.sh` only loads `.path`, so the variable must
+come from the service environment — that is why it is wired through the
+LaunchDaemon plist and the supervisor's own export rather than `.env`. This
+was verified from the upstream source above; this repo's tests mock the
+runner and cannot exercise the real binary.
+
+**Location and ownership.** The default is the per-runner
+`/opt/github-runners/runner-N/_toolcache`, created and owned by the runner
+user. `runner-setup` exports it via `AGENT_TOOLSDIRECTORY` in the
+LaunchDaemon's `EnvironmentVariables` (override with
+`runner-setup --tool-cache-dir DIR`), and `runner-ephemeral` resolves and
+exports the same variable itself — so even an older plist running a newer
+supervisor gets the per-runner cache. A pre-set `RUNNER_TOOL_CACHE` or
+`AGENT_TOOLSDIRECTORY` in the supervisor's environment wins (the path must be
+absolute and outside `RUNNER_DIR/_work`, otherwise the cycle fails and backs
+off). Checkout, `_temp`, and registration residue still reset every cycle;
+only the tool cache and `_diag` logs persist.
+
+**Concurrency.** The per-runner default means two runners never write the
+same cache, so concurrent jobs cannot corrupt each other's tool installs or
+evict an active cache. Pointing several runners at one shared
+`--tool-cache-dir` is an explicit opt-in: `setup-*` actions tolerate
+concurrent reads, but concurrent first-time installs of the same tool version
+can race — share only if you accept that.
+
+**Migration (idle-only).** On the first wipe after this feature lands, a
+legacy `_work/_tool` is *moved* (never copied, never merged, never deleted by
+the move) to the configured cache while the runner service is stopped —
+`wipe_state` runs between jobs, so the migration cannot race a running job.
+If the target already exists or the legacy path is a symlink, nothing is
+migrated and the legacy copy resets with `_work`. Rollback: stop the runner,
+remove `AGENT_TOOLSDIRECTORY` from the plist (or the supervisor environment),
+and move `_toolcache` back to `_work/_tool` — the runner then falls back to
+`_work/_tool` and no cache content was deleted at any point.
+
+**Eviction and removal.** `runner-prune` keeps the cache warm by default;
+`runner-prune --all --offline --purge-caches` evicts every
+`runner-N/_toolcache` during the acknowledged maintenance window (see
+[disk-cleanup.md](disk-cleanup.md)). `runner-cleanup` deletes the cache with
+the runner directory. `runner-upgrade` carries `_toolcache` across upgrades
+and rollbacks exactly like `_work`, and `runner-upgrade repair` rewrites only
+the plist's `ProgramArguments`, so the configured location survives
+re-registration (see [auto-upgrades.md](auto-upgrades.md)).
+
+**Hardening interplay.** With `--sandbox`, a tool cache outside the runner
+tree is automatically added to the writable paths. With
+`--snapshot-rollback`, only `_work` is restored from the snapshot — the cache
+is untouched either way.
 
 ## Usage
 
@@ -179,11 +243,13 @@ the runner's workspace subtree; it is not a host snapshot mechanism.
 
 - Ephemeral re-registration adds a few seconds of latency before each job
   (token fetch + `config.sh`). Throughput-sensitive farms should size N
-  accordingly.
+  accordingly. The persistent [tool cache](#persistent-tool-cache) removes the
+  much larger `setup-*` re-download cost from every job after the first.
 - `_work` is wiped between cycles; job workspaces do not persist. `_diag`
-  logs intentionally persist so failures remain diagnosable. With
-  `--snapshot-rollback` on APFS, the wipe is a snapshot restore with the same
-  outcome (see above).
+  logs intentionally persist so failures remain diagnosable, and the
+  per-runner `_toolcache` persists so installed tool versions survive resets.
+  With `--snapshot-rollback` on APFS, the wipe is a snapshot restore with the
+  same outcome (see above).
 - A `--url` scope with a path deeper than `OWNER/REPO` cannot be mapped to an
   API endpoint — use `--org`/`--repo` (and `--api-url` for GHE) in that case.
 
