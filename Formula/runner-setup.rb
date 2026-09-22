@@ -18,6 +18,7 @@ class RunnerSetup < Formula
       runner-cleanup
       runner-ephemeral
       runner-prune
+      runner-ramscratch
       runner-health
       runner-cache
       runner-logs
@@ -83,6 +84,7 @@ class RunnerSetup < Formula
       runner-cleanup
       runner-ephemeral
       runner-prune
+      runner-ramscratch
       runner-health
       runner-cache
       runner-logs

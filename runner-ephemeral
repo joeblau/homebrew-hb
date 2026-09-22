@@ -46,6 +46,14 @@
 #                         _work from it between jobs, falling back to the
 #                         rm -rf cleanup whenever snapshots are unavailable
 #                         or fail (cleanup is never skipped)
+#   --ram-scratch --ram-scratch-mb N
+#                         before each job, allocate an N MB per-job scratch
+#                         directory on the host's bounded RAM volume (via the
+#                         runner-ramscratch helper) and expose it to job steps
+#                         as RUNNER_RAM_SCRATCH; when the allocation fails
+#                         (disabled, low memory, budget exhausted) the job
+#                         still runs with an SSD fallback path. See
+#                         docs/ram-scratch.md.
 # Full VM/image isolation and host snapshot rollback stay out of scope.
 
 set -euo pipefail
@@ -73,6 +81,13 @@ SNAPSHOT_ROLLBACK=0   # --snapshot-rollback: APFS snapshot restore of _work
 SNAPSHOT_NAME=""      # com.apple.TimeMachine.YYYY-MM-DD-HHMMSS
 SNAPSHOT_DATE=""      # YYYY-MM-DD-HHMMSS (tmutil deletelocalsnapshot arg)
 TOOL_CACHE_DIR=""     # resolved persistent tool cache (AGENT_TOOLSDIRECTORY)
+RAM_SCRATCH="${RUNNER_RAMSCRATCH:-0}"   # --ram-scratch or RUNNER_RAMSCRATCH=1
+RAM_SCRATCH_MB="${RUNNER_RAMSCRATCH_MB:-0}"  # --ram-scratch-mb or env
+RAM_SCRATCH_PATH=""   # per-cycle scratch dir (RAM volume or SSD fallback)
+RAM_SCRATCH_IS_RAM=0  # 1 when RAM_SCRATCH_PATH is on the RAM volume
+RAM_SCRATCH_RUNNER="" # sanitized runner name used for the scratch subdir
+RAM_SCRATCH_JOB=""    # per-cycle job id used for the scratch subdir
+RAMSCRATCH_BIN=""     # resolved runner-ramscratch helper binary
 
 GITHUB_PAT_VALUE=""
 RUNNER_URL=""
@@ -141,6 +156,19 @@ OPTIONS:
                       or fail — cleanup is never skipped. Snapshot mount and
                       tmutil may require NOPASSWD sudo for tmutil/mount_apfs/
                       umount; sudo is never used for anything else here.
+  --ram-scratch       Before each job, allocate a per-job scratch directory on
+                      the host's bounded RAM volume via the runner-ramscratch
+                      helper and expose it to job steps as RUNNER_RAM_SCRATCH
+                      (exported AND written into .env). Requires
+                      --ram-scratch-mb and a configured runner-ramscratch
+                      budget (runner-ramscratch config --total-budget-mb N).
+                      When the helper, memory headroom, or budget is
+                      unavailable, the job still runs with an SSD fallback
+                      path under _work. May also be enabled via the
+                      RUNNER_RAMSCRATCH=1 plist env var (sizing via
+                      RUNNER_RAMSCRATCH_MB). See docs/ram-scratch.md.
+  --ram-scratch-mb N  This runner's per-job share of the host-wide RAM scratch
+                      budget (required with --ram-scratch; explicit sizing).
   -h, --help          Show this help and exit
 
 PERSISTENT TOOL CACHE:
@@ -235,6 +263,11 @@ parse_args() {
         SANDBOX_CACHE_PATHS+=("$2"); shift 2 ;;
       --sandbox-cache-path=*) SANDBOX_CACHE_PATHS+=("${1#*=}"); shift ;;
       --snapshot-rollback) SNAPSHOT_ROLLBACK=1; shift ;;
+      --ram-scratch) RAM_SCRATCH=1; shift ;;
+      --ram-scratch-mb)
+        [[ $# -ge 2 ]] || { err "--ram-scratch-mb requires a value"; usage; exit 2; }
+        RAM_SCRATCH_MB="$2"; shift 2 ;;
+      --ram-scratch-mb=*) RAM_SCRATCH_MB="${1#*=}"; shift ;;
       -h|--help)   usage; exit 0 ;;
       *)
         err "Unknown argument: $1"
@@ -264,6 +297,17 @@ parse_args() {
   if ! [[ "${MAX_FAILURES}" =~ ^[0-9]+$ ]] || [[ "${MAX_FAILURES}" -lt 1 ]]; then
     err "--max-failures must be a positive integer (got: '${MAX_FAILURES}')"
     exit 2
+  fi
+
+  # Opt-in RAM scratch: explicit per-job sizing is mandatory when enabled.
+  if [[ "${RAM_SCRATCH}" == "true" ]]; then RAM_SCRATCH=1; fi
+  if [[ "${RAM_SCRATCH}" == "1" ]]; then
+    if ! [[ "${RAM_SCRATCH_MB}" =~ ^[0-9]+$ ]] || [[ "${RAM_SCRATCH_MB}" -lt 1 ]]; then
+      err "--ram-scratch requires explicit sizing: --ram-scratch-mb N"
+      err "(this runner's per-job share of the host-wide runner-ramscratch budget;"
+      err "or set RUNNER_RAMSCRATCH_MB). Got: '${RAM_SCRATCH_MB}'"
+      exit 2
+    fi
   fi
 
   [[ -n "${PAT_FILE}" ]] || PAT_FILE="${DIR}/.github_pat"
@@ -389,6 +433,9 @@ shutdown() {
     kill -TERM "${CHILD_PID}" 2>/dev/null || true
     wait "${CHILD_PID}" 2>/dev/null || true
   fi
+  # Interrupted jobs still get their scratch _out copied to retained SSD
+  # storage before the volatile RAM allocation is released.
+  teardown_ram_scratch || true
   if [[ "${SNAPSHOT_ROLLBACK}" -eq 1 ]]; then
     delete_workspace_snapshot || true
   fi
@@ -466,6 +513,13 @@ prepare_sandbox_profile() {
     case "${TOOL_CACHE_DIR}/" in
       "${DIR}/"*) ;;  # already writable via the runner-tree subpath rule
       *) writable+=("${TOOL_CACHE_DIR}") ;;
+    esac
+  fi
+  # Same for a RAM scratch path: the shared volume lives outside RUNNER_DIR.
+  if [[ -n "${RAM_SCRATCH_PATH}" ]]; then
+    case "${RAM_SCRATCH_PATH}/" in
+      "${DIR}/"*) ;;
+      *) writable+=("${RAM_SCRATCH_PATH}") ;;
     esac
   fi
   if [[ ${#writable[@]} -gt 0 ]]; then
@@ -696,6 +750,148 @@ migrate_tool_cache() {
 }
 
 # ----------------------------------------------------------------------------
+# OPT-IN: RAM-backed per-job build scratch (--ram-scratch; docs/ram-scratch.md).
+# Each cycle allocates a job-specific directory on the host's ONE bounded RAM
+# volume via the runner-ramscratch helper (which enforces a host-wide budget
+# across runners and a memory-headroom floor), then exposes it to job steps as
+# RUNNER_RAM_SCRATCH — exported here AND written into .env so it survives
+# runsvc.sh's environment handling. Only explicitly selected temporary/build
+# directories belong there: installed tools (_toolcache), compiler/dependency
+# caches (sccache/bazel), credentials, and retained _diag logs stay on SSD.
+#
+# Failure policy: allocation failure (feature off, helper missing, budget
+# exhausted, low memory) falls back to an SSD path under _work BEFORE the job
+# starts, so the job always runs. If a job EXHAUSTS its scratch mid-job, the
+# affected build step fails with ENOSPC on the bounded RAM volume (host disk
+# is unaffected); the job is NOT retried or migrated — non-idempotent steps
+# are never silently rerun. Size --ram-scratch-mb for the workload.
+# ----------------------------------------------------------------------------
+
+# Locate runner-ramscratch: explicit override, next to this script, then PATH.
+resolve_ramscratch_bin() {
+  if [[ -n "${RUNNER_RAMSCRATCH_BIN:-}" && -x "${RUNNER_RAMSCRATCH_BIN}" ]]; then
+    RAMSCRATCH_BIN="${RUNNER_RAMSCRATCH_BIN}"
+    return 0
+  fi
+  # Script-adjacent lookup only makes sense when this file was executed by
+  # path (when sourced, BASH_SOURCE[0] carries no real location).
+  case "${BASH_SOURCE[0]:-}" in
+    */*)
+      local self_dir
+      self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd || true)"
+      if [[ -n "${self_dir}" && -x "${self_dir}/runner-ramscratch" ]]; then
+        RAMSCRATCH_BIN="${self_dir}/runner-ramscratch"
+        return 0
+      fi ;;
+  esac
+  if command -v runner-ramscratch >/dev/null 2>&1; then
+    RAMSCRATCH_BIN="$(command -v runner-ramscratch)"
+    return 0
+  fi
+  return 1
+}
+
+# Set/remove one key in the runner's .env, preserving every other line
+# (operator configuration and job hooks included). .env survives wipe_state.
+write_runner_env() {
+  local key="$1" value="$2"
+  local file="${DIR}/.env" tmp="${DIR}/.env.ramscratch.$$"
+  if [[ -f "${file}" ]]; then
+    grep -v "^${key}=" "${file}" > "${tmp}" 2>/dev/null || true
+  else
+    : > "${tmp}"
+  fi
+  printf '%s=%s\n' "${key}" "${value}" >> "${tmp}"
+  mv -f "${tmp}" "${file}"
+}
+
+clear_runner_env() {
+  local key="$1"
+  local file="${DIR}/.env" tmp="${DIR}/.env.ramscratch.$$"
+  [[ -f "${file}" ]] || return 0
+  grep -v "^${key}=" "${file}" > "${tmp}" 2>/dev/null || true
+  mv -f "${tmp}" "${file}"
+}
+
+# Allocate this cycle's scratch directory. On any allocation problem, fall
+# back to an SSD path under _work so the job still runs (acceptance:
+# disabled/unavailable/insufficient-memory cases keep a working SSD path).
+prepare_ram_scratch() {
+  local cycle_num="${1:-0}"
+  RAM_SCRATCH_PATH=""
+  RAM_SCRATCH_IS_RAM=0
+  [[ "${RAM_SCRATCH}" == "1" ]] || return 0
+
+  # The scratch subdir names must satisfy runner-ramscratch's name rules.
+  RAM_SCRATCH_RUNNER="$(printf '%s' "${RUNNER_NAME}" | tr -c 'A-Za-z0-9._-' '-')"
+  RAM_SCRATCH_RUNNER="${RAM_SCRATCH_RUNNER#"${RAM_SCRATCH_RUNNER%%[A-Za-z0-9]*}"}"
+  [[ -n "${RAM_SCRATCH_RUNNER}" ]] || RAM_SCRATCH_RUNNER="runner"
+  RAM_SCRATCH_JOB="cycle-${cycle_num}"
+
+  local alloc_out=""
+  if resolve_ramscratch_bin; then
+    if alloc_out="$("${RAMSCRATCH_BIN}" alloc \
+        --runner "${RAM_SCRATCH_RUNNER}" --job "${RAM_SCRATCH_JOB}" \
+        --size-mb "${RAM_SCRATCH_MB}")"; then
+      RAM_SCRATCH_PATH="${alloc_out}"
+      RAM_SCRATCH_IS_RAM=1
+      step "RAM scratch: ${RAM_SCRATCH_PATH} (${RAM_SCRATCH_MB} MB budgeted)"
+    else
+      warn "RAM scratch allocation failed (not configured, budget exhausted,"
+      warn "or low memory); falling back to SSD scratch for this job."
+    fi
+  else
+    warn "runner-ramscratch helper not found; falling back to SSD scratch."
+  fi
+
+  if [[ -z "${RAM_SCRATCH_PATH}" ]]; then
+    RAM_SCRATCH_PATH="${DIR}/_work/_scratch"
+    if ! mkdir -p "${RAM_SCRATCH_PATH}"; then
+      err "Could not create the SSD fallback scratch directory."
+      return 1
+    fi
+    step "SSD scratch fallback: ${RAM_SCRATCH_PATH}"
+  fi
+  export RUNNER_RAM_SCRATCH="${RAM_SCRATCH_PATH}"
+  write_runner_env "RUNNER_RAM_SCRATCH" "${RAM_SCRATCH_PATH}"
+  return 0
+}
+
+# Copy the job's designated output subdir (_out) to retained SSD storage
+# BEFORE scratch teardown, so artifacts/logs survive the volatile volume —
+# including for interrupted jobs (shutdown() calls teardown too).
+copy_out_ram_scratch() {
+  local src="${RAM_SCRATCH_PATH}/_out"
+  [[ -d "${src}" ]] || return 0
+  local dest="${DIR}/_diag/ramscratch/${RAM_SCRATCH_JOB}-$(date +%Y%m%d-%H%M%S)"
+  if mkdir -p "${dest}" && cp -R "${src}/." "${dest}/"; then
+    step "Copied scratch _out to ${dest} (SSD, retained)."
+  else
+    warn "Could not copy ${src} out before scratch teardown."
+  fi
+}
+
+# Release this cycle's scratch. RAM allocations go back to the helper (which
+# detaches the shared volume only once no job holds an allocation); the SSD
+# fallback lives under _work and is removed by the next cycle's reset. The
+# .env pointer is always cleared so a dead path never leaks into the next job.
+teardown_ram_scratch() {
+  [[ -n "${RAM_SCRATCH_PATH}" ]] || return 0
+  if [[ "${RAM_SCRATCH_IS_RAM}" -eq 1 ]]; then
+    copy_out_ram_scratch
+    if resolve_ramscratch_bin; then
+      "${RAMSCRATCH_BIN}" clean --runner "${RAM_SCRATCH_RUNNER}" \
+        --job "${RAM_SCRATCH_JOB}" || warn "RAM scratch clean failed."
+    fi
+  fi
+  clear_runner_env "RUNNER_RAM_SCRATCH"
+  unset RUNNER_RAM_SCRATCH 2>/dev/null || true
+  RAM_SCRATCH_PATH=""
+  RAM_SCRATCH_IS_RAM=0
+  return 0
+}
+
+# ----------------------------------------------------------------------------
 # Wipe job output and registration residue so every cycle starts from a
 # reset workspace (binaries, operator configuration, the persistent tool
 # cache, and _diag logs are kept). _work goes through reset_workspace, which
@@ -721,6 +917,7 @@ RUNNER_NAME=""
 RUNNER_GROUP=""
 
 run_cycle() {
+  local cycle_num="${1:-0}"
   # Resolve and export the persistent tool cache first, so a misconfigured
   # AGENT_TOOLSDIRECTORY fails the cycle (backoff) instead of wasting a
   # registration token or running a job whose cache cannot persist.
@@ -783,6 +980,13 @@ run_cycle() {
     fi
   fi
 
+  # OPT-IN: allocate this job's RAM scratch directory (SSD fallback inside).
+  # Runs after registration so RUNNER_NAME is pinned, and before the sandbox
+  # profile so the scratch path is included in the writable set.
+  if ! prepare_ram_scratch "${cycle_num}"; then
+    return 1
+  fi
+
   # OPT-IN: sandbox the runner service. Failing to honor an explicit
   # --sandbox request fails the cycle (with backoff) rather than running
   # unconfined.
@@ -810,6 +1014,9 @@ run_cycle() {
   wait "${CHILD_PID}" && run_rc=0 || run_rc=$?
   CHILD_PID=""
   log "Runner '${RUNNER_NAME}' exited (rc=${run_rc}); job complete or service stopped."
+  # Copy scratch _out to retained SSD storage and release the RAM allocation
+  # (artifacts out BEFORE teardown), whether the job succeeded or failed.
+  teardown_ram_scratch || true
   # A failed listener must back off too, otherwise a crash can continuously
   # re-register and hammer the API. Job failures normally still exit the service 0.
   [[ "${run_rc}" -eq 0 ]]
@@ -836,7 +1043,7 @@ main() {
   while :; do
     cycle=$((cycle + 1))
     log "Lifecycle cycle ${cycle} starting."
-    if run_cycle; then
+    if run_cycle "${cycle}"; then
       failures=0
     else
       failures=$((failures + 1))
