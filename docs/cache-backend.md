@@ -1,9 +1,15 @@
-# Local S3 dependency cache (`runner-cache`)
+# Local and shared S3 dependency cache (`runner-cache`)
 
 `runner-cache` installs MinIO for dependency caches shared by trusted GitHub
 Actions jobs on one Mac. It runs as the invoking non-root user through the
 `com.github.runner-cache` LaunchDaemon and stores objects under
 `/opt/github-runner-cache/data`. The S3 API and console listen on loopback only.
+
+To share one cache across several Macs, `runner-cache client` configures a
+**configuration-only client** for an existing authenticated S3-compatible
+endpoint — no local MinIO installation or daemon on the client Mac. See
+[Shared backend across Macs (client mode)](#shared-backend-across-macs-client-mode).
+Local mode and its loopback defaults are unchanged either way.
 
 **MinIO is not a replacement endpoint for `actions/cache`.** GitHub's current
 cache client uses authenticated cache service RPCs, which differ from S3.
@@ -210,10 +216,137 @@ Be honest about what this cannot enforce:
 reports daemon, health (`GET /healthz`), and authorized scope count without
 secrets. `runner-cache uninstall` also removes the gateway daemon and plist.
 
-Distributed operation is intentionally **not implemented**: one gateway and
-one MinIO per Mac, loopback only, no cross-host cache sharing, and no
-reachability from GitHub-hosted runners or Docker VMs. For remote runners,
-use a reachable TLS S3 endpoint with the explicit S3 action instead.
+Distributed operation is intentionally **not implemented** for the gateway:
+one gateway and one MinIO per Mac, loopback only, no cross-host cache sharing,
+and no reachability from GitHub-hosted runners or Docker VMs. For cross-host
+cache sharing, point the other Macs at a reachable S3 endpoint with
+[`runner-cache client`](#shared-backend-across-macs-client-mode) and the
+explicit S3 action instead.
+
+## Shared backend across Macs (client mode)
+
+Local mode binds MinIO to `127.0.0.1`, so jobs on another Mac cannot reuse
+this host's cache. `runner-cache client` is the supported cross-host mode: it
+records a **shared, already-authenticated S3-compatible endpoint** per scope
+and emits the workflow integration for it. It is configuration-only — it
+installs no MinIO, starts no daemon, and performs no reachability checks, so
+it works on a Mac with no cache software installed at all.
+
+### Private-network deployment
+
+Run the S3 server (MinIO or any S3-compatible service) on one dedicated,
+always-on host reachable from every runner Mac over the trusted LAN or VPN.
+Terminate TLS there (a certificate the runner Macs trust) and keep the server
+off the public internet with firewall rules; TLS is the default in client
+mode and `--no-tls` is intended only for a trusted private network. Do **not**
+turn a local-mode Mac into the shared server by changing its bind address:
+local mode intentionally binds loopback, and exposing it would also expose
+its console and credentials. Provision one bucket and one constrained
+keypair per scope on the server, exactly as local mode does.
+
+On each client Mac, configure the scope with the endpoint settings the
+supported S3 client (the minio-js-based action) needs:
+
+```sh
+printf 'ACCESS_KEY=%s\nSECRET_KEY=%s\n' "$AK" "$SK" \
+  | runner-cache client install --repo acme/monorepo \
+      --endpoint cache.internal.lan --port 443 --region us-east-1
+runner-cache client env --repo acme/monorepo
+```
+
+`--tls` is the default (port 443); `--no-tls` defaults the port to 9000.
+`--path-style on` (the default) matches MinIO and the S3 action's addressing;
+set `--path-style off` only for endpoints requiring virtual-hosted buckets.
+`--bucket NAME` overrides the default `actions-cache-<scope>` name when the
+server provisioned a different bucket. Credentials are read from stdin into a
+managed 0600 file, or referenced in place with `--credentials-file PATH` (an
+existing 0600 file with `ACCESS_KEY`/`SECRET_KEY` lines, managed by you).
+Configuration and credential files live under
+`/opt/github-runner-cache/config/clients/`; values are never printed, never
+on argv, and never in generated workflow config. `client uninstall --repo …`
+removes the configuration (and only the managed credential file); the remote
+bucket's objects are untouched.
+
+`client env` prints the same `RUNNER_CACHE_*` settings as local `env`, plus
+`RUNNER_CACHE_REGION` and `RUNNER_CACHE_PATH_STYLE`, and a workflow snippet
+pointing the explicit S3 action at the remote endpoint:
+
+```yaml
+- uses: tespkg/actions-cache@v1
+  id: dependency-cache
+  with:
+    endpoint: cache.internal.lan
+    port: 443
+    insecure: false
+    region: us-east-1
+    accessKey: ${{ secrets.RUNNER_CACHE_ACCESS_KEY }}
+    secretKey: ${{ secrets.RUNNER_CACHE_SECRET_KEY }}
+    bucket: actions-cache-repo-acme-monorepo-<digest>
+    use-fallback: false
+    path: ~/Library/Caches/Homebrew
+    key: brew-${{ github.repository }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Brewfile.lock.json') }}
+```
+
+Distribute the scope's `ACCESS_KEY`/`SECRET_KEY` from the server to each
+client Mac's credential file and to the same GitHub Actions secrets as in
+local mode. Everything in [Workflow integration](#workflow-integration) —
+pinning the action by SHA, `use-fallback`, duplicate setup-* caching — still
+applies.
+
+### Cache keys, concurrent writers, and failure behavior
+
+- **Key inputs.** Scope keys by repository, OS, architecture, toolchain, and
+  dependency lockfiles, e.g.
+  `key: <kind>-${{ github.repository }}-${{ runner.os }}-${{ runner.arch }}-<toolchain>-${{ hashFiles('**/lockfile') }}`.
+  The bucket already isolates the org/repository scope; the key isolates
+  everything else. A job on Mac A populates an entry that a fresh workspace
+  on Mac B reuses only when both compute the same key.
+- **Concurrent writers.** S3 gives per-object atomicity with last-writer-wins
+  replacement: readers always get a complete old or new object, never a torn
+  mix. Jobs racing to save the same key are therefore safe; use per-ref or
+  per-lockfile keys to keep entries useful. The action verifies the archive
+  while restoring, so a failed or partial transfer fails the step instead of
+  silently restoring corrupt content.
+- **Backend outage.** Behavior is explicit, never silent: with
+  `use-fallback: false` the cache step fails on an unreachable endpoint
+  (fail the job, or add `continue-on-error` and keep a correct uncached build
+  path); with `use-fallback: true` the action falls back to GitHub's cache
+  service. Choose per workflow and record which you rely on.
+- **Hits vs. S3 counters.** Workflow cache hits come from the action's
+  `cache-hit` output and the step's restore/save durations. Raw S3 request,
+  error, and byte counters on the server (its Prometheus endpoint, or
+  `runner-cache metrics` on a local-mode server) are a separate lower-level
+  signal and cannot establish hit rates — keep the two apart in dashboards.
+- **Local/remote interaction.** Both modes can coexist on one Mac (separate
+  config trees under `config/scopes/` and `config/clients/`); each workflow
+  chooses its backend by the endpoint it passes to the action. A host can
+  serve its own local cache and consume a remote one for different scopes.
+- **Retention and size limits.** `runner-cache` imposes no size cap or object
+  expiry in either mode. On the shared server, configure bucket lifecycle
+  rules (for MinIO, `mc ilm rule add`) sized to the fleet's aggregate cache
+  volume — several Macs write more than one — and monitor disk usage there.
+
+### sccache integration point
+
+The compiler-cache helper (`runner-sccache`, tracked separately) targets the
+same backend through sccache's S3 storage: `SCCACHE_BUCKET=<bucket>`,
+`SCCACHE_ENDPOINT=<host>:<port>` (no scheme), `SCCACHE_REGION=<region>`,
+`SCCACHE_S3_USE_SSL=true|false` matching `--tls`, and
+`SCCACHE_NO_PATH_STYLE=true` only when the endpoint was configured with
+`--path-style off`; credentials via `AWS_ACCESS_KEY_ID` /
+`AWS_SECRET_ACCESS_KEY` from the scope credential file. Client mode does not
+install or manage sccache; this is only the documented hand-off.
+
+### Measuring remote cache cost
+
+The measurement harness is tracked separately (runner performance tooling);
+until it exists, measure manually. For a representative workflow, record from
+the action step on both a populating Mac and a fresh-workspace Mac: the
+`cache-hit` output, restore and save step durations (and, for sccache, its
+statistics), plus full-job duration, across cold (empty/purged prefix) and
+warm runs, and again with the endpoint unreachable to confirm the chosen
+outage behavior. Compare remote-restore latency against local-mode restore
+and against a fully uncached build before rolling a shared cache out.
 
 ## Scope boundaries and operations
 
@@ -253,6 +386,9 @@ persist across rotation.
 | `gateway install (--org ORG \| --repo OWNER/REPO) [--gateway-port N] [--save-prefix P]...` | Install the GitHub-protocol cache gateway daemon and mint the scope's bearer token. |
 | `gateway env [--org ORG \| --repo OWNER/REPO]` | Print ACTIONS_CACHE_URL/ACTIONS_RESULTS_URL wiring for standard actions/cache; token stays in the 0600 scope file. |
 | `gateway start` / `gateway stop` / `gateway status [--json]` | Manage the gateway daemon. |
+| `client install (--org ORG \| --repo OWNER/REPO) --endpoint HOST [--port N] [--tls \| --no-tls] [--region R] [--path-style on\|off] [--bucket NAME] [--credentials-file PATH]` | Record a shared remote S3 endpoint and 0600 credential file for the scope. No MinIO installation or daemon. Credentials come from stdin or a referenced file, never argv. |
+| `client env [--org ORG \| --repo OWNER/REPO]` | Print the remote S3 settings and the S3-action workflow integration; secrets stay in files. |
+| `client uninstall (--org ORG \| --repo OWNER/REPO)` | Remove the scope's client configuration and managed credential file; remote objects are untouched. |
 | `uninstall [--yes] [--keep-data]` | Remove the daemon. `--keep-data` preserves **both data and credentials/config** for reinstall; otherwise all cache files are removed. |
 
 Local metrics are at `http://127.0.0.1:9000/minio/v2/metrics/cluster`; public
@@ -265,6 +401,7 @@ Use `runner-cache status`, `sudo launchctl print system/com.github.runner-cache`
 and `/opt/github-runner-cache/logs/minio-stderr.log` for troubleshooting. Monitor
 disk usage and configure bucket lifecycle retention for your workload; this
 helper does not currently impose a cache size cap or automatically expire
-objects. For remote S3, configure a reachable TLS endpoint and its own scope
-credentials in the S3 action; the locally installed server intentionally
-listens only on this Mac.
+objects. For a backend shared by several Macs, keep this local server on
+loopback and configure the other Macs with
+[`runner-cache client`](#shared-backend-across-macs-client-mode) against a
+dedicated, TLS-protected S3 endpoint.
