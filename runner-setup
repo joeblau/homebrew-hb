@@ -40,6 +40,13 @@ RUNNERS="${DEFAULT_RUNNERS}"
 LABELS="macos,macmini,self-hosted"
 NAME_PREFIX=""        # GitHub runner-name prefix; defaults to this machine's name
 NAME_PREFIX_SET=0     # 1 once --name-prefix was given (even if empty)
+COLIMA=0             # --colima: boot the shared VM and gate runner startup
+DOCKER_TIMEOUT=300
+COLIMA_INHERITED=0
+DOCKER_HELPER=""
+COLIMA_UPGRADE_BIN=""
+COLIMA_CONFIG_HOME=""
+COLIMA_DOCKER_CONFIG=""
 EPHEMERAL=0           # 1 => LaunchDaemon runs runner-ephemeral, not runsvc.sh
 EPHEMERAL_BIN=""      # resolved absolute path of the runner-ephemeral supervisor
 TOOL_CACHE_DIR=""     # --tool-cache-dir override; default is per-runner DIR/_toolcache
@@ -89,7 +96,7 @@ usage() {
 ${PROG_NAME} — provision GitHub Actions self-hosted runners on macOS
 
 USAGE:
-  ${PROG_NAME} (--org ORG | --repo OWNER/REPO | --url URL) --token TOKEN [options]
+  ${PROG_NAME} (--org ORG | --repo OWNER/REPO | --url URL) [--token TOKEN] [options]
 
 SCOPE (choose exactly ONE — it must match where you generated the token):
   --org ORG_NAME        Organization runner (https://github.com/ORG_NAME).
@@ -100,7 +107,8 @@ SCOPE (choose exactly ONE — it must match where you generated the token):
                         config.sh command (also works for GitHub Enterprise).
 
 REQUIRED:
-  --token TOKEN         Runner registration token for the scope above. The org
+  --token TOKEN         Required for registration; --colima can update existing
+                        same-scope runners without a token. The org
                         and repo pages issue DIFFERENT tokens; a repo token used
                         with --org (or vice versa) returns 404. May also be
                         supplied via the RUNNER_TOKEN env var (preferred — see
@@ -115,6 +123,12 @@ OPTIONS:
                         scope. Use --name-prefix '' for a plain runner-N. An
                         already-registered runner keeps its original name on
                         re-run (runner-cleanup it first to actually rename it).
+  --colima              Start Colima at boot as the runner user and wait for
+                        Docker before starting each runner. Installs Colima,
+                        Docker CLI and Buildx if needed. Updates existing
+                        same-scope runners without re-registering them.
+  --docker-timeout N    Docker readiness timeout in seconds (default: 300;
+                        maximum: 3600). launchd retries failed starts.
   --ephemeral           Make each runner ephemeral: instead of pointing the
                         LaunchDaemon at bin/runsvc.sh directly, point it at the
                         runner-ephemeral supervisor, which re-registers the
@@ -232,6 +246,11 @@ parse_args() {
         [[ $# -ge 2 ]] || { err "--name-prefix requires a value"; usage; exit 2; }
         NAME_PREFIX="$2"; NAME_PREFIX_SET=1; shift 2 ;;
       --name-prefix=*) NAME_PREFIX="${1#*=}"; NAME_PREFIX_SET=1; shift ;;
+      --colima) COLIMA=1; shift ;;
+      --docker-timeout)
+        [[ $# -ge 2 ]] || { err "--docker-timeout requires a value"; exit 2; }
+        DOCKER_TIMEOUT="$2"; shift 2 ;;
+      --docker-timeout=*) DOCKER_TIMEOUT="${1#*=}"; shift ;;
       --ephemeral) EPHEMERAL=1; shift ;;
       --tool-cache-dir)
         [[ $# -ge 2 ]] || { err "--tool-cache-dir requires a value"; usage; exit 2; }
@@ -275,7 +294,7 @@ parse_args() {
     exit 2
   fi
 
-  if [[ -z "${TOKEN}" ]]; then
+  if [[ -z "${TOKEN}" && "${COLIMA}" -eq 0 ]]; then
     err "Missing required argument: --token (or RUNNER_TOKEN env)"
     usage
     exit 2
@@ -303,6 +322,10 @@ parse_args() {
         err "--tool-cache-dir must live outside every runner's _work directory."
         exit 2 ;;
     esac
+  fi
+
+  if ! [[ "${DOCKER_TIMEOUT}" =~ ^[1-9][0-9]*$ ]] || [[ "${DOCKER_TIMEOUT}" -gt 3600 ]]; then
+    err "--docker-timeout must be between 1 and 3600 seconds"; exit 2
   fi
 
   # Opt-in RAM scratch: per-job lifecycle needs the ephemeral supervisor, and
@@ -644,6 +667,168 @@ bootout_system() {
   return 0
 }
 
+# One foreground Colima service per host, independent of any single runner.
+# No runner may accept a job until its own readiness gate succeeds.
+prepare_colima_boot() {
+  local self_dir colima_bin label="com.github.runner-colima" plist staged processes
+  self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  DOCKER_HELPER="${self_dir}/runner-docker-builder"
+  COLIMA_UPGRADE_BIN="${self_dir}/runner-upgrade"
+  [[ -x "${DOCKER_HELPER}" ]] || DOCKER_HELPER="$(command -v runner-docker-builder)" || return 1
+  [[ -x "${COLIMA_UPGRADE_BIN}" ]] || COLIMA_UPGRADE_BIN="$(command -v runner-upgrade)" || return 1
+  command -v python3 >/dev/null || { err "--colima requires python3"; return 1; }
+  plist="${LAUNCH_DAEMON_DIR}/${label}.plist"
+  if [[ "${COLIMA_INHERITED}" -eq 1 ]]; then
+    local settings
+    settings="$(python3 - "${plist}" "${REAL_USER}" <<'PYINHERIT'
+import json, plistlib, sys
+with open(sys.argv[1], "rb") as f:
+    config = plistlib.load(f)
+if config.get("UserName") != sys.argv[2]:
+    raise SystemExit("Colima boot service belongs to another runner user")
+env = config.get("EnvironmentVariables", {})
+for key in ("COLIMA_HOME", "DOCKER_CONFIG"):
+    if not env.get(key, "").startswith("/"):
+        raise SystemExit("Missing absolute Colima boot configuration: " + key)
+timeout = env.get("RUNNER_DOCKER_TIMEOUT", "300")
+if not timeout.isdigit() or not 1 <= int(timeout) <= 3600:
+    raise SystemExit("Invalid Colima readiness timeout")
+print(json.dumps(env | {"RUNNER_DOCKER_TIMEOUT": timeout}))
+PYINHERIT
+)" || return 1
+    COLIMA_CONFIG_HOME="$(printf '%s' "${settings}" | jq -r .COLIMA_HOME)"
+    COLIMA_DOCKER_CONFIG="$(printf '%s' "${settings}" | jq -r .DOCKER_CONFIG)"
+    DOCKER_TIMEOUT="$(printf '%s' "${settings}" | jq -r .RUNNER_DOCKER_TIMEOUT)"
+    sudo launchctl enable "system/${label}" || return 1
+    if ! sudo launchctl print "system/${label}" >/dev/null 2>&1; then
+      sudo launchctl bootstrap system "${plist}" || return 1
+    fi
+    return 0
+  fi
+  # Do not transition service ownership while any local CI worker is active.
+  processes="$(ps -axo comm=)" || { err "Cannot inspect active jobs"; return 1; }
+  if printf '%s\n' "${processes}" | grep -Eq '(^|/)Runner[.]Worker$'; then
+    err "Active runner job detected. Pause dispatch and let jobs finish before --colima setup."; return 1
+  fi
+  if [[ -e "${REAL_HOME}/Library/LaunchAgents/homebrew.mxcl.colima.plist"      || -e "${LAUNCH_DAEMON_DIR}/homebrew.mxcl.colima.plist" ]]; then
+    err "Colima already has a Homebrew service. Stop that service between jobs before using --colima."; return 1
+  fi
+  COLIMA_CONFIG_HOME="${COLIMA_HOME:-${REAL_HOME}/.colima}"
+  COLIMA_DOCKER_CONFIG="${DOCKER_CONFIG:-${REAL_HOME}/.docker}"
+  [[ "${COLIMA_CONFIG_HOME}" == /* && "${COLIMA_DOCKER_CONFIG}" == /* ]] || {
+    err "COLIMA_HOME and DOCKER_CONFIG must be absolute paths"; return 1;
+  }
+  plist="${LAUNCH_DAEMON_DIR}/${label}.plist"
+  # Never take over another service user's VM.
+  if [[ -f "${plist}" ]]; then
+    python3 - "${plist}" "${REAL_USER}" <<'PYCHECK'
+import plistlib, sys
+with open(sys.argv[1], "rb") as f:
+    existing = plistlib.load(f)
+if existing.get("UserName") != sys.argv[2]:
+    raise SystemExit("Colima boot daemon belongs to another user; refusing to replace it")
+PYCHECK
+    [[ $? -eq 0 ]] || return 1
+  fi
+  as_user env COLIMA_PROFILE=default COLIMA_HOME="${COLIMA_CONFIG_HOME}" DOCKER_CONFIG="${COLIMA_DOCKER_CONFIG}"     "${DOCKER_HELPER}" setup-colima || return 1
+  colima_bin="$(command -v colima)" || return 1
+  staged="${WORK_TMPDIR}/${label}.plist"
+  as_user mkdir -p "${REAL_HOME}/Library/Logs/runner-colima" || return 1
+  python3 - "${staged}" "${REAL_USER}" "${REAL_HOME}" "${colima_bin}"       "${COLIMA_CONFIG_HOME}" "${COLIMA_DOCKER_CONFIG}" "${DOCKER_TIMEOUT}" <<'PYDAEMON'
+import pathlib, plistlib, sys
+path, user, home, binary, colima_home, docker_config, timeout = sys.argv[1:]
+logs = str(pathlib.Path(home) / "Library/Logs/runner-colima")
+with open(path, "wb") as f:
+    plistlib.dump({
+        "Label": "com.github.runner-colima", "UserName": user,
+        "ProgramArguments": [binary, "start", "default", "--foreground"],
+        "WorkingDirectory": home,
+        "EnvironmentVariables": {
+            "HOME": home, "USER": user, "LOGNAME": user,
+            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+            "COLIMA_HOME": colima_home, "COLIMA_PROFILE": "default",
+            "DOCKER_CONFIG": docker_config, "RUNNER_DOCKER_TIMEOUT": timeout,
+        },
+        "RunAtLoad": True, "KeepAlive": True, "ThrottleInterval": 30,
+        "SessionCreate": True,
+        "StandardOutPath": logs + "/stdout.log", "StandardErrorPath": logs + "/stderr.log",
+    }, f)
+PYDAEMON
+  [[ $? -eq 0 ]] || return 1
+  plutil -lint "${staged}" >/dev/null || return 1
+  if ! cmp -s "${staged}" "${plist}"; then
+    if sudo launchctl print "system/${label}" >/dev/null 2>&1; then
+      bootout_system "${label}" || return 1
+      if sudo launchctl print "system/${label}" >/dev/null 2>&1; then
+        err "Previous Colima daemon has not stopped; retry setup."; return 1
+      fi
+    fi
+    sudo cp "${staged}" "${plist}" && sudo chown root:wheel "${plist}"       && sudo chmod 644 "${plist}" || return 1
+  fi
+  sudo launchctl enable "system/${label}" || return 1
+  if ! sudo launchctl print "system/${label}" >/dev/null 2>&1; then
+    sudo launchctl bootstrap system "${plist}" || return 1
+  fi
+  step "Colima boot daemon installed; runner startup will wait for Docker."
+}
+
+# Wrap a known runner service without changing its registration or supervisor
+# options. plistlib handles XML quoting for paths and retained operator values.
+gate_colima_plist() {
+  python3 - "$1" "$2" "$3" "${DOCKER_HELPER}" "${DOCKER_TIMEOUT}"     "${REAL_USER}" "${COLIMA_DOCKER_CONFIG}" <<'PYPLIST'
+import pathlib, plistlib, sys
+source, target, directory, helper, timeout, user, docker_config = sys.argv[1:]
+with open(source, "rb") as f:
+    config = plistlib.load(f)
+args = config.get("ProgramArguments", [])
+if (not isinstance(args, list) or not args or not all(isinstance(a, str) for a in args)
+        or config.get("UserName") != user or config.get("WorkingDirectory") != directory
+        or config.get("Program", args[0]) != args[0]):
+    raise SystemExit("Unrecognized runner LaunchDaemon; refusing to replace its command")
+if pathlib.Path(args[0]).name == "runner-docker-builder":
+    if len(args) < 6 or args[1:3] != ["wait-colima", "--timeout"] or args[4] != "--":
+        raise SystemExit("Unrecognized Docker readiness wrapper")
+    args = args[5:]
+if args[0] != directory + "/bin/runsvc.sh" and not (
+        args[0].startswith("/") and pathlib.Path(args[0]).name == "runner-ephemeral"):
+    raise SystemExit("Unrecognized runner entrypoint; refusing to replace its command")
+config["ProgramArguments"] = [helper, "wait-colima", "--timeout", timeout, "--"] + args
+if "Program" in config:
+    config["Program"] = helper
+config.setdefault("EnvironmentVariables", {})["DOCKER_CONFIG"] = docker_config
+config["RunAtLoad"] = True
+config["KeepAlive"] = {"SuccessfulExit": False}
+with open(target, "wb") as f:
+    plistlib.dump(config, f)
+PYPLIST
+}
+
+# Existing same-scope runners can gain the gate without config.sh, a fresh
+# registration token, or changes to their ephemeral registration settings.
+retrofit_colima_runner() {
+  local idx="$1" dir="$2" plist="$3" staged="${WORK_TMPDIR}/colima-runner-${1}.plist"
+  gate_colima_plist "${plist}" "${staged}" "${dir}" || return 1
+  if cmp -s "${staged}" "${plist}"; then
+    if [[ ! -e "${RUNNER_ROOT}/.maintenance/runner-${idx}" ]] \
+        && ! sudo launchctl print "system/com.github.runner-${idx}" >/dev/null 2>&1; then
+      as_user "${COLIMA_UPGRADE_BIN}" start --runner "${idx}" --yes \
+        --health-timeout "$((DOCKER_TIMEOUT + 300))" || return 1
+    fi
+    record_status "runner-${idx}" "OK (Colima gate already installed)"
+    return 0
+  fi
+  local held=0
+  [[ ! -e "${RUNNER_ROOT}/.maintenance/runner-${idx}" ]] || held=1
+  as_user "${COLIMA_UPGRADE_BIN}" shutdown --runner "${idx}" --yes || return 1
+  if ! { sudo cp "${staged}" "${plist}" && sudo chown root:wheel "${plist}"       && sudo chmod 644 "${plist}"; }; then
+    err "Could not install Docker gate; runner-${idx} remains in maintenance."; return 1
+  fi
+  if [[ "${held}" -eq 0 ]]; then
+    as_user "${COLIMA_UPGRADE_BIN}" start --runner "${idx}" --yes       --health-timeout "$((DOCKER_TIMEOUT + 300))" || return 1
+  fi
+  record_status "runner-${idx}" "Colima gate installed (registration preserved)"
+}
+
 configure_runner() {
   # NOTE: this is called as `if ! configure_runner ...`, so `set -e` is INACTIVE
   # for the whole body (bash disables errexit inside a negated/if condition).
@@ -680,6 +865,15 @@ configure_runner() {
   fi
 
   log "Configuring ${name} as '${runner_name}'  (${dir})"
+
+  if [[ "${COLIMA}" -eq 1 && -f "${dir}/.runner" && -f "${plist_dest}" ]]; then
+    local prior_url
+    prior_url="$(jq -r '.gitHubUrl // ""' "${dir}/.runner")" || return 1
+    if [[ "$(printf '%s' "${prior_url%/}" | tr '[:upper:]' '[:lower:]')" ==           "$(printf '%s' "${RUNNER_URL%/}" | tr '[:upper:]' '[:lower:]')" ]]; then
+      retrofit_colima_runner "${idx}" "${dir}" "${plist_dest}"
+      return $?
+    fi
+  fi
 
   # --- Idempotency: already provisioned, loaded, AND same scope? -----------
   # .runner is JSON containing "gitHubUrl"; only skip when it matches the
@@ -947,6 +1141,12 @@ ${ramscratch_env_xml}  </dict>
 </plist>
 EOF
 
+  if [[ "${COLIMA}" -eq 1 ]]; then
+    if ! gate_colima_plist "${tmp_plist}" "${tmp_plist}.gated" "${dir}"         || ! mv "${tmp_plist}.gated" "${tmp_plist}"; then
+      record_status "${name}" "FAILED (Docker readiness gate)"; return 1
+    fi
+  fi
+
   # Validate the plist before installing it.
   if ! plutil -lint "${tmp_plist}" >/dev/null 2>&1; then
     err "Generated plist failed plutil -lint for ${name}."
@@ -1023,6 +1223,21 @@ main() {
   detect_user
   detect_arch
   detect_host
+  # Once a host opts in, autoscaled/new runners inherit the same boot gate.
+  if [[ "${COLIMA}" -eq 0 && -f "${LAUNCH_DAEMON_DIR}/com.github.runner-colima.plist" ]]; then
+    COLIMA=1
+    COLIMA_INHERITED=1
+  fi
+  if [[ "${COLIMA}" -eq 1 && -z "${TOKEN}" ]]; then
+    local ci_idx ci_dir ci_scope
+    for ((ci_idx = 1; ci_idx <= RUNNERS; ci_idx++)); do
+      ci_dir="${RUNNER_ROOT}/runner-${ci_idx}"
+      ci_scope="$(jq -r '.gitHubUrl // ""' "${ci_dir}/.runner" 2>/dev/null)" || ci_scope=""
+      if [[ ! -f "${LAUNCH_DAEMON_DIR}/com.github.runner-${ci_idx}.plist"           || "$(printf '%s' "${ci_scope%/}" | tr '[:upper:]' '[:lower:]')" !=              "$(printf '%s' "${RUNNER_URL%/}" | tr '[:upper:]' '[:lower:]')" ]]; then
+        err "runner-${ci_idx} requires registration; supply --token or RUNNER_TOKEN."; return 1
+      fi
+    done
+  fi
   ensure_sudo
   local staging_root="${TMPDIR:-/tmp}"
   [[ "${EUID}" -ne 0 ]] || staging_root=/tmp
@@ -1032,6 +1247,9 @@ main() {
   sudo chown "${REAL_USER}:${REAL_GROUP}" "${WORK_TMPDIR}"
   prepare_runner_archive
   prepare_root_dir
+  if [[ "${COLIMA}" -eq 1 ]]; then
+    prepare_colima_boot || { err "Could not configure Colima boot service"; return 1; }
+  fi
 
   log "Provisioning ${RUNNERS} runner(s) under ${RUNNER_ROOT}"
   PROVISIONING_STARTED=1

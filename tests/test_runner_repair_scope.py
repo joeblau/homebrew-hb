@@ -90,6 +90,29 @@ class RunnerRepairScopeTests(unittest.TestCase):
                 self.assertEqual(self.argument("--url"), "https://github.com/lev7finance")
                 self.assertIn("--ephemeral", self.configure_arguments())
 
+    def test_repair_preserves_colima_gate_for_persistent_runner(self):
+        config = plistlib.loads(self.plist.read_bytes())
+        prefix = ["/opt/homebrew/bin/runner-docker-builder", "wait-colima", "--timeout", "300", "--"]
+        config["ProgramArguments"] = prefix + config["ProgramArguments"]
+        self.plist.write_bytes(plistlib.dumps(config))
+        before = self.plist.read_bytes()
+        result = self.shell(TEST_REPAIR_ORG="lev7finance")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.plist.read_bytes(), before)
+
+    def test_repair_updates_ephemeral_scope_inside_colima_gate(self):
+        self.supervisor()
+        config = plistlib.loads(self.plist.read_bytes())
+        prefix = ["/opt/homebrew/bin/runner-docker-builder", "wait-colima", "--timeout", "120", "--"]
+        config["ProgramArguments"] = prefix + config["ProgramArguments"]
+        self.plist.write_bytes(plistlib.dumps(config))
+        result = self.shell(TEST_REPAIR_ORG="lev7finance", TEST_LABELS="macos,finance")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = plistlib.loads(self.plist.read_bytes())["ProgramArguments"]
+        self.assertEqual(args[:5], prefix)
+        self.assertEqual(args[args.index("--url") + 1], "https://github.com/lev7finance")
+        self.assertEqual(args[args.index("--labels") + 1], "macos,finance")
+
     def test_ephemeral_authentication_failure_retry_updates_old_supervisor_scope(self):
         self.supervisor()
         before = self.plist.read_bytes()
