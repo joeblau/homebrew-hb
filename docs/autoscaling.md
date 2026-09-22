@@ -179,7 +179,7 @@ covered by idle slots adds nothing. Directories that are offline,
 mid-registration, or failed registration never count as ready slots, and a
 `--min` reconciliation that finds missing indices restores them in the same
 bounded batch. A runner-list API failure makes idle capacity unknown, and the
-tick conservatively provisions at most one runner.
+tick aborts scale-up, including minimum-fleet reconciliation.
 
 **Bounded batches for bursts.** `--scale-up-batch N` (default **1**) lets one
 tick add up to N runners — for example draining a 6-job matrix burst in two

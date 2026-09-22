@@ -337,7 +337,7 @@ detect_user() {
 require_cmds() {
   local missing=()
   local c
-  for c in curl jq sed grep uname id whoami sleep rm mkdir basename; do
+  for c in curl jq sed grep uname id whoami sleep rm mkdir basename python3; do
     command -v "${c}" >/dev/null 2>&1 || missing+=("${c}")
   done
   if [[ ${#missing[@]} -gt 0 ]]; then
@@ -707,20 +707,49 @@ read_saved_identity() {
 # shared location at the operator's risk.
 # ----------------------------------------------------------------------------
 resolve_tool_cache_dir() {
-  local dir="${RUNNER_TOOL_CACHE:-${AGENT_TOOLSDIRECTORY:-${DIR}/_toolcache}}"
-  while [[ "${dir}" == */ && "${dir}" != "/" ]]; do dir="${dir%/}"; done
-  case "${dir}" in
-    /*) ;;
-    *)
-      err "Tool cache directory must be an absolute path (got: '${dir}')."
-      return 1 ;;
-  esac
-  case "${dir}/" in
-    "${DIR}/_work/"*)
-      err "Tool cache directory must live OUTSIDE ${DIR}/_work (got: '${dir}');"
-      err "ephemeral resets delete _work, so a cache inside it cannot persist."
-      return 1 ;;
-  esac
+  local rtc="${RUNNER_TOOL_CACHE:-}" rtd="${RUNNER_TOOLSDIRECTORY:-}"
+  local atd="${AGENT_TOOLSDIRECTORY:-}" line
+  # Runner.Listener imports .env before resolving its directories; match it.
+  if [[ -f "${DIR}/.env" ]]; then
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+      case "${line}" in
+        RUNNER_TOOL_CACHE=*) rtc="${line#*=}" ;;
+        RUNNER_TOOLSDIRECTORY=*) rtd="${line#*=}" ;;
+        AGENT_TOOLSDIRECTORY=*) atd="${line#*=}" ;;
+      esac
+    done < "${DIR}/.env"
+  fi
+  local dir="${rtc:-${rtd:-${atd:-${DIR}/_toolcache}}}"
+  if ! dir="$(python3 - "${DIR}" "${dir}" <<'PYTOOLS'
+import os
+import pathlib
+import sys
+root, value = sys.argv[1:]
+try:
+    if not os.path.isabs(value):
+        raise ValueError("Tool cache directory must be an absolute path")
+    cache = pathlib.Path(value).resolve()
+    runner = pathlib.Path(root).resolve()
+    disposable = [runner / name for name in ("_work", "_diag")]
+    disposable += [path.resolve() for path in disposable]
+    if cache == runner or cache in runner.parents:
+        raise ValueError("Tool cache must not contain the runner directory")
+    if any(path == cache or path in cache.parents or cache in path.parents
+           for path in disposable):
+        raise ValueError("Tool cache directory must live OUTSIDE disposable runner storage")
+    existing = cache
+    while not existing.exists():
+        existing = existing.parent
+    if not existing.is_dir() or existing.stat().st_uid != os.getuid():
+        raise ValueError("Tool cache destination must be owned by the invoking user")
+    print(cache)
+except (OSError, RuntimeError, ValueError) as exc:
+    print(str(exc), file=sys.stderr)
+    sys.exit(1)
+PYTOOLS
+)"; then
+    return 1
+  fi
   TOOL_CACHE_DIR="${dir}"
   export AGENT_TOOLSDIRECTORY="${TOOL_CACHE_DIR}"
   return 0
@@ -867,18 +896,21 @@ copy_out_ram_scratch() {
   if mkdir -p "${dest}" && cp -R "${src}/." "${dest}/"; then
     step "Copied scratch _out to ${dest} (SSD, retained)."
   else
-    warn "Could not copy ${src} out before scratch teardown."
+    warn "Could not copy ${src}; retaining scratch and blocking workspace resets."
+    touch "${DIR}/.scratch-retention-failed"
+    return 1
   fi
 }
 
 # Release this cycle's scratch. RAM allocations go back to the helper (which
 # detaches the shared volume only once no job holds an allocation); the SSD
 # fallback lives under _work and is removed by the next cycle's reset. The
-# .env pointer is always cleared so a dead path never leaks into the next job.
+# .env pointer is cleared after successful retention; copy failure blocks resets.
 teardown_ram_scratch() {
   [[ -n "${RAM_SCRATCH_PATH}" ]] || return 0
+  copy_out_ram_scratch || return 1
+  rm -f "${DIR}/.scratch-retention-failed"
   if [[ "${RAM_SCRATCH_IS_RAM}" -eq 1 ]]; then
-    copy_out_ram_scratch
     if resolve_ramscratch_bin; then
       "${RAMSCRATCH_BIN}" clean --runner "${RAM_SCRATCH_RUNNER}" \
         --job "${RAM_SCRATCH_JOB}" || warn "RAM scratch clean failed."
@@ -898,6 +930,10 @@ teardown_ram_scratch() {
 # honors --snapshot-rollback and always falls back to rm -rf.
 # ----------------------------------------------------------------------------
 wipe_state() {
+  if [[ -e "${DIR}/.scratch-retention-failed" ]]; then
+    err "Scratch output retention failed; recover _out before removing ${DIR}/.scratch-retention-failed."
+    return 1
+  fi
   resolve_tool_cache_dir || return 1
   migrate_tool_cache || return 1
   reset_workspace || return 1
@@ -1016,7 +1052,7 @@ run_cycle() {
   log "Runner '${RUNNER_NAME}' exited (rc=${run_rc}); job complete or service stopped."
   # Copy scratch _out to retained SSD storage and release the RAM allocation
   # (artifacts out BEFORE teardown), whether the job succeeded or failed.
-  teardown_ram_scratch || true
+  teardown_ram_scratch || return 1
   # A failed listener must back off too, otherwise a crash can continuously
   # re-register and hammer the API. Job failures normally still exit the service 0.
   [[ "${run_rc}" -eq 0 ]]

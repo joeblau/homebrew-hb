@@ -205,10 +205,9 @@ EXAMPLES:
   # Cold vs warm, pinned source + toolchain, five repetitions each:
   ${PROG_NAME} run --scenario cold --label baseline --reps 5 \\
     --toolchain 'rustc 1.80.1, macOS 15, arm64' \\
-    --cmd 'git clone -q --depth 1 --branch v1.10.0 \\
-      file:///opt/mirrors/homebrew-hb src && cd src/agent-mcp && \\
-      bench_phase() { printf "RUNNER_BENCH_PHASE %s %s\\n" "\$1" "\$(date +%s)"; }; \\
-      bench_phase setup && cargo build --release -q && bench_phase build'
+    --cmd 'mkdir -p "\$RUNNER_BENCH_CACHE_DIR"; echo benchmark-smoke'
+  # docs/runner-performance.md includes a repeatable C build workload that
+  # handles cold/warm caches and applies valid source edits after checkout.
   ${PROG_NAME} run --scenario warm --label baseline --reps 5 --cmd '...'
   # A small source edit, then concurrency scaling:
   ${PROG_NAME} run --scenario edited --label baseline --reps 5 --cmd '...'
@@ -231,6 +230,13 @@ EOF
 # ----------------------------------------------------------------------------
 cleanup() {
   local code=$?
+  if [[ -n "${SLOT_PIDS_FILE}" && -f "${SLOT_PIDS_FILE}" ]]; then
+    local slot pid
+    while IFS=$'\t' read -r slot pid; do
+      kill "${pid}" 2>/dev/null || true
+      wait "${pid}" 2>/dev/null || true
+    done < "${SLOT_PIDS_FILE}"
+  fi
   if [[ -n "${SAMPLER_PID}" ]]; then
     kill "${SAMPLER_PID}" 2>/dev/null || true
   fi
@@ -259,7 +265,7 @@ on_interrupt() {
     local slot pid
     while IFS=$'\t' read -r slot pid; do
       [[ -n "${pid}" ]] || continue
-      kill_tree "${pid}"
+      kill "${pid}" 2>/dev/null || true
     done < "${SLOT_PIDS_FILE}"
   fi
   return 0
@@ -451,9 +457,7 @@ iso_now() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
 
 # Escape a string for embedding in JSON (same rules as runner-logs).
 json_escape() {
-  printf '%s' "$1" \
-    | tr -d '\000-\010\013-\037' \
-    | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/\\t/g'
+  printf '%s' "$1" | python3 -c 'import json, sys; print(json.dumps(sys.stdin.read())[1:-1], end="")'
 }
 
 # Hardware/OS configuration recorded alongside every result, so baseline and
@@ -508,8 +512,8 @@ tree_stats() {
     }'
 }
 
-# Kill a workload process and its whole tree (used on cancellation so a
-# cancelled run never leaves orphan processes behind).
+# Best-effort tree cleanup utility. Workload supervision uses a dedicated
+# process group instead, since exited parents can lose their descendants.
 kill_tree() {
   local root="$1" kids
   [[ -n "${root}" ]] || return 0
@@ -614,14 +618,55 @@ prepare_scenario() {
 # substitution would make the job a child of the subshell, breaking wait).
 launch_slot() {
   local slot="$1" slot_dir="$2" cache_dir="$3" logfile="$4" stats="$5"
-  (
-    cd "${slot_dir}" || exit 97
-    export RUNNER_BENCH_SLOT="${slot}"
-    export RUNNER_BENCH_CACHE_DIR="${cache_dir}"
-    export RUNNER_BENCH_STATS_FILE="${stats}"
-    export RUNNER_BENCH_SCENARIO="${SCENARIO}"
-    eval "${CMD}"
-  ) > "${logfile}" 2>&1 &
+  RUNNER_BENCH_SLOT="${slot}" RUNNER_BENCH_CACHE_DIR="${cache_dir}" \
+  RUNNER_BENCH_STATS_FILE="${stats}" RUNNER_BENCH_SCENARIO="${SCENARIO}" \
+  python3 - "${slot_dir}" "${CMD}" "${stats}.timing" > "${logfile}" 2>&1 <<'PYSLOT' &
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+
+workdir, command, timing_path = sys.argv[1:]
+child = None
+cancelled = False
+
+def stop_group():
+    if child is not None:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+def cancel(signum, frame):
+    global cancelled
+    cancelled = True
+    stop_group()
+
+signal.signal(signal.SIGTERM, cancel)
+signal.signal(signal.SIGINT, cancel)
+started = time.time()
+clock_start = time.monotonic()
+rc = 130
+try:
+    if not cancelled:
+        child = subprocess.Popen(["/bin/bash", "-e", "-o", "pipefail", "-c", command],
+                                 cwd=workdir, start_new_session=True)
+        if cancelled:
+            stop_group()
+        rc = child.wait()
+finally:
+    finished = time.time()
+    duration = time.monotonic() - clock_start
+    # The process group survives a shell exiting and its children being reparented.
+    # Always clean it, including successful jobs which left background workers.
+    stop_group()
+    with open(timing_path, "w") as handle:
+        json.dump({"start_epoch": started, "end_epoch": finished,
+                   "duration_s": duration}, handle)
+sys.exit(130 if cancelled else (128 - rc if rc < 0 else rc))
+PYSLOT
   LAUNCH_PID=$!
 }
 
@@ -645,6 +690,7 @@ finalize_rep() {
   local rep="$1"
   write_meta "${META_FILE}" "${rep}"
   python3 - "${META_FILE}" "${SLOTS_TSV}.done" "${SAMPLES_FILE}" "${RESULTS_FILE}" <<'PYEOF'
+import datetime
 import json
 import os
 import re
@@ -695,7 +741,7 @@ if meta.get("queued_at") is not None:
     queue_delay = meta["start_epoch"] - meta["queued_at"]
 
 
-def parse_phases(log_path):
+def parse_phases(log_path, start_epoch):
     markers = []
     try:
         with open(log_path, errors="replace") as handle:
@@ -706,7 +752,7 @@ def parse_phases(log_path):
     except OSError:
         pass
     phases = {}
-    previous = meta["start_epoch"]
+    previous = start_epoch
     for name, epoch in markers:
         phases[name] = max(0, epoch - previous)
         previous = epoch
@@ -794,14 +840,25 @@ for slot, rc, workdir, cache_dir, log_path, stats_path, before, after in slots:
     except ValueError:
         pass
 
+    with open(stats_path + ".timing") as handle:
+        timing = json.load(handle)
+    def iso(epoch):
+        return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).isoformat()
     rec = base_record()
     rec.update({
+        "ts": iso(timing["end_epoch"]),
+        "started_at": iso(timing["start_epoch"]),
+        "finished_at": iso(timing["end_epoch"]),
+        "duration_s": timing["duration_s"],
+        "queue_delay_s": (timing["start_epoch"] - meta["queued_at"]
+                          if meta.get("queued_at") is not None else None),
+        "queue_timing_source": "batch_supplied" if meta.get("queued_at") is not None else None,
         "scope": "job",
         "slot": int(slot),
         "workdir": workdir,
         "exit_code": rc,
         "result": result,
-        "phases": parse_phases(log_path),
+        "phases": parse_phases(log_path, timing["start_epoch"]),
         "cache": {
             "hits": stats.get("cache_hits"),
             "misses": stats.get("cache_misses"),
@@ -871,7 +928,7 @@ rep_run() {
 
   local slot slot_dir cache_dir logfile stats pid before
   slot=0
-  while [[ "${slot}" -lt "${CONCURRENCY}" ]]; do
+  while [[ "${slot}" -lt "${CONCURRENCY}" && "${CANCELLED}" -eq 0 ]]; do
     if [[ "${CONCURRENCY}" -eq 1 ]]; then
       slot_dir="${WORKDIR}"
     else
@@ -903,10 +960,15 @@ rep_run() {
   while IFS=$'\t' read -r slot pid slot_dir cache_dir logfile stats before; do
     rc=0
     wait "${pid}" || rc=$?
+    # A trapped signal interrupts wait before the supervisor writes timing.
+    if [[ "${CANCELLED}" -eq 1 ]]; then
+      wait "${pid}" 2>/dev/null || true
+    fi
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "${slot}" "${rc}" "${slot_dir}" "${cache_dir}" "${logfile}" "${stats}" "${before}" \
       "$(dir_kb "${cache_dir}")" >> "${SLOTS_TSV}.done"
   done < "${SLOTS_TSV}"
+  : > "${SLOT_PIDS_FILE}"
 
   trap global_interrupt INT TERM
   kill "${SAMPLER_PID}" 2>/dev/null || true
@@ -1053,7 +1115,8 @@ for key in sorted(groups):
     latest = (jobs or hosts)[-1]
     summaries[key] = {
         "label": key[0], "scenario": key[1], "concurrency": key[2],
-        "runs": len(jobs),
+        "runs": len({(r.get("run_id"), r.get("repetition")) for r in (hosts or jobs)}),
+        "job_samples": len(jobs),
         "failures": sum(1 for r in jobs if r.get("result") == "failed"),
         "cancelled": sum(1 for r in jobs if r.get("result") == "cancelled"),
         "command": latest.get("command"),
@@ -1131,9 +1194,9 @@ for key in sorted(summaries):
     note = ""
     if gs["runs"] < 5:
         note = "  WARNING: fewer than 5 repetitions; medians/tails are unreliable"
-    print("  samples: n=%d job run(s)%s" % (gs["runs"], note))
+    print("  samples: %d repetitions, n=%d job run(s)%s" % (gs["runs"], gs["job_samples"], note))
     print("  results: %d succeeded, %d failed, %d cancelled"
-          % (gs["runs"] - gs["failures"] - gs["cancelled"],
+          % (gs["job_samples"] - gs["failures"] - gs["cancelled"],
              gs["failures"], gs["cancelled"]))
     host = gs["host"] or {}
     mem_gb = None

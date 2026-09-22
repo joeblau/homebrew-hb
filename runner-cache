@@ -509,10 +509,19 @@ pick_client_scope() {
 # True when $1 is a readable credentials file with non-empty ACCESS_KEY and
 # SECRET_KEY. Values are never printed.
 client_credentials_ok() {
-  local f="$1" ak="" sk=""
+  local f="$1" line ak="" sk="" literal=0
   [[ -f "${f}" && -r "${f}" ]] || return 1
-  ak="$(. "${f}" 2>/dev/null; printf '%s' "${ACCESS_KEY:-}")"
-  sk="$(. "${f}" 2>/dev/null; printf '%s' "${SECRET_KEY:-}")"
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    case "${line}" in
+      '# runner-cache credentials v2') literal=1 ;;
+      ACCESS_KEY=*) ak="${line#ACCESS_KEY=}" ;;
+      SECRET_KEY=*) sk="${line#SECRET_KEY=}" ;;
+    esac
+  done < "${f}"
+  if [[ "${literal}" -eq 0 ]]; then
+    [[ "${ak}" != '""' && "${ak}" != "''" ]] || ak=""
+    [[ "${sk}" != '""' && "${sk}" != "''" ]] || sk=""
+  fi
   [[ -n "${ak}" && -n "${sk}" ]]
 }
 
@@ -531,7 +540,7 @@ ensure_secret_perms() {
 # to $1 with mode 0600. Nothing read is ever echoed.
 read_client_credentials_stdin() {
   local dest="$1" line ak="" sk=""
-  while IFS= read -r line; do
+  while IFS= read -r line || [[ -n "${line}" ]]; do
     case "${line}" in
       ACCESS_KEY=*)             ak="${line#ACCESS_KEY=}" ;;
       SECRET_KEY=*)             sk="${line#SECRET_KEY=}" ;;
@@ -539,13 +548,11 @@ read_client_credentials_stdin() {
       AWS_SECRET_ACCESS_KEY=*)  sk="${line#AWS_SECRET_ACCESS_KEY=}" ;;
     esac
   done
-  # Tolerate shell-style quoting in the piped lines.
-  ak="${ak%\"}"; ak="${ak#\"}"; ak="${ak%\'}"; ak="${ak#\'}"
-  sk="${sk%\"}"; sk="${sk#\"}"; sk="${sk%\'}"; sk="${sk#\'}"
   [[ -n "${ak}" && -n "${sk}" ]] || return 1
   write_secret_file "${dest}" <<EOF
-ACCESS_KEY="${ak}"
-SECRET_KEY="${sk}"
+# runner-cache credentials v2
+ACCESS_KEY=${ak}
+SECRET_KEY=${sk}
 EOF
 }
 
@@ -1283,6 +1290,8 @@ EOF
           path: ~/Library/Caches/Homebrew
           key: brew-\${{ github.repository }}-\${{ runner.os }}-\${{ runner.arch }}-\${{ hashFiles('**/Brewfile.lock.json') }}
 
+    The action selects addressing automatically; RUNNER_CACHE_PATH_STYLE
+    is metadata, not an action input. Verify endpoint compatibility.
     Pin the action to a reviewed full commit SHA in production. Use an
     existing dependency lockfile in the key; include toolchain versions for
     compiled caches. Disable duplicate setup-* caching for this same path.
@@ -2267,6 +2276,8 @@ cmd_client_install() {
   [[ "${TLS}" -eq 1 ]] && tls_word="true"
   [[ "${PATH_STYLE}" -eq 1 ]] && path_style_word="true"
 
+  local quoted_creds_file
+  printf -v quoted_creds_file '%q' "${creds_file}"
   write_secret_file "${cf}" <<EOF
 SCOPE_KIND="${SCOPE_KIND}"
 SCOPE="${SCOPE}"
@@ -2276,7 +2287,7 @@ REMOTE_PORT="${CLIENT_PORT}"
 REMOTE_TLS="${tls_word}"
 REMOTE_REGION="${REGION}"
 REMOTE_PATH_STYLE="${path_style_word}"
-CREDENTIALS_FILE="${creds_file}"
+CREDENTIALS_FILE=${quoted_creds_file}
 CREATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 EOF
 
@@ -2308,6 +2319,12 @@ cmd_client_env() {
     err "ACCESS_KEY/SECRET_KEY. Re-run client install with credentials on stdin"
     err "or --credentials-file PATH. The cache is unusable until then."
     exit 1
+  fi
+
+  if [[ "${REMOTE_PATH_STYLE}" == "false" ]]; then
+    err "Cannot emit the actions-cache workflow for --path-style off: the action has no addressing-mode input."
+    err "Use a client with explicit virtual-host support (for sccache, SCCACHE_NO_PATH_STYLE=true)."
+    return 1
   fi
 
   local insecure="true" scheme="http"
@@ -2349,6 +2366,8 @@ EOF
           path: ~/Library/Caches/Homebrew
           key: brew-\${{ github.repository }}-\${{ runner.os }}-\${{ runner.arch }}-\${{ hashFiles('**/Brewfile.lock.json') }}
 
+    The action selects addressing automatically; RUNNER_CACHE_PATH_STYLE
+    is metadata, not an action input. Verify endpoint compatibility.
     Pin the action to a reviewed full commit SHA in production. Scope keys by
     repository, OS/architecture, toolchain, and dependency lockfiles. Read
     the step's cache-hit output for workflow cache hits; raw S3 request

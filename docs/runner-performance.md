@@ -125,22 +125,41 @@ and target architecture (the recorded host block carries `arch` and
 limits identical between baseline and candidate runs — `report` warns when
 the compared groups recorded different commands or hosts.
 
+The following executable smoke workload uses a fixed C source template and
+an incremental build stored entirely in the disposable cache. It needs `cc`.
+It is a harness check, not a representative fleet performance benchmark;
+replace it with your pinned project build for performance decisions. The
+work directory is reused safely across repetitions. For `edited`, the default
+`BENCH_EDIT.txt` marker count changes a constant in the compiled source.
+
 ```sh
-BENCH='git clone -q file:///opt/mirrors/monorepo.git src && cd src &&
-  git checkout -q v2026.09.0 &&
-  bench_phase() { printf "RUNNER_BENCH_PHASE %s %s\n" "$1" "$(date +%s)"; } &&
-  bench_phase checkout &&
-  ./ci/restore-deps.sh && bench_phase restore &&
-  ./ci/build.sh        && bench_phase build &&
-  ./ci/test.sh         && bench_phase test &&
-  ./ci/save-cache.sh   && bench_phase save'
+BENCH=$(cat <<'WORKLOAD'
+set -eu
+bench_phase() { printf "RUNNER_BENCH_PHASE %s %s\n" "$1" "$(date +%s)"; }
+mkdir -p src "$RUNNER_BENCH_CACHE_DIR"
+value=0
+if [ "$RUNNER_BENCH_SCENARIO" = edited ]; then
+  value=$(wc -l < BENCH_EDIT.txt | tr -d " ")
+fi
+printf "#include <stdio.h>\nint main(void) { puts(\"value=%s\"); return 0; }\n" "$value" > src/main.c
+bench_phase checkout
+cache="$RUNNER_BENCH_CACHE_DIR"
+if [ ! -x "$cache/demo" ] || ! cmp -s src/main.c "$cache/main.c"; then
+  cc -O2 src/main.c -o "$cache/demo"
+  cp src/main.c "$cache/main.c"
+fi
+bench_phase build
+test "$("$cache/demo")" = "value=$value"
+bench_phase test
+WORKLOAD
+)
 ```
 
 ### Measure each scenario
 
 ```sh
 runner-bench run --scenario cold   --label baseline --reps 5 --cmd "$BENCH" \
-  --toolchain 'rustc 1.80.1, arm64'
+  --toolchain "$(cc --version | head -n 1)"
 runner-bench run --scenario warm   --label baseline --reps 5 --cmd "$BENCH"
 runner-bench run --scenario edited --label baseline --reps 5 --cmd "$BENCH"
 runner-bench run --scenario warm   --label baseline --reps 5 --concurrency 2 \
@@ -153,8 +172,10 @@ runner-bench report --baseline baseline --candidate candidate
   to the workload as `RUNNER_BENCH_CACHE_DIR`) before each repetition and
   refuses any cache dir outside the workdir. Point the workload's dependency
   caches at it.
-- `warm` runs unchanged; `edited` appends one small deterministic line to
-  `--edit-file` per repetition to simulate a small source edit.
+- `warm` runs unchanged; `edited` appends one marker line to `--edit-file`
+  per repetition before launching the workload. That file defaults to
+  `BENCH_EDIT.txt`; the workload must translate it into a valid source edit
+  after checkout, as above. Do not append these markers directly to C/Rust source.
 - `--concurrency N` runs N identical copies in `WORKDIR/slot-N`. Per-job
   records (`scope: "job"`, one per slot) stay separate from the host-wide
   record (`scope: "host"`), so overlapping jobs are distinguishable.
@@ -164,7 +185,8 @@ runner-bench report --baseline baseline --candidate candidate
 Every record carries the host block (model, CPU count, RAM, arch, macOS,
 machine label), label/scenario/concurrency/repetition, queue delay (when
 `--queued-at` or `RUNNER_BENCH_QUEUED_AT` supplies the queue timestamp — take
-it from the GitHub API's run/job `created_at` on a real runner), full
+it from the GitHub API's run/job `created_at` on a real runner). This is one
+batch-supplied timestamp, not independently observed per-job queue timing. Full
 duration, per-phase durations from `RUNNER_BENCH_PHASE` markers, peak/mean
 CPU and peak RSS from process-tree samples, host swap growth and disk-usage
 growth, cache hit/miss/restore/save counters the workload writes to

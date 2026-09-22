@@ -175,3 +175,12 @@ can cause. Complement it with `sysctl vm.swapusage` and
 concurrency (`--concurrency N`) since concurrent jobs share one bounded
 budget. Adopt (or widen the rollout of) RAM scratch only if medians improve
 without increased failures or swap growth; keep it opt-in otherwise.
+
+### Recovering output after copy failure
+
+Both RAM and SSD fallback `_out` directories are copied into `_diag/ramscratch`
+before cleanup. If copying fails, the supervisor retains the source and writes
+`.scratch-retention-failed` in the runner directory. Resets stay blocked across
+supervisor restarts. Stop the supervisor, recover `_out` to durable storage,
+clean the retained RAM allocation if applicable, then remove that marker and
+restart. RAM contents still cannot survive a host reboot or power loss.

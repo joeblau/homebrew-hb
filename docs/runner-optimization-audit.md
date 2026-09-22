@@ -6,7 +6,34 @@ but the claim that they are done correctly is not supported.** Findings below
 include reproduced failures, not just missing staging evidence. This is an
 audit; implementation files were not changed.
 
-## Confirmed findings
+## Remediation for v1.11.0 (2026-09-22)
+
+The findings below are preserved as the historical audit. Release preparation
+addresses them as follows:
+
+| Finding | Remediation and regression evidence |
+| --- | --- |
+| 1 | Release packaging must use the v1.11.0 archive and its verified SHA-256; Python 3.14 is now an explicit formula dependency. Archive installation is the final release gate. |
+| 2 | Allocation keys use a delimiter excluded from runner/job names; duplicate allocations are rejected. Collision and repeat-allocation regressions pass. |
+| 3 | Both RAM and SSD `_out` are copied before cleanup. Failed copies preserve scratch and block resets across restarts until the operator recovers outputs. Both modes have regressions. |
+| 4 | Every workload runs in an owned process group, cleaned on success, failure, and cancellation even after its shell exits. Real background-child regression tests pass. |
+| 5 | Workflow settings include `SCCACHE_IGNORE_SERVER_IO_ERROR=1`. Real sccache v0.18.0 plus Clang verified fallback after a reset following `CompileStarted`; initial request errors still fail, now explicitly documented. |
+| 6 | Managed credentials are literal data, never sourced. Quoted legacy files are validated without shell execution. Metacharacters, command substitutions, and missing trailing newlines have regression coverage. |
+| 7 | Effective cache configuration includes `RUNNER_TOOLSDIRECTORY` and `.env`, resolves physical paths, and validates ownership and separation from disposable storage before wiping. Alias, traversal, and precedence regressions pass. |
+| 8 | Runner-list failures abort scale-up, including minimum-fleet reconciliation. The former test expecting provisioning on failure now enforces refusal. |
+| 9 | Job timestamps and monotonic durations come from each workload supervisor, separately from host/batch timing. Unequal-duration concurrent jobs have regression coverage. Queue timestamps are explicitly labeled batch-supplied. |
+| 10 | Reports count independent repetitions separately from job samples; concurrent slots cannot satisfy the five-repetition gate. |
+| 11 | The documented C smoke workload reuses its checkout safely, stores incremental output in the disposable cache, and translates edit markers into valid compiled source changes. All five repetitions pass in each of cold, warm, and edited scenarios. Multiline commands now serialize correctly in JSON. |
+| 12 | Actions snippet generation rejects virtual-host-only configuration; documentation explains that the action selects addressing automatically and does not consume `RUNNER_CACHE_PATH_STYLE`. |
+
+Validation: `python3 -m unittest discover -s tests` passed **400 tests**.
+The pre-existing MCP missing-command failure was also fixed: an explicit
+`RUNNER_MCP_BIN_DIR` now prevents unintended fallback to installed host tools.
+These checks are local fixtures and targeted compiler/process tests. They do
+not establish fleet performance gains or replace the live multi-Mac, cache,
+and RAM-disk staging checks listed at the end of this historical audit.
+
+## Confirmed findings (historical)
 
 ### 1. P1 — Formula cannot install the three new tools from its declared source
 

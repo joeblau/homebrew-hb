@@ -109,6 +109,7 @@ log_decision() {{ printf '%s:%s\\n' "$3" "$4" >> "${{RUNNER_ROOT}}/decisions"; }
         self.assertEqual(result.returncode, 2)
 
     def test_ephemeral_flag_and_file_resolved_pat_reach_setup(self):
+        self.online_runners_api([])
         fake = self.root / "setup"
         fake.write_text('#!/bin/bash\nprintf "%s|%s\\n" "$*" "$GITHUB_PAT"\n')
         fake.chmod(0o755)
@@ -158,6 +159,7 @@ log_decision() {{ printf '%s:%s\\n' "$3" "$4" >> "${{RUNNER_ROOT}}/decisions"; }
         self.assertNotIn("unsafe", result.stdout)
 
     def test_numbering_gap_only_fills_one_runner(self):
+        self.online_runners_api([])
         self.runner(1)
         self.runner(3)
         fake = self.root / "setup"
@@ -271,6 +273,7 @@ log_decision() {{ printf '%s:%s\\n' "$3" "$4" >> "${{RUNNER_ROOT}}/decisions"; }
         self.assertNotIn("--runners", result.stdout)
 
     def test_minimum_reconciled_in_one_batch_across_numbering_gaps(self):
+        self.online_runners_api([])
         self.runner(1)
         self.runner(3)
         fake = self.fake_setup()
@@ -281,15 +284,23 @@ log_decision() {{ printf '%s:%s\\n' "$3" "$4" >> "${{RUNNER_ROOT}}/decisions"; }
         # Deficit is 2; targeting index 4 makes runner-setup fill gaps 2 and 4.
         self.assertIn("--runners 4", result.stdout)
 
-    def test_runner_list_failure_limits_batch_to_one(self):
+    def test_runner_list_failure_aborts_scale_up(self):
         fake = self.fake_setup()  # runner-list endpoint deliberately unregistered
         result = self.run_shell(
             f'fetch_token() {{ echo example; }}; RUNNER_SETUP_BIN={shlex.quote(str(fake))}; do_scale_up 5 0',
             args="--repo acme/repo --min 0 --max 8 --scale-up-batch 4 --cooldown-minutes 0")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("--runners 1", result.stdout)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("--runners", result.stdout)
+
+    def test_runner_list_failure_also_blocks_minimum_reconciliation(self):
+        for depth in (0, 8):
+            result = self.run_shell(f'plan_scale_up_batch {depth} 0',
+                                    args="--repo acme/repo --min 4 --max 8 --scale-up-batch 4")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, "")
 
     def test_partial_provisioning_failure_logs_requested_attempted_actual(self):
+        self.online_runners_api([])
         fake = self.fake_setup(f'mkdir -p {shlex.quote(str(self.root))}/runner-1\nexit 1\n')
         result = self.run_shell(
             f'fetch_token() {{ echo example; }}; RUNNER_SETUP_BIN={shlex.quote(str(fake))}; do_scale_up 0 0',

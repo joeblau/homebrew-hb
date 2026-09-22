@@ -177,8 +177,9 @@ class RunnerBenchTests(unittest.TestCase):
         job = next(r for r in records if r["scope"] == "job")
         self.assertEqual(job["result"], "success")
         self.assertEqual(job["exit_code"], 0)
-        self.assertEqual(job["duration_s"], 30)
-        self.assertEqual(job["phases"], {"setup": 10, "build": 10})
+        self.assertGreaterEqual(job["duration_s"], 0)
+        self.assertEqual(set(job["phases"]), {"setup", "build"})
+        self.assertEqual(job["phases"]["build"], 10)
         self.assertEqual(job["label"], "t1")
         self.assertEqual(job["scenario"], "warm")
         self.assertEqual(job["cache"]["hits"], 12)
@@ -211,7 +212,10 @@ class RunnerBenchTests(unittest.TestCase):
         result = self.shell(workload_body('--label t1 --queued-at 990'))
         self.assertEqual(result.returncode, 0, result.stderr)
         job = next(r for r in self.results() if r["scope"] == "job")
-        self.assertEqual(job["queue_delay_s"], 40)  # start 1030 - queued 990
+        from datetime import datetime
+        start = datetime.fromisoformat(job["started_at"]).timestamp()
+        self.assertAlmostEqual(job["queue_delay_s"], start - 990, places=5)
+        self.assertEqual(job["queue_timing_source"], "batch_supplied")
         self.assertNotIn("queue_delay_s", job["unsupported"])
 
     def test_run_without_stats_file_marks_cache_counters_unsupported(self):
@@ -283,6 +287,55 @@ class RunnerBenchTests(unittest.TestCase):
         for job in jobs:
             self.assertEqual(job["result"], "failed")
             self.assertEqual(job["exit_code"], 3)
+
+    def test_exit_cleans_reparented_children_on_success_and_failure(self):
+        for code in (0, 1):
+            with self.subTest(code=code):
+                body = r'''
+ps() { command ps "$@"; }
+main run --reps 1 --interval 1 --workdir "${WORKDIR}" --results-dir "${RESULTS_DIR}" \
+  --cmd 'sleep 60 & echo $! > child.pid; exit %d'
+''' % code
+                result = self.shell(body)
+                self.assertEqual(result.returncode, code, result.stderr)
+                pid = (self.root / "work/child.pid").read_text().strip()
+                probe = subprocess.run(["ps", "-p", pid, "-o", "stat="], text=True, capture_output=True)
+                self.assertTrue(probe.returncode != 0 or probe.stdout.strip().startswith("Z"), probe.stdout)
+
+    def test_each_slot_records_its_own_duration(self):
+        result = self.shell("""main run --reps 1 --interval 1 --concurrency 2 --workdir "${WORKDIR}" --results-dir "${RESULTS_DIR}" --cmd 'if [ "$RUNNER_BENCH_SLOT" = 0 ]; then sleep 2; else sleep 0.2; fi'""")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        jobs = {r["slot"]: r for r in self.results() if r["scope"] == "job"}
+        self.assertGreater(jobs[0]["duration_s"] - jobs[1]["duration_s"], 1)
+        self.assertNotEqual(jobs[0]["finished_at"], jobs[1]["finished_at"])
+
+    def test_concurrent_jobs_do_not_satisfy_repetition_gate(self):
+        records = []
+        for label in ("baseline", "candidate"):
+            for slot in range(5):
+                rec = job_record(label, "warm", 5, 1, 2)
+                rec["slot"] = slot
+                records.append(rec)
+            records.append(host_record(label, "warm", 5, 1, 0))
+        self.write_results(records)
+        result = self.shell('main report --results-dir "${RESULTS_DIR}" --baseline baseline --candidate candidate --json')
+        data = json.loads(result.stdout)
+        self.assertEqual(data["groups"][0]["runs"], 1)
+        self.assertEqual(data["groups"][0]["job_samples"], 5)
+        self.assertTrue(any("fewer than 5" in w for w in data["comparisons"][0]["warnings"]))
+
+    def test_documented_workload_runs_five_repetitions_in_all_scenarios(self):
+        doc = (SCRIPT.parent / "docs/runner-performance.md").read_text()
+        workload = doc.split("BENCH=$(cat <<'WORKLOAD'\n", 1)[1].split("\nWORKLOAD\n", 1)[0]
+        for scenario in ("cold", "warm", "edited"):
+            body = "WL=$(cat <<'DOCWORKLOAD'\n" + workload + "\nDOCWORKLOAD\n)\n"
+            body += f'main run --reps 5 --interval 1 --scenario {scenario} --workdir "${{WORKDIR}}" --results-dir "${{RESULTS_DIR}}" --cmd "$WL"'
+            result = self.shell(body)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        jobs = [r for r in self.results() if r["scope"] == "job"]
+        self.assertEqual(len(jobs), 15)
+        self.assertTrue(all(r["result"] == "success" for r in jobs))
+        self.assertIn('value=5', (self.root / "work/src/main.c").read_text())
 
     def test_cancelled_run_records_result_and_leaves_no_orphans(self):
         marker = self.root / "child.pid"

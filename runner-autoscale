@@ -663,22 +663,24 @@ save_idle_since() {
 # and the matching queued demand beyond ready idle capacity, clamped by
 # --scale-up-batch and the room below --max and the per-host capacity budget.
 # The runner list is needed to offset demand by idle capacity; if it cannot be
-# fetched the state is unknown, so fail closed to a single-runner tick.
+# fetched the state is unknown, so abort the scale-up decision.
 plan_scale_up_batch() {
   local depth="$1" current="$2"
   local min_deficit=0 demand=0
   if [[ "${current}" -lt "${MIN_RUNNERS}" ]]; then
     min_deficit=$((MIN_RUNNERS - current))
   fi
-  if [[ "${depth}" -ge "${SCALE_UP_THRESHOLD}" ]]; then
+  if [[ "${depth}" -ge "${SCALE_UP_THRESHOLD}" || "${min_deficit}" -gt 0 ]]; then
     local rjson="" idle
     if rjson="$(api_list "${SCOPE_API}/actions/runners" runners)"; then
       idle="$(count_ready_idle "${rjson}")"
-      demand=$((depth - idle))
-      [[ "${demand}" -ge 0 ]] || demand=0
+      if [[ "${depth}" -ge "${SCALE_UP_THRESHOLD}" ]]; then
+        demand=$((depth - idle))
+        [[ "${demand}" -ge 0 ]] || demand=0
+      fi
     else
-      warn "Could not fetch the runner list; idle capacity is unknown, so this tick provisions at most one runner."
-      demand=1
+      warn "Could not fetch the runner list; idle capacity is unknown, refusing scale-up."
+      return 1
     fi
   fi
   local wanted="${min_deficit}"
@@ -697,7 +699,10 @@ do_scale_up() {
   local depth="$1" current="$2"
   hold_for_maintenance && return 0
   local batch
-  batch="$(plan_scale_up_batch "${depth}" "${current}")"
+  if ! batch="$(plan_scale_up_batch "${depth}" "${current}")"; then
+    log_decision "${depth}" "${current}" "error" "runner capacity unavailable; scale-up skipped"
+    return 1
+  fi
   if [[ "${batch}" -lt 1 ]]; then
     log_decision "${depth}" "${current}" "none" \
       "queued demand is already covered by ready idle capacity, or the fleet is at its max/capacity budget"

@@ -106,6 +106,32 @@ printf '%s' "$AGENT_TOOLSDIRECTORY"
             (self.root / "_toolcache/node/20.11.0/installed").read_text(), "cached tool")
         self.assertFalse((self.root / "_work").exists())
 
+    def test_aliases_into_disposable_storage_fail_before_wipe(self):
+        (self.root / "_work/_tool").mkdir(parents=True)
+        marker = self.root / "_work/_tool/keep"
+        marker.write_text("installed")
+        (self.root / "alias").symlink_to(self.root / "_work/_tool")
+        for value in (str(self.root / "alias"), str(self.root / "safe/../_work/_tool")):
+            with self.subTest(value=value):
+                result = self.shell('DIR="$TEST_ROOT"; wipe_state', AGENT_TOOLSDIRECTORY=value)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(marker.read_text(), "installed")
+
+    def test_runner_toolsdirectory_precedes_agent_and_env_file_is_validated(self):
+        result = self.shell('DIR="$TEST_ROOT"; resolve_tool_cache_dir; echo "$TOOL_CACHE_DIR"',
+                            RUNNER_TOOLSDIRECTORY=str(self.root / "preferred"),
+                            AGENT_TOOLSDIRECTORY=str(self.root / "ignored"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), str(self.root / "preferred"))
+        (self.root / ".env").write_text(f"RUNNER_TOOLSDIRECTORY={self.root}/_work/_tool\n")
+        result = self.shell('DIR="$TEST_ROOT"; wipe_state')
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_unowned_cache_destination_is_rejected(self):
+        result = self.shell('DIR="$TEST_ROOT"; resolve_tool_cache_dir', AGENT_TOOLSDIRECTORY="/usr/bin")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("owned by the invoking user", result.stderr)
+
     def test_existing_cache_is_never_merged(self):
         (self.root / "_work/_tool/node").mkdir(parents=True)
         (self.root / "_work/_tool/node/old").write_text("legacy")

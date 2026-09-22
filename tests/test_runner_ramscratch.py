@@ -148,6 +148,30 @@ printf '%s\n%s' "$path1" "$path2"
         self.assertIn("DEVICE=/dev/disk9", state)
         self.assertIn("SIZE_MB=2048", state)
 
+    def test_allocation_identity_collision_cannot_detach_another_job(self):
+        self.write_config()
+        result = self.shell("""
+cmd_alloc --runner a__b --job c --size-mb 512 >/dev/null
+cmd_alloc --runner a --job b__c --size-mb 512 >/dev/null
+allocated_mb
+cmd_clean --runner a__b --job c
+""")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("1024", result.stdout)
+        self.assertTrue((self.state / "volume/a/b__c").is_dir())
+        self.assertFalse((self.root / "detach-log").exists())
+        result = self.shell("cmd_clean --runner a --job b__c")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.root / "detach-log").exists())
+
+    def test_duplicate_allocation_cannot_overwrite_reservation(self):
+        self.write_config()
+        result = self.shell("cmd_alloc --runner a --job b --size-mb 512")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.shell("cmd_alloc --runner a --job b --size-mb 256")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((self.state / "allocs/a:b").read_text().strip(), "512")
+
     def test_budget_is_enforced_across_runners(self):
         self.write_config(budget=1024)
         result = self.shell('''
@@ -159,7 +183,7 @@ cmd_alloc --runner runner-2 --job cycle-1 --size-mb 512 >/dev/null
         # The refused allocation created nothing; the granted one survives.
         self.assertTrue((self.state / "volume/runner-1/cycle-1").is_dir())
         self.assertFalse((self.state / "volume/runner-2").exists())
-        self.assertFalse((self.state / "allocs/runner-2__cycle-1").exists())
+        self.assertFalse((self.state / "allocs/runner-2:cycle-1").exists())
 
     def test_low_memory_refuses_allocation(self):
         self.write_config()
@@ -275,8 +299,8 @@ cmd_alloc --runner runner-1 --job cycle-2 --size-mb 512 >/dev/null || exit 97
         self.assertIn("Stale RAM scratch state", result.stderr)
         # Pre-reboot allocations were dropped from the ledger, not charged
         # against the budget forever.
-        self.assertFalse((self.state / "allocs/runner-2__cycle-1").exists())
-        self.assertTrue((self.state / "allocs/runner-1__cycle-2").exists())
+        self.assertFalse((self.state / "allocs/runner-2:cycle-1").exists())
+        self.assertTrue((self.state / "allocs/runner-1:cycle-2").exists())
 
     # --- inspect --------------------------------------------------------------
     def test_inspect_reports_config_volume_and_allocations(self):
@@ -404,6 +428,40 @@ if ! run_cycle 1; then exit 99; fi
         # No clean call: the SSD fallback resets with the next cycle's wipe.
         self.assertEqual(len(self.calls()), 1)
         self.assertIn("alloc", self.calls()[0])
+
+    def test_ssd_fallback_retains_outputs_before_reset(self):
+        self.make_runner('mkdir -p "$RUNNER_RAM_SCRATCH/_out"; echo artifact > "$RUNNER_RAM_SCRATCH/_out/result"')
+        result = self.shell("""
+DIR="$TEST_ROOT"; RUNNER_URL=https://github.com/acme
+RAM_SCRATCH=1; RAM_SCRATCH_MB=512
+fetch_registration_token() { FETCHED_TOKEN=secret; }
+run_cycle 1 && wipe_state
+""", RAMSCRATCH_ALLOC_FAILS="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        copies = list((self.root / "_diag/ramscratch").glob("cycle-1-*/result"))
+        self.assertEqual(len(copies), 1)
+        self.assertEqual(copies[0].read_text().strip(), "artifact")
+
+    def test_failed_copy_blocks_reset_and_retains_source_in_both_modes(self):
+        for ram in (0, 1):
+            with self.subTest(ram=ram):
+                result = self.shell(f"""
+DIR="$TEST_ROOT"
+RAM_SCRATCH_PATH="$DIR/_work/_scratch"; RAM_SCRATCH_IS_RAM={ram}
+RAM_SCRATCH_RUNNER=runner; RAM_SCRATCH_JOB=job
+mkdir -p "$RAM_SCRATCH_PATH/_out"
+echo precious > "$RAM_SCRATCH_PATH/_out/result"
+cp() {{ return 1; }}
+if teardown_ram_scratch; then exit 90; fi
+if wipe_state; then exit 91; fi
+test -f "$RAM_SCRATCH_PATH/_out/result"
+""")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue((self.root / ".scratch-retention-failed").exists())
+                self.assertFalse(any(" clean " in call for call in self.calls()))
+                # Simulate restart: no in-memory scratch state remains.
+                result = self.shell('DIR="$TEST_ROOT"; wipe_state')
+                self.assertNotEqual(result.returncode, 0)
 
     def test_disabled_by_default_makes_no_helper_calls(self):
         self.make_runner('echo "${RUNNER_RAM_SCRATCH:-unset}" > "$TEST_ROOT/seen-scratch"')

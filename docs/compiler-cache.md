@@ -53,6 +53,7 @@ SCCACHE_DIR=/opt/github-runner-sccache/data/repo-acme-monorepo-<digest>
 SCCACHE_CACHE_SIZE=20G
 SCCACHE_SERVER_PORT=4226
 SCCACHE_IDLE_TIMEOUT=0
+SCCACHE_IGNORE_SERVER_IO_ERROR=1
 RUSTC_WRAPPER=/opt/homebrew/bin/sccache
 ```
 
@@ -149,11 +150,15 @@ workflow) may cover more clang invocations; see the ccache/sccache notes in
 
 ## Failure fallback
 
-A cache failure never breaks a build. If the sccache server is unreachable,
-the disk cache is corrupt, or a cache read/write fails, sccache runs the real
-compiler directly and counts the failure under cache errors — the build stays
-correct, just uncached. Watch the error counters with `runner-sccache stats`;
-a rising error count means you are paying wrapper overhead without caching.
+`runner-sccache env` emits `SCCACHE_IGNORE_SERVER_IO_ERROR=1`, enabling
+uncached local compilation for errors reading an accepted compilation's
+response. This is sccache's [documented fallback setting](https://github.com/mozilla/sccache#usage),
+but not a guarantee for every communication failure: initial connection/request
+failures, missing wrapper executables, invalid configuration, and compiler
+errors can still fail a build. Validation with sccache v0.18.0 and real Clang
+confirmed fallback after a server reset following `CompileStarted`; an error
+before that response still fails even with the setting enabled. Watch cache error counters with
+`runner-sccache stats`; server connection failures may not reach those counters.
 To bypass the cache entirely, drop the `env` step from the workflow or unset
 `RUSTC_WRAPPER` — both restore a plain uncached build with no other change.
 

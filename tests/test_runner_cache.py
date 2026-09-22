@@ -286,7 +286,7 @@ mc() { printf 'Unexpected mc invocation\n' >&2; return 94; }
         self.assertTrue(credentials.exists())
         self.assertEqual(credentials.stat().st_mode & 0o777, 0o600)
         self.assertEqual(credentials.read_text(),
-                         'ACCESS_KEY="remote-ak-fixture"\nSECRET_KEY="remote-sk-fixture"\n')
+                         '# runner-cache credentials v2\nACCESS_KEY=remote-ak-fixture\nSECRET_KEY=remote-sk-fixture\n')
         for secret in ("remote-ak-fixture", "remote-sk-fixture"):
             self.assertNotIn(secret, config + result.stdout + result.stderr)
         # No local daemon or MinIO state is created.
@@ -319,6 +319,33 @@ mc() { printf 'Unexpected mc invocation\n' >&2; return 94; }
         self.assertIn("ACTIONS_CACHE_URL", result.stderr)  # only as a "never redirect" warning
         for secret in ("remote-ak-fixture", "remote-sk-fixture"):
             self.assertNotIn(secret, result.stdout + result.stderr)
+
+    def test_credentials_metacharacters_are_literal_and_never_executed(self):
+        marker = self.root / "executed"
+        secret = f"'quoted\"$UNSET `touch {marker}` $(touch {marker})\\end'"
+        result = self.install_client(stdin=f"ACCESS_KEY=literal$key\nSECRET_KEY={secret}")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stored = self.client_config_path().with_suffix(".credentials").read_text()
+        self.assertIn(f"SECRET_KEY={secret}\n", stored)
+        result = self.shell('parse_args client env --repo acme/project; cmd_client_env')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(marker.exists())
+        self.assertNotIn(secret, result.stdout + result.stderr)
+
+    def test_legacy_credential_file_is_not_sourced(self):
+        marker = self.root / "executed"
+        external = self.root / "old.credentials"
+        external.write_text(f'ACCESS_KEY="$(touch {marker})"\nSECRET_KEY="valid"\n')
+        result = self.install_client(extra_args="--credentials-file " + shlex.quote(str(external)), stdin=None)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(marker.exists())
+
+    def test_virtual_host_mode_rejects_unsupported_action_snippet(self):
+        self.assertEqual(self.install_client(extra_args="--path-style off").returncode, 0)
+        result = self.shell('parse_args client env --repo acme/project; cmd_client_env')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("uses: tespkg", result.stderr)
+        self.assertIn("no addressing-mode input", result.stderr)
 
     def test_client_defaults_and_no_tls_port_resolution(self):
         result = self.shell(
@@ -369,7 +396,7 @@ mc() { printf 'Unexpected mc invocation\n' >&2; return 94; }
             extra_args="--credentials-file " + shlex.quote(str(external)), stdin=None)
         self.assertEqual(result.returncode, 0, result.stderr)
         config = self.client_config_path().read_text()
-        self.assertIn('CREDENTIALS_FILE="' + str(external) + '"', config)
+        self.assertIn("CREDENTIALS_FILE=" + str(external), config)
         self.assertNotIn("external-ak-fixture", config + result.stdout + result.stderr)
         # No managed credential copy is made.
         self.assertEqual(list((self.root / "config/clients").glob("*.credentials")), [])

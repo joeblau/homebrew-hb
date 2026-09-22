@@ -255,12 +255,17 @@ runner-cache client env --repo acme/monorepo
 ```
 
 `--tls` is the default (port 443); `--no-tls` defaults the port to 9000.
-`--path-style on` (the default) matches MinIO and the S3 action's addressing;
-set `--path-style off` only for endpoints requiring virtual-hosted buckets.
+`--path-style on` is the default. The S3 action selects addressing automatically;
+it has no input to enforce path style, so verify compatibility with your endpoint.
+`--path-style off` records virtual-hosted intent for clients such as sccache;
+`client env` refuses to emit the Actions snippet for that unsupported combination.
+`RUNNER_CACHE_PATH_STYLE` is configuration metadata, not an Actions input.
 `--bucket NAME` overrides the default `actions-cache-<scope>` name when the
 server provisioned a different bucket. Credentials are read from stdin into a
 managed 0600 file, or referenced in place with `--credentials-file PATH` (an
 existing 0600 file with `ACCESS_KEY`/`SECRET_KEY` lines, managed by you).
+Managed credentials use literal `KEY=value` lines: quotes, dollar signs, and
+backticks are data. Do not source credential files as shell scripts.
 Configuration and credential files live under
 `/opt/github-runner-cache/config/clients/`; values are never printed, never
 on argv, and never in generated workflow config. `client uninstall --repo …`

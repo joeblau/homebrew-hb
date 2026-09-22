@@ -496,6 +496,11 @@ cmd_alloc() {
 
   # Host-wide budget across ALL runners: the new request must fit inside the
   # ledger total, so two simultaneous jobs share one bounded volume.
+  local allocation="${ALLOC_DIR}/${runner}:${job}"
+  if [[ -e "${allocation}" ]]; then
+    err "Scratch allocation already exists for ${runner}/${job}; clean it before reallocating."
+    exit 1
+  fi
   local used
   used="$(allocated_mb)"
   if (( used + size_mb > TOTAL_BUDGET_MB )); then
@@ -509,7 +514,7 @@ cmd_alloc() {
 
   local scratch="${MOUNT_POINT}/${runner}/${job}"
   mkdir -p "${scratch}"
-  printf '%s\n' "${size_mb}" > "${ALLOC_DIR}/${runner}__${job}"
+  printf '%s\n' "${size_mb}" > "${ALLOC_DIR}/${runner}:${job}"
   step "Allocated ${size_mb} MB scratch for ${runner}/${job} ($(( used + size_mb ))/${TOTAL_BUDGET_MB} MB in use)."
   release_lock
   trap - EXIT
@@ -624,7 +629,7 @@ cmd_clean() {
     trap - EXIT
     return 1
   fi
-  rm -f "${ALLOC_DIR}/${runner}__${job}"
+  rm -f "${ALLOC_DIR}/${runner}:${job}"
   rmdir "${MOUNT_POINT}/${runner}" 2>/dev/null || true   # drop the empty runner dir
   step "Cleaned scratch for ${runner}/${job}."
 
@@ -676,7 +681,7 @@ cmd_inspect() {
       [[ -f "${f}" ]] || continue
       entry="$(basename "${f}")"
       mb="$(head -n1 "${f}" 2>/dev/null || true)"
-      printf '       - %s: %s MB\n' "${entry//__//}" "${mb}" >&2
+      printf '       - %s: %s MB\n' "${entry//://}" "${mb}" >&2
       count=$((count + 1))
     done
   fi

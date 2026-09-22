@@ -137,10 +137,10 @@ HOW IT PLUGS IN:
   parse are NOT accelerated. See docs/compiler-cache.md.
 
 FALLBACK:
-  If the sccache server or cache fails, sccache runs the real compiler
-  directly and counts the failure under cache errors — the build stays
-  correct, just uncached. To bypass the cache entirely, drop the env step or
-  unset RUSTC_WRAPPER.
+  The emitted SCCACHE_IGNORE_SERVER_IO_ERROR=1 allows uncached local compilation
+  when reading an accepted compilation's response fails. Initial connection
+  or request errors, missing wrappers, and compiler errors can still fail builds.
+  To bypass the cache entirely, drop the env step or unset RUSTC_WRAPPER.
 
 TRUST:
   Per-scope directories, ports, and caps separate caches; they do NOT isolate
@@ -560,6 +560,7 @@ SCCACHE_DIR=$(data_dir "${SCOPE_SLUG}")
 SCCACHE_CACHE_SIZE=${MAX_SIZE_GIB}G
 SCCACHE_SERVER_PORT=${PORT}
 SCCACHE_IDLE_TIMEOUT=0
+SCCACHE_IGNORE_SERVER_IO_ERROR=1
 RUSTC_WRAPPER=${SCCACHE_BIN}
 EOF
 
@@ -602,10 +603,10 @@ EOF
     separate integrations), linking steps, and compiler invocations sccache
     cannot parse. Those compile normally and are never poisoned by the cache.
 
-    FALLBACK: if the sccache server or cache fails, sccache runs the real
-    compiler directly and counts the failure under cache errors — the build
-    stays correct, just uncached. To bypass the cache entirely, drop the env
-    step or unset RUSTC_WRAPPER.
+    FALLBACK: SCCACHE_IGNORE_SERVER_IO_ERROR=1 enables uncached local compilation
+    when reading an accepted compilation's response fails. Initial connection
+    or request errors, missing wrappers, and compiler errors can still fail builds.
+    To bypass the cache entirely, drop the env step or unset RUSTC_WRAPPER.
 
     Record '${PROG_NAME} stats ${scope_flag} --json' before and after a warm
     rebuild to include requests/hits/misses/errors and cache size in

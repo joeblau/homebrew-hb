@@ -11,6 +11,7 @@ class RunnerSetup < Formula
   depends_on "docker"
   depends_on "jq"
   depends_on :macos
+  depends_on "python@3.14"
 
   def install
     bin.install %w[

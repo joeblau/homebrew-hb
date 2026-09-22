@@ -90,6 +90,7 @@ brew() { printf 'Unexpected brew invocation\n' >&2; return 91; }
             "SCCACHE_CACHE_SIZE": "25G",
             "SCCACHE_SERVER_PORT": "14226",
             "SCCACHE_IDLE_TIMEOUT": "0",
+            "SCCACHE_IGNORE_SERVER_IO_ERROR": "1",
             "RUSTC_WRAPPER": "/usr/local/bin/sccache",
         })
         self.assertIn("$GITHUB_ENV", result.stderr)
