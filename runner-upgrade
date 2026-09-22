@@ -1068,7 +1068,7 @@ repair_preserve_failed_registration() {
 # Inspect the actual service, including during retries whose saved settings
 # already contain the new scope. Never rewrite an unknown wrapper's arguments.
 repair_plist_plan() {
-  local plist="$1" dir="$2" url="$3" document program arguments updated api_url
+  local plist="$1" dir="$2" url="$3" document program arguments updated api_url wrapper='[]'
   document="$(plutil -convert json -o - -- "${plist}" 2>/dev/null)" || {
     err "Cannot parse LaunchDaemon ${plist}; no registration was changed."; return 1;
   }
@@ -1080,6 +1080,16 @@ repair_plist_plan() {
   fi
   arguments="$(printf '%s' "${document}" | jq -c .ProgramArguments)"
   program="$(printf '%s' "${arguments}" | jq -r '.[0]')"
+  if [[ "${program}" == /* && "${program##*/}" == runner-docker-builder ]]; then
+    if ! printf '%s' "${arguments}" | jq -e '
+        length >= 6 and .[1] == "wait-colima" and .[2] == "--timeout"
+        and (.[3] | test("^[1-9][0-9]*$")) and .[4] == "--"' >/dev/null; then
+      err "Unrecognized Docker readiness wrapper in ${plist}"; return 1
+    fi
+    wrapper="$(printf '%s' "${arguments}" | jq -c '.[0:5]')"
+    arguments="$(printf '%s' "${arguments}" | jq -c '.[5:]')"
+    program="$(printf '%s' "${arguments}" | jq -r '.[0]')"
+  fi
   if [[ "${program}" == "${dir}/bin/runsvc.sh" ]]; then
     printf '{"supervisor":false,"arguments":null}\n'
     return 0
@@ -1114,7 +1124,8 @@ repair_plist_plan() {
     ' 2>/dev/null)"; then
     err "Malformed registration arguments in ${plist}; no registration was changed."; return 1
   fi
-  jq -cn --argjson arguments "${updated}" '{supervisor:true, arguments:$arguments}'
+  jq -cn --argjson arguments "${updated}" --argjson wrapper "${wrapper}" \
+    '{supervisor:true, arguments:($wrapper + $arguments)}'
 }
 
 repair_install_plist() {

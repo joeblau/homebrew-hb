@@ -80,6 +80,7 @@ ${PROG_NAME} — fast Docker image builds on macOS GitHub Actions runners
 USAGE:
   ${PROG_NAME} setup-remote --host ssh://user@linux-builder [options]
   ${PROG_NAME} setup-colima [options]
+  ${PROG_NAME} wait-colima [--timeout SECONDS] -- COMMAND [ARG ...]
   ${PROG_NAME} use-desktop
   ${PROG_NAME} status [--json]
   ${PROG_NAME} gc status [--builder NAME] [--verbose]
@@ -97,6 +98,9 @@ COMMANDS:
   setup-colima     Local alternative: install colima + docker CLI + buildx via
                    Homebrew, start a lightweight Lima VM, and wire buildx to it
                    (builder name: ${COLIMA_BUILDER_NAME}, docker-container driver).
+  wait-colima      Wait for the default Colima Docker daemon, then exec COMMAND.
+                   Used by runner-setup --colima at boot; default timeout 300s.
+                   Failure never launches COMMAND. Does not start another VM.
   use-desktop      Revert the default builder to Docker Desktop (desktop-linux).
   status           Show the active docker context and buildx builders.
                    --json emits one object (context, selected builder, mode,
@@ -1182,10 +1186,90 @@ registry_mirror_status() {
   fi
 }
 
+# Gate the service entrypoint, not a job step: container jobs need Docker
+# before Runner.Listener can accept them. exec preserves runsvc.sh's signals.
+wait_colima() {
+  local timeout=300
+  if [[ "${1:-}" == --timeout ]]; then
+    [[ $# -ge 2 ]] || { err "--timeout requires seconds"; return 2; }
+    timeout="$2"; shift 2
+  fi
+  if ! [[ "${timeout}" =~ ^[1-9][0-9]*$ ]] || [[ "${timeout}" -gt 3600 ]]; then
+    err "--timeout must be between 1 and 3600 seconds"; return 2
+  fi
+  [[ "${1:-}" == -- && $# -ge 2 ]] || {
+    err "USAGE: ${PROG_NAME} wait-colima [--timeout SECONDS] -- COMMAND [ARG ...]"; return 2;
+  }
+  shift
+  command -v python3 >/dev/null || { err "python3 is required for readiness checks"; return 1; }
+  # Replace this shell with the gate, and the gate with the actual service.
+  exec python3 - "${timeout}" "$@" <<'PYGATE'
+import os
+import signal
+import subprocess
+import sys
+import time
+
+timeout = int(sys.argv[1])
+command = sys.argv[2:]
+env = dict(os.environ, DOCKER_CONTEXT="colima")
+for key in ("DOCKER_HOST", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH"):
+    env.pop(key, None)
+probe = None
+
+def stop_probe():
+    if probe is not None:
+        try:
+            os.killpg(probe.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        probe.wait()
+
+def interrupted(signum, frame):
+    stop_probe()
+    raise SystemExit(128 + signum)
+
+signal.signal(signal.SIGTERM, interrupted)
+signal.signal(signal.SIGINT, interrupted)
+deadline = time.monotonic() + timeout
+print(f"Waiting up to {timeout}s for Colima Docker before starting the runner...", file=sys.stderr, flush=True)
+while time.monotonic() < deadline:
+    remaining = deadline - time.monotonic()
+    try:
+        probe = subprocess.Popen(["docker", "--context", "colima", "info"],
+                                 env=env, stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 start_new_session=True)
+        rc = probe.wait(timeout=max(0.01, min(5, remaining)))
+    except subprocess.TimeoutExpired:
+        stop_probe()
+        rc = 1
+    except OSError as exc:
+        print(f"Cannot check Colima Docker: {exc}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        probe = None
+    if rc == 0:
+        print("Colima Docker is ready; starting runner.", file=sys.stderr, flush=True)
+        # Restore defaults before exec; the service installs its own handlers.
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        os.execvpe(command[0], command, env)
+    time.sleep(max(0, min(1, deadline - time.monotonic())))
+print("Colima Docker did not become ready; runner remains offline. launchd will retry.", file=sys.stderr)
+sys.exit(1)
+PYGATE
+}
+
 # ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
 main() {
+  if [[ "${1:-}" == wait-colima ]]; then
+    shift
+    wait_colima "$@"
+    return $?
+  fi
   parse_args "$@"
   detect_platform
   require_cmds

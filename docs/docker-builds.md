@@ -65,6 +65,79 @@ runner-docker-builder use-desktop
 `use-desktop` verifies and selects Docker Desktop's `desktop-linux` context
 and builder. It reports an error if Desktop is unavailable.
 
+### Start Docker and runners together at every boot
+
+Add `--colima` to `runner-setup` on each CI Mac. Setup installs Colima and its
+Docker/Buildx tooling, creates one system LaunchDaemon for the default VM, and
+wraps each runner's service entrypoint with a Docker readiness gate:
+
+```sh
+# New persistent runners (RUNNER_TOKEN contains a registration token).
+runner-setup --org acme --runners 2 --colima
+
+# New ephemeral runners also need GITHUB_PAT for re-registration.
+runner-setup --org acme --runners 2 --ephemeral --colima
+
+# Existing registered runners: no new token is needed for a same-scope retrofit.
+# Pause new jobs and allow current jobs to finish before changing services.
+runner-setup --org acme --runners 2 --colima --docker-timeout 300
+```
+
+Use `--repo OWNER/REPO` instead of `--org` for repository-scoped runners.
+The number selects runner-1 through runner-N. A new or differently scoped
+runner still requires `RUNNER_TOKEN`; tokenless setup validates the entire
+selection before provisioning anything.
+
+At each boot, launchd starts `com.github.runner-colima` as the runner's
+non-root service user, with explicit `HOME`, `COLIMA_HOME`, `DOCKER_CONFIG`,
+and PATH. It runs `colima start default --foreground`, using the existing VM
+configuration and keeping its image and build caches. Unlike a user-level
+`brew services start colima`, this is a system service with `RunAtLoad` and
+does not require a GUI login. [Colima foreground mode](https://github.com/abiosoft/colima/blob/main/docs/FAQ.md#does-colima-support-autostart)
+is designed for service supervision; Homebrew documents the
+[boot/login distinction](https://docs.brew.sh/Manpage#services-subcommand).
+
+Each runner daemon starts through `runner-docker-builder wait-colima`.
+The gate polls `docker --context colima info` with bounded probe timeouts,
+then execs the original `bin/runsvc.sh` or `runner-ephemeral` command. Until
+Docker responds, the runner listener does not start or accept jobs. This
+also covers job/service containers, which are created before workflow steps.
+A timeout leaves the runner offline and exits unsuccessfully, so launchd
+retries. `--docker-timeout` accepts 1–3600 seconds (default 300).
+The started runner inherits `DOCKER_CONTEXT=colima`; conflicting inherited
+`DOCKER_HOST` and TLS overrides are removed by the gate.
+
+All runners share one VM and daemon, so they never race to start separate
+Colima instances. Once the host has opted in, later `runner-setup` calls,
+including autoscaler provisioning, inherit its Colima configuration and
+readiness timeout. Updating an existing runner preserves its registration,
+credentials, supervisor arguments and existing maintenance hold. The update
+uses `runner-upgrade` shutdown/start to check active jobs and verify readiness.
+Runner upgrades and scope repairs preserve the readiness gate.
+
+If a Homebrew Colima service is already registered, stop that service between
+jobs before opting in (`brew services stop colima` for a user service, or
+`sudo brew services stop colima` for a system service). Setup refuses competing
+service managers and a shared daemon owned by another user. Configure VM
+CPU/memory/disk beforehand with `runner-docker-builder setup-colima` if the
+default 4 CPUs, 8 GiB memory and 60 GiB disk are unsuitable.
+
+Inspect startup on each Mac with:
+
+```sh
+sudo launchctl print system/com.github.runner-colima
+sudo launchctl print system/com.github.runner-1
+docker --context colima info
+tail -n 50 "$HOME/Library/Logs/runner-colima/stderr.log"
+tail -n 50 /opt/github-runners/runner-1/_diag/runner-stderr.log
+```
+
+Check one canary Mac after a reboot before rolling out fleet-wide; fixture
+tests do not validate your VM backend or host's pre-login environment.
+FileVault's pre-boot unlock must complete before macOS services can start.
+Colima readiness is a startup gate, not a monitor that interrupts jobs if
+Docker becomes unavailable later.
+
 ## Explicit workflow selection
 
 Use `--builder runner-remote` (or `runner-colima`) for predictable routing:

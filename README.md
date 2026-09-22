@@ -10,6 +10,7 @@ Provision and operate GitHub Actions self-hosted runners on macOS:
 
 Installing `runner-setup` with Homebrew also installs the Docker CLI and `jq`.
 For Docker builds, configure [Colima or a remote Linux builder](docs/docker-builds.md).
+Use `runner-setup --colima` to start Docker at boot and gate runner startup on Docker readiness.
 
 - `runner-setup` / `runner-cleanup` — provision and tear down runners as system LaunchDaemons
 - `runner-ephemeral` — one-job runners, re-registered fresh after every job, with opt-in sandbox-exec confinement and APFS snapshot rollback ([docs](docs/ephemeral-runners.md))
