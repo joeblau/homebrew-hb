@@ -224,5 +224,211 @@ cmd_uninstall
         self.assertFalse((self.root / "bin").exists())
 
 
+class RunnerCacheClientTests(unittest.TestCase):
+    """Client mode: configuration-only remote S3 backend; no local services."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="runner-cache-client-test-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        for directory in ("config/scopes", "config/clients", "bin", "data", "logs"):
+            (self.root / directory).mkdir(parents=True, exist_ok=True)
+
+    def shell(self, body, stdin=None):
+        prelude = r'''
+source "$1"
+CACHE_ROOT="$2"
+SCOPES_DIR="${CACHE_ROOT}/config/scopes"
+CLIENTS_DIR="${CACHE_ROOT}/config/clients"
+MINIO_ENV_FILE="${CACHE_ROOT}/config/minio.env"
+WRAPPER_PATH="${CACHE_ROOT}/bin/run-minio.sh"
+PLIST_DEST="${CACHE_ROOT}/fixture.plist"
+LOG_DIR="${CACHE_ROOT}/logs"
+detect_platform() { :; }
+detect_user() { :; }
+require_cmds() { :; }
+ensure_sudo() { :; }
+as_user() { "$@"; }
+sudo() { printf 'Unexpected sudo invocation\n' >&2; return 90; }
+brew() { printf 'Unexpected brew invocation\n' >&2; return 91; }
+launchctl() { printf 'Unexpected launchctl invocation\n' >&2; return 92; }
+minio() { printf 'Unexpected minio invocation\n' >&2; return 93; }
+mc() { printf 'Unexpected mc invocation\n' >&2; return 94; }
+'''
+        return subprocess.run(
+            ["/bin/bash", "-c", prelude + "\n" + body, "test", str(SCRIPT), str(self.root)],
+            text=True, capture_output=True, check=False, input=stdin,
+        )
+
+    def install_client(self, extra_args="", stdin="ACCESS_KEY=remote-ak-fixture\nSECRET_KEY=remote-sk-fixture\n"):
+        return self.shell(
+            "parse_args client install --repo acme/project --endpoint cache.internal.lan "
+            "--port 9443 --region eu-west-1 " + extra_args + "; cmd_client_install",
+            stdin=stdin,
+        )
+
+    def client_config_path(self):
+        configs = list((self.root / "config/clients").glob("*.env"))
+        self.assertEqual(len(configs), 1)
+        return configs[0]
+
+    def test_client_install_stores_remote_config_without_secrets_or_local_services(self):
+        result = self.install_client()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Unexpected", result.stderr)
+        config = self.client_config_path().read_text()
+        for expected in ('SCOPE="acme/project"', 'REMOTE_ENDPOINT="cache.internal.lan"',
+                         'REMOTE_PORT="9443"', 'REMOTE_TLS="true"', 'REMOTE_REGION="eu-west-1"',
+                         'REMOTE_PATH_STYLE="true"'):
+            self.assertIn(expected, config)
+        self.assertIn('BUCKET="actions-cache-repo-acme-project-', config)
+        credentials = self.client_config_path().with_suffix(".credentials")
+        self.assertTrue(credentials.exists())
+        self.assertEqual(credentials.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(credentials.read_text(),
+                         'ACCESS_KEY="remote-ak-fixture"\nSECRET_KEY="remote-sk-fixture"\n')
+        for secret in ("remote-ak-fixture", "remote-sk-fixture"):
+            self.assertNotIn(secret, config + result.stdout + result.stderr)
+        # No local daemon or MinIO state is created.
+        self.assertFalse((self.root / "config/minio.env").exists())
+        self.assertEqual(list((self.root / "config/scopes").glob("*.env")), [])
+
+    def test_client_env_emits_remote_s3_integration_without_secrets(self):
+        self.assertEqual(self.install_client().returncode, 0)
+        result = self.shell('parse_args client env --repo acme/project; cmd_client_env')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        bucket = [line.split("=", 1)[1].strip('"') for line in
+                  self.client_config_path().read_text().splitlines()
+                  if line.startswith("BUCKET=")][0]
+        self.assertEqual(dict(line.split("=", 1) for line in result.stdout.splitlines()), {
+            "RUNNER_CACHE_ENDPOINT": "cache.internal.lan",
+            "RUNNER_CACHE_PORT": "9443",
+            "RUNNER_CACHE_BUCKET": bucket,
+            "RUNNER_CACHE_INSECURE": "false",
+            "RUNNER_CACHE_REGION": "eu-west-1",
+            "RUNNER_CACHE_PATH_STYLE": "true",
+        })
+        self.assertNotIn("ACTIONS_", result.stdout)
+        self.assertIn("tespkg/actions-cache@v1", result.stderr)
+        self.assertIn("endpoint: cache.internal.lan", result.stderr)
+        self.assertIn("region: eu-west-1", result.stderr)
+        self.assertIn("insecure: false", result.stderr)
+        self.assertIn("${{ secrets.RUNNER_CACHE_SECRET_KEY }}", result.stderr)
+        self.assertIn("SCCACHE_BUCKET=" + bucket, result.stderr)
+        self.assertIn("SCCACHE_ENDPOINT=cache.internal.lan:9443", result.stderr)
+        self.assertIn("ACTIONS_CACHE_URL", result.stderr)  # only as a "never redirect" warning
+        for secret in ("remote-ak-fixture", "remote-sk-fixture"):
+            self.assertNotIn(secret, result.stdout + result.stderr)
+
+    def test_client_defaults_and_no_tls_port_resolution(self):
+        result = self.shell(
+            'parse_args client install --org acme --endpoint 10.0.0.5; '
+            'printf "%s %s %s" "$CLIENT_PORT" "$TLS" "$PATH_STYLE"')
+        self.assertEqual(result.stdout, "443 1 1")
+        result = self.shell(
+            'parse_args client install --org acme --endpoint 10.0.0.5 --no-tls --path-style off; '
+            'printf "%s %s %s" "$CLIENT_PORT" "$TLS" "$PATH_STYLE"')
+        self.assertEqual(result.stdout, "9000 0 0")
+
+    def test_client_install_rejects_invalid_options_before_writing_anything(self):
+        arguments = [
+            "client install --repo acme/project",
+            "client install --repo acme/project --endpoint http://cache.internal.lan",
+            "client install --repo acme/project --endpoint cache.internal.lan:9000",
+            "client install --repo acme/project --endpoint 'bad host'",
+            "client install --repo acme/project --endpoint cache.internal.lan --port 0",
+            "client install --repo acme/project --endpoint cache.internal.lan --port not-a-port",
+            "client install --repo acme/project --endpoint cache.internal.lan --region 'bad region'",
+            "client install --repo acme/project --endpoint cache.internal.lan --path-style maybe",
+            "client install --repo acme/project --endpoint cache.internal.lan --bucket Bad_Bucket",
+            "client install --endpoint cache.internal.lan",
+            "client env --org acme --repo acme/project",
+        ]
+        for args in arguments:
+            with self.subTest(args=args):
+                tokens = shlex.split(args)
+                result = self.shell('parse_args ' + ' '.join(shlex.quote(token) for token in tokens))
+                self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(list((self.root / "config/clients").glob("*.env")), [])
+
+    def test_client_install_requires_credentials_and_reports_their_absence(self):
+        result = self.shell(
+            'parse_args client install --repo acme/project --endpoint cache.internal.lan; '
+            'cmd_client_install',
+            stdin="",
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("credentials", result.stderr)
+        self.assertEqual(list((self.root / "config/clients").glob("*.env")), [])
+
+    def test_client_install_references_external_credentials_file(self):
+        external = self.root / "elsewhere.credentials"
+        external.write_text('ACCESS_KEY="external-ak-fixture"\nSECRET_KEY="external-sk-fixture"\n')
+        external.chmod(0o600)
+        result = self.install_client(
+            extra_args="--credentials-file " + shlex.quote(str(external)), stdin=None)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = self.client_config_path().read_text()
+        self.assertIn('CREDENTIALS_FILE="' + str(external) + '"', config)
+        self.assertNotIn("external-ak-fixture", config + result.stdout + result.stderr)
+        # No managed credential copy is made.
+        self.assertEqual(list((self.root / "config/clients").glob("*.credentials")), [])
+        result = self.shell('parse_args client env --repo acme/project; cmd_client_env')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("external-sk-fixture", result.stdout + result.stderr)
+        # uninstall removes the config but never the external credentials file.
+        result = self.shell('parse_args client uninstall --repo acme/project; cmd_client_uninstall')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(list((self.root / "config/clients").glob("*.env")), [])
+        self.assertTrue(external.exists())
+
+    def test_client_install_fails_when_referenced_credentials_file_is_missing(self):
+        result = self.install_client(
+            extra_args="--credentials-file " + str(self.root / "nope.credentials"), stdin=None)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("credentials", result.stderr.lower())
+        self.assertEqual(list((self.root / "config/clients").glob("*.env")), [])
+
+    def test_client_env_fails_closed_when_credentials_disappear(self):
+        self.assertEqual(self.install_client().returncode, 0)
+        self.client_config_path().with_suffix(".credentials").unlink()
+        result = self.shell('parse_args client env --repo acme/project; cmd_client_env')
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("credentials", result.stderr.lower())
+
+    def test_client_env_reports_unconfigured_scope(self):
+        result = self.shell('parse_args client env --repo acme/project; cmd_client_env')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("not configured", result.stderr)
+
+    def test_client_uninstall_removes_managed_config_and_credentials(self):
+        self.assertEqual(self.install_client().returncode, 0)
+        managed = self.client_config_path().with_suffix(".credentials")
+        result = self.shell('parse_args client uninstall --repo acme/project; cmd_client_uninstall')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(list((self.root / "config/clients").glob("*.env")), [])
+        self.assertFalse(managed.exists())
+
+    def test_local_mode_files_and_env_are_untouched_by_client_presence(self):
+        # A scope can exist in both modes; local env output is unchanged.
+        scopes = self.root / "config/scopes"
+        (scopes / "repo-acme-project.env").write_text(
+            'SCOPE_KIND="repo"\nSCOPE="acme/project"\n'
+            'BUCKET="actions-cache-repo-acme-project"\n'
+            'POLICY_NAME="cache-repo-acme-project"\n'
+            'ACCESS_KEY="fixture-scope-access"\nSECRET_KEY="fixture-scope-secret"\n'
+        )
+        (self.root / "config/minio.env").write_text('CACHE_PORT="19000"\nCACHE_CONSOLE_PORT="19001"\n')
+        self.assertEqual(self.install_client().returncode, 0)
+        result = self.shell('parse_args env --repo acme/project; cmd_env')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(dict(line.split("=", 1) for line in result.stdout.splitlines()), {
+            "RUNNER_CACHE_ENDPOINT": "127.0.0.1", "RUNNER_CACHE_PORT": "19000",
+            "RUNNER_CACHE_BUCKET": "actions-cache-repo-acme-project",
+            "RUNNER_CACHE_INSECURE": "true",
+        })
+
+
 if __name__ == "__main__":
     unittest.main()

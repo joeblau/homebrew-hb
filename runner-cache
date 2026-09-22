@@ -10,6 +10,19 @@
 #   runner-cache gateway install (--org ORG | --repo OWNER/REPO) [--gateway-port N] [--save-prefix P]...
 #   runner-cache gateway env [--org ORG | --repo OWNER/REPO]
 #   runner-cache gateway start|stop|status
+#   runner-cache client install (--org ORG | --repo OWNER/REPO) --endpoint HOST
+#     [--port N] [--tls | --no-tls] [--region R] [--path-style on|off]
+#     [--bucket NAME] [--credentials-file PATH]
+#   runner-cache client env [--org ORG | --repo OWNER/REPO]
+#   runner-cache client uninstall (--org ORG | --repo OWNER/REPO)
+#
+# The optional 'client' family is configuration-only: it records a shared,
+# already-authenticated remote S3-compatible endpoint (host, port, TLS,
+# region, path-style, bucket) plus a 0600 credential-file reference per
+# scope, and 'client env' emits the S3-action workflow integration for it.
+# It installs no MinIO, runs no daemon, and never prints credentials.
+# Local mode and its loopback defaults are unchanged; S3 is never wired to
+# ACTIONS_CACHE_URL / ACTIONS_RESULTS_URL / runtime tokens.
 #
 # The optional 'gateway' family runs a GitHub Actions cache-service (Twirp v2,
 # JSON) HTTP gateway on loopback in front of the same per-scope MinIO buckets,
@@ -56,8 +69,12 @@ GATEWAY_SERVER_PATH="${CACHE_ROOT}/bin/cache-gateway.py"
 GATEWAY_WRAPPER_PATH="${CACHE_ROOT}/bin/run-cache-gateway.sh"
 DEFAULT_GATEWAY_PORT=9157
 
+# Configuration-only remote S3 client mode (no local MinIO/daemon).
+CLIENTS_DIR="${CACHE_ROOT}/config/clients"
+
 COMMAND=""
 GATEWAY_SUB=""
+CLIENT_SUB=""
 ORG=""
 REPO=""
 PORT="${DEFAULT_PORT}"
@@ -68,6 +85,15 @@ ASSUME_YES=0
 KEEP_DATA=0
 RAW=0
 JSON=0
+
+# client install inputs.
+ENDPOINT=""
+CLIENT_PORT=""
+TLS=1
+REGION="us-east-1"
+PATH_STYLE=1
+CLIENT_BUCKET=""
+CREDENTIALS_FILE=""
 
 # Derived from the chosen scope (--org / --repo).
 SCOPE_KIND=""
@@ -95,6 +121,13 @@ SCOPE=""
 ACCESS_KEY=""
 SECRET_KEY=""
 CREATED_AT=""
+
+# Per-scope client values loaded from ${CLIENTS_DIR}/<slug>.env (never echoed).
+REMOTE_ENDPOINT=""
+REMOTE_PORT=""
+REMOTE_TLS=""
+REMOTE_REGION=""
+REMOTE_PATH_STYLE=""
 
 # ----------------------------------------------------------------------------
 # Output helpers — progress goes to stderr; secrets are NEVER interpolated.
@@ -135,11 +168,21 @@ COMMANDS:
                   gateway start|stop|status
                                     Manage the gateway daemon. status --json
                                     emits one JSON object.
+  client        Configuration-only client for a shared remote S3 backend:
+                  client install    Record the remote endpoint (host, port,
+                                    TLS, region, path-style, bucket) and a
+                                    0600 credential file for a scope. No
+                                    MinIO installation, no daemon.
+                  client env        Print the S3 cache action integration for
+                                    the remote endpoint (secrets stay in
+                                    files, never on stdout/stderr).
+                  client uninstall  Remove the scope's client configuration
+                                    and its managed credential file.
   uninstall     Boot out + remove the daemon and delete ${CACHE_ROOT}
                 (asks for confirmation; --keep-data preserves data + credentials).
   -h, --help    Show this help and exit.
 
-SCOPE (install/env — choose exactly ONE):
+SCOPE (install/env/gateway/client — choose exactly ONE):
   --org ORG_NAME        Org-level cache: bucket actions-cache-org-ORG_NAME.
   --repo OWNER/REPO     Repo-level cache: bucket actions-cache-repo-OWNER-REPO.
 
@@ -152,6 +195,19 @@ OPTIONS:
   --save-prefix P       (gateway install) Allow SAVE only for cache keys with
                         this prefix; repeatable. Default policy is '*' (all
                         keys). Restore is never restricted.
+  --endpoint HOST       (client install) Bare host or IP of the remote S3
+                        endpoint (no scheme, no path). Required.
+  --tls / --no-tls      (client install) Use HTTPS to the endpoint (default:
+                        --tls). Default port is 443 with TLS, 9000 without.
+                        Use --no-tls only on a trusted private network.
+  --region R            (client install) S3 region (default: us-east-1).
+  --path-style on|off   (client install) Path-style object addressing
+                        (default: on, as MinIO and the S3 action require).
+  --bucket NAME         (client install) Remote bucket (default: the same
+                        actions-cache-<scope> name local mode would use).
+  --credentials-file P  (client install) Reference an existing 0600 file
+                        holding ACCESS_KEY/SECRET_KEY instead of reading
+                        credentials from stdin into a managed file.
   --json                (status) Emit one JSON object on stdout; see
                         docs/agent-tools.md for the schema.
   --raw                 (metrics) Dump the raw Prometheus exposition instead
@@ -164,6 +220,8 @@ EXAMPLES:
   ${PROG_NAME} env --repo acme/monorepo
   ${PROG_NAME} gateway install --repo acme/monorepo --save-prefix 'main-'
   ${PROG_NAME} gateway env --repo acme/monorepo
+  printf 'ACCESS_KEY=%s\nSECRET_KEY=%s\n' "\$AK" "\$SK" | ${PROG_NAME} client install --repo acme/monorepo --endpoint cache.internal.lan
+  ${PROG_NAME} client env --repo acme/monorepo
   ${PROG_NAME} status
   ${PROG_NAME} metrics
   ${PROG_NAME} uninstall --yes --keep-data
@@ -410,6 +468,88 @@ pick_scope() {
 }
 
 # ----------------------------------------------------------------------------
+# client helpers — configuration-only remote S3 endpoint per scope
+# ----------------------------------------------------------------------------
+client_file() {
+  printf '%s/%s.env' "${CLIENTS_DIR}" "$1"
+}
+
+client_credentials_file_default() {
+  printf '%s/%s.credentials' "${CLIENTS_DIR}" "$1"
+}
+
+# Pick the client scope for `client env`: explicit flags win; otherwise a
+# single configured client scope is used unambiguously.
+pick_client_scope() {
+  if [[ -n "${ORG}" || -n "${REPO}" ]]; then
+    resolve_scope
+    return 0
+  fi
+  local f count=0 chosen=""
+  shopt -s nullglob
+  for f in "${CLIENTS_DIR}"/*.env; do
+    count=$((count + 1))
+    chosen="${f}"
+  done
+  shopt -u nullglob
+  if [[ "${count}" -eq 0 ]]; then
+    err "No remote client scope configured yet. Run:"
+    err "  ${PROG_NAME} client install --org ORG --endpoint HOST (or --repo OWNER/REPO)"
+    exit 1
+  elif [[ "${count}" -gt 1 ]]; then
+    err "Multiple client scopes configured; pick one with --org or --repo:"
+    for f in "${CLIENTS_DIR}"/*.env; do
+      printf '     - %s\n' "$(basename "${f}" .env)" >&2
+    done
+    exit 2
+  fi
+  SCOPE_SLUG="$(basename "${chosen}" .env)"
+}
+
+# True when $1 is a readable credentials file with non-empty ACCESS_KEY and
+# SECRET_KEY. Values are never printed.
+client_credentials_ok() {
+  local f="$1" ak="" sk=""
+  [[ -f "${f}" && -r "${f}" ]] || return 1
+  ak="$(. "${f}" 2>/dev/null; printf '%s' "${ACCESS_KEY:-}")"
+  sk="$(. "${f}" 2>/dev/null; printf '%s' "${SECRET_KEY:-}")"
+  [[ -n "${ak}" && -n "${sk}" ]]
+}
+
+# Tighten a credential file to 0600 if it is readable by group/other.
+ensure_secret_perms() {
+  local f="$1" perms
+  perms="$(stat -f '%Lp' "${f}" 2>/dev/null || printf '')"
+  if [[ -n "${perms}" && "${perms}" != "600" ]]; then
+    warn "Credentials file ${f} has mode ${perms}; tightening to 600."
+    as_user chmod 600 "${f}"
+  fi
+}
+
+# Read ACCESS_KEY=.../SECRET_KEY=... lines (AWS_ACCESS_KEY_ID/
+# AWS_SECRET_ACCESS_KEY also accepted) from stdin and persist them, normalized,
+# to $1 with mode 0600. Nothing read is ever echoed.
+read_client_credentials_stdin() {
+  local dest="$1" line ak="" sk=""
+  while IFS= read -r line; do
+    case "${line}" in
+      ACCESS_KEY=*)             ak="${line#ACCESS_KEY=}" ;;
+      SECRET_KEY=*)             sk="${line#SECRET_KEY=}" ;;
+      AWS_ACCESS_KEY_ID=*)      ak="${line#AWS_ACCESS_KEY_ID=}" ;;
+      AWS_SECRET_ACCESS_KEY=*)  sk="${line#AWS_SECRET_ACCESS_KEY=}" ;;
+    esac
+  done
+  # Tolerate shell-style quoting in the piped lines.
+  ak="${ak%\"}"; ak="${ak#\"}"; ak="${ak%\'}"; ak="${ak#\'}"
+  sk="${sk%\"}"; sk="${sk#\"}"; sk="${sk%\'}"; sk="${sk#\'}"
+  [[ -n "${ak}" && -n "${sk}" ]] || return 1
+  write_secret_file "${dest}" <<EOF
+ACCESS_KEY="${ak}"
+SECRET_KEY="${sk}"
+EOF
+}
+
+# ----------------------------------------------------------------------------
 # Argument parsing
 # ----------------------------------------------------------------------------
 parse_scope_flag() {
@@ -443,6 +583,46 @@ validate_scope_names() {
   fi
 }
 
+# Validate `client install` endpoint options. Unlike the local daemon ports,
+# the remote endpoint may live on a privileged port (443 is the TLS default).
+validate_client_options() {
+  local re
+  if [[ -z "${ENDPOINT}" ]]; then
+    err "client install requires --endpoint HOST (the shared remote S3 endpoint)."
+    exit 2
+  fi
+  if [[ "${ENDPOINT}" == *"://"* || "${ENDPOINT}" == */* || "${ENDPOINT}" == *:* ]]; then
+    err "--endpoint must be a bare host or IP, without scheme, port, or path (got: '${ENDPOINT}')."
+    exit 2
+  fi
+  re='^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$'
+  if ! [[ "${ENDPOINT}" =~ ${re} ]]; then
+    err "--endpoint must be a valid hostname or IPv4 address (got: '${ENDPOINT}')."
+    exit 2
+  fi
+  if [[ -z "${CLIENT_PORT}" ]]; then
+    if [[ "${TLS}" -eq 1 ]]; then CLIENT_PORT=443; else CLIENT_PORT=9000; fi
+  fi
+  if ! [[ "${CLIENT_PORT}" =~ ^[0-9]+$ ]] || [[ ${#CLIENT_PORT} -gt 5 ]] \
+      || [[ "$((10#${CLIENT_PORT}))" -lt 1 || "$((10#${CLIENT_PORT}))" -gt 65535 ]]; then
+    err "--port must be a TCP port (1-65535) (got: '${CLIENT_PORT}')"
+    exit 2
+  fi
+  CLIENT_PORT="$((10#${CLIENT_PORT}))"
+  re='^[A-Za-z0-9][A-Za-z0-9-]{0,62}$'
+  if ! [[ "${REGION}" =~ ${re} ]]; then
+    err "--region must be a valid S3 region name (got: '${REGION}')."
+    exit 2
+  fi
+  if [[ -n "${CLIENT_BUCKET}" ]]; then
+    re='^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+    if ! [[ "${CLIENT_BUCKET}" =~ ${re} ]]; then
+      err "--bucket must be a valid S3 bucket name (got: '${CLIENT_BUCKET}')."
+      exit 2
+    fi
+  fi
+}
+
 parse_args() {
   COMMAND="${1:-}"
   if [[ $# -gt 0 ]]; then shift; fi
@@ -451,7 +631,7 @@ parse_args() {
     ""|-h|--help|help)
       usage; exit 0 ;;
     install|env|start|stop|status|metrics|uninstall) ;;
-    gateway) ;;
+    gateway|client) ;;
     *)
       err "Unknown command: ${COMMAND}"
       usage
@@ -472,6 +652,20 @@ parse_args() {
     esac
   fi
 
+  if [[ "${COMMAND}" == "client" ]]; then
+    CLIENT_SUB="${1:-}"
+    if [[ $# -gt 0 ]]; then shift; fi
+    case "${CLIENT_SUB}" in
+      -h|--help|help)
+        usage; exit 0 ;;
+      install|env|uninstall) ;;
+      *)
+        err "Unknown client command: '${CLIENT_SUB:-<missing>}' (want install|env|uninstall)"
+        usage
+        exit 2 ;;
+    esac
+  fi
+
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --org)
@@ -484,8 +678,8 @@ parse_args() {
       --repo=*)    REPO="${1#*=}"; shift ;;
       --port)
         [[ $# -ge 2 ]] || { err "--port requires a value"; usage; exit 2; }
-        PORT="$2"; shift 2 ;;
-      --port=*)    PORT="${1#*=}"; shift ;;
+        PORT="$2"; CLIENT_PORT="$2"; shift 2 ;;
+      --port=*)    PORT="${1#*=}"; CLIENT_PORT="${1#*=}"; shift ;;
       --console-port)
         [[ $# -ge 2 ]] || { err "--console-port requires a value"; usage; exit 2; }
         CONSOLE_PORT="$2"; shift 2 ;;
@@ -500,6 +694,39 @@ parse_args() {
       --save-prefix=*)
         [[ -n "${1#*=}" ]] || { err "--save-prefix requires a non-empty value"; usage; exit 2; }
         SAVE_PREFIXES+=("${1#*=}"); shift ;;
+      --endpoint)
+        [[ $# -ge 2 ]] || { err "--endpoint requires a value"; usage; exit 2; }
+        ENDPOINT="$2"; shift 2 ;;
+      --endpoint=*)  ENDPOINT="${1#*=}"; shift ;;
+      --tls)         TLS=1; shift ;;
+      --no-tls)      TLS=0; shift ;;
+      --region)
+        [[ $# -ge 2 ]] || { err "--region requires a value"; usage; exit 2; }
+        REGION="$2"; shift 2 ;;
+      --region=*)    REGION="${1#*=}"; shift ;;
+      --path-style)
+        [[ $# -ge 2 ]] || { err "--path-style requires a value (on|off)"; usage; exit 2; }
+        case "$2" in
+          on)  PATH_STYLE=1 ;;
+          off) PATH_STYLE=0 ;;
+          *) err "--path-style must be 'on' or 'off' (got: '$2')"; exit 2 ;;
+        esac
+        shift 2 ;;
+      --path-style=*)
+        case "${1#*=}" in
+          on)  PATH_STYLE=1 ;;
+          off) PATH_STYLE=0 ;;
+          *) err "--path-style must be 'on' or 'off' (got: '${1#*=}')"; exit 2 ;;
+        esac
+        shift ;;
+      --bucket)
+        [[ $# -ge 2 ]] || { err "--bucket requires a value"; usage; exit 2; }
+        CLIENT_BUCKET="$2"; shift 2 ;;
+      --bucket=*)    CLIENT_BUCKET="${1#*=}"; shift ;;
+      --credentials-file)
+        [[ $# -ge 2 ]] || { err "--credentials-file requires a value"; usage; exit 2; }
+        CREDENTIALS_FILE="$2"; shift 2 ;;
+      --credentials-file=*) CREDENTIALS_FILE="${1#*=}"; shift ;;
       --raw)       RAW=1; shift ;;
       --json)      JSON=1; shift ;;
       -y|--yes)    ASSUME_YES=1; shift ;;
@@ -556,6 +783,24 @@ parse_args() {
             exit 2
           fi
           validate_scope_names
+          ;;
+      esac
+      ;;
+    client)
+      case "${CLIENT_SUB}" in
+        install)
+          validate_scope_choice
+          validate_client_options
+          ;;
+        env)
+          if [[ -n "${ORG}" && -n "${REPO}" ]]; then
+            err "Choose only one of --org or --repo."
+            exit 2
+          fi
+          validate_scope_names
+          ;;
+        uninstall)
+          validate_scope_choice
           ;;
       esac
       ;;
@@ -1955,6 +2200,209 @@ cmd_gateway() {
 }
 
 # ----------------------------------------------------------------------------
+# client — configuration-only mode for a shared remote S3-compatible backend.
+# Stores endpoint settings and a 0600 credential-file reference per scope
+# under ${CLIENTS_DIR}; installs no MinIO, runs no daemon, and never prints
+# credential values. Local mode is untouched by anything here.
+# ----------------------------------------------------------------------------
+cmd_client_install() {
+  detect_platform
+  require_cmds uname id dscl shasum awk tr grep stat chmod date
+  detect_user
+  resolve_scope
+
+  local bucket="${CLIENT_BUCKET:-${BUCKET}}"
+  local cf creds_file
+  cf="$(client_file "${SCOPE_SLUG}")"
+  creds_file="${CREDENTIALS_FILE:-$(client_credentials_file_default "${SCOPE_SLUG}")}"
+
+  case "${ENDPOINT}" in
+    127.*|localhost|::1)
+      warn "--endpoint ${ENDPOINT} is loopback. For a same-Mac backend, prefer"
+      warn "'${PROG_NAME} install' (local mode); client mode is for remote hosts."
+      ;;
+  esac
+
+  # /opt scaffolding needs sudo only when missing (mirrors install).
+  if [[ ! -d "${CACHE_ROOT}" ]]; then
+    log "Creating ${CACHE_ROOT} (sudo) and chowning to ${REAL_USER}:${REAL_GROUP}"
+    ensure_sudo
+    sudo mkdir -p "${CACHE_ROOT}"
+    sudo chown "${REAL_USER}:${REAL_GROUP}"
+  fi
+  as_user mkdir -p "${CLIENTS_DIR}"
+  as_user chmod 700 "${CACHE_ROOT}/config" "${CLIENTS_DIR}"
+
+  # Credentials: referenced file, piped stdin, or reuse — never argv/echo.
+  if [[ -n "${CREDENTIALS_FILE}" ]]; then
+    if ! client_credentials_ok "${creds_file}"; then
+      err "Referenced credentials file ${creds_file} is missing or lacks"
+      err "ACCESS_KEY/SECRET_KEY lines. Create it with mode 0600 first."
+      exit 1
+    fi
+    ensure_secret_perms "${creds_file}"
+    step "Referencing external credentials ${creds_file} (never displayed)"
+  elif [[ ! -t 0 ]]; then
+    log "Reading scope credentials from stdin (never displayed)"
+    if ! read_client_credentials_stdin "${creds_file}"; then
+      err "Could not read credentials from stdin. Pipe them as KEY=VALUE lines:"
+      err "  printf 'ACCESS_KEY=%s\\nSECRET_KEY=%s\\n' \"\$ACCESS_KEY\" \"\$SECRET_KEY\" \\"
+      err "    | ${PROG_NAME} client install ..."
+      err "or reference an existing 0600 file with --credentials-file PATH."
+      exit 1
+    fi
+    step "Scope credentials stored in ${creds_file} (0600, never displayed)"
+  elif client_credentials_ok "${creds_file}"; then
+    step "Reusing existing credentials ${creds_file} (never displayed)"
+    step "Pipe new credentials on stdin to rotate them."
+  else
+    err "No credentials for this scope yet. Provide them on stdin:"
+    err "  printf 'ACCESS_KEY=%s\\nSECRET_KEY=%s\\n' \"\$ACCESS_KEY\" \"\$SECRET_KEY\" \\"
+    err "    | ${PROG_NAME} client install ..."
+    err "or reference an existing 0600 file with --credentials-file PATH."
+    exit 1
+  fi
+
+  local tls_word="false" path_style_word="false"
+  [[ "${TLS}" -eq 1 ]] && tls_word="true"
+  [[ "${PATH_STYLE}" -eq 1 ]] && path_style_word="true"
+
+  write_secret_file "${cf}" <<EOF
+SCOPE_KIND="${SCOPE_KIND}"
+SCOPE="${SCOPE}"
+BUCKET="${bucket}"
+REMOTE_ENDPOINT="${ENDPOINT}"
+REMOTE_PORT="${CLIENT_PORT}"
+REMOTE_TLS="${tls_word}"
+REMOTE_REGION="${REGION}"
+REMOTE_PATH_STYLE="${path_style_word}"
+CREDENTIALS_FILE="${creds_file}"
+CREATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+EOF
+
+  printf '\n'
+  log "Client scope '${SCOPE_SLUG}' configured (no local service installed)."
+  log "Remote endpoint: $([[ "${tls_word}" == "true" ]] && printf 'https' || printf 'http')://${ENDPOINT}:${CLIENT_PORT}  (bucket: ${bucket})"
+  log "Configuration:   ${cf} (0600)"
+  log "Next step:       ${PROG_NAME} client env $( [[ "${SCOPE_KIND}" == "org" ]] && printf -- '--org %s' "${SCOPE}" || printf -- '--repo %s' "${SCOPE}" )"
+}
+
+# client env — non-secret remote S3 settings on stdout; the S3-action workflow
+# integration, credential handling, and sccache integration point on stderr.
+cmd_client_env() {
+  detect_platform
+  require_cmds uname id dscl shasum awk tr
+  detect_user
+  pick_client_scope
+  local cf
+  cf="$(client_file "${SCOPE_SLUG}")"
+  if [[ ! -r "${cf}" ]]; then
+    err "Client scope '${SCOPE_SLUG}' is not configured. Run:"
+    err "  ${PROG_NAME} client install with the same scope and --endpoint."
+    exit 1
+  fi
+  # shellcheck disable=SC1090
+  . "${cf}"
+  if ! client_credentials_ok "${CREDENTIALS_FILE}"; then
+    err "Credentials file ${CREDENTIALS_FILE} is missing or lacks"
+    err "ACCESS_KEY/SECRET_KEY. Re-run client install with credentials on stdin"
+    err "or --credentials-file PATH. The cache is unusable until then."
+    exit 1
+  fi
+
+  local insecure="true" scheme="http"
+  if [[ "${REMOTE_TLS}" == "true" ]]; then
+    insecure="false"
+    scheme="https"
+  fi
+
+  cat <<EOF
+RUNNER_CACHE_ENDPOINT=${REMOTE_ENDPOINT}
+RUNNER_CACHE_PORT=${REMOTE_PORT}
+RUNNER_CACHE_BUCKET=${BUCKET}
+RUNNER_CACHE_INSECURE=${insecure}
+RUNNER_CACHE_REGION=${REMOTE_REGION}
+RUNNER_CACHE_PATH_STYLE=${REMOTE_PATH_STYLE}
+EOF
+
+  cat >&2 <<EOF
+
+==> Client scope '${SCOPE_SLUG}' targets ${scheme}://${REMOTE_ENDPOINT}:${REMOTE_PORT}
+    bucket '${BUCKET}'. No local MinIO is installed or required in this mode.
+    Credentials: ${CREDENTIALS_FILE} (0600, never displayed). Configure
+    GitHub Actions secrets RUNNER_CACHE_ACCESS_KEY and
+    RUNNER_CACHE_SECRET_KEY from ACCESS_KEY and SECRET_KEY in that file.
+
+==> Add this step to the workflow (requires an up-to-date Actions runner):
+
+      - uses: tespkg/actions-cache@v1
+        id: dependency-cache
+        with:
+          endpoint: ${REMOTE_ENDPOINT}
+          port: ${REMOTE_PORT}
+          insecure: ${insecure}
+          region: ${REMOTE_REGION}
+          accessKey: \${{ secrets.RUNNER_CACHE_ACCESS_KEY }}
+          secretKey: \${{ secrets.RUNNER_CACHE_SECRET_KEY }}
+          bucket: ${BUCKET}
+          use-fallback: false
+          path: ~/Library/Caches/Homebrew
+          key: brew-\${{ github.repository }}-\${{ runner.os }}-\${{ runner.arch }}-\${{ hashFiles('**/Brewfile.lock.json') }}
+
+    Pin the action to a reviewed full commit SHA in production. Scope keys by
+    repository, OS/architecture, toolchain, and dependency lockfiles. Read
+    the step's cache-hit output for workflow cache hits; raw S3 request
+    counters on the server are a separate, lower-level signal. On backend
+    outage the step fails explicitly unless you set use-fallback: true
+    (GitHub cache fallback) or continue-on-error with an uncached build path.
+
+    S3 is not GitHub's Actions cache protocol. Never point ACTIONS_CACHE_URL,
+    ACTIONS_RESULTS_URL, or ACTIONS_RUNTIME_TOKEN at this endpoint; standard
+    actions/cache keeps using GitHub (or the 'gateway' family on a local Mac).
+
+    sccache S3 backend integration point (the runner-sccache helper is tracked
+    separately and not installed here): SCCACHE_BUCKET=${BUCKET},
+    SCCACHE_ENDPOINT=${REMOTE_ENDPOINT}:${REMOTE_PORT},
+    SCCACHE_REGION=${REMOTE_REGION}, SCCACHE_S3_USE_SSL=${REMOTE_TLS}, and
+    SCCACHE_NO_PATH_STYLE=true only when path-style is off; credentials via
+    AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY from the credentials file.
+    See docs/cache-backend.md.
+EOF
+}
+
+cmd_client_uninstall() {
+  detect_platform
+  require_cmds uname id dscl shasum awk tr rm
+  detect_user
+  resolve_scope
+  local cf creds_default
+  cf="$(client_file "${SCOPE_SLUG}")"
+  if [[ ! -e "${cf}" ]]; then
+    log "No client configuration for scope '${SCOPE_SLUG}'; nothing to remove."
+    exit 0
+  fi
+  creds_default="$(client_credentials_file_default "${SCOPE_SLUG}")"
+  step "Removing ${cf}"
+  as_user rm -f "${cf}"
+  # Only the managed credential file is removed; an external file referenced
+  # via --credentials-file stays under its owner's control.
+  if [[ -e "${creds_default}" ]]; then
+    step "Removing ${creds_default}"
+    as_user rm -f "${creds_default}"
+  fi
+  log "Client configuration for scope '${SCOPE_SLUG}' removed."
+  log "The remote bucket and its objects on the server are untouched."
+}
+
+cmd_client() {
+  case "${CLIENT_SUB}" in
+    install)   cmd_client_install ;;
+    env)       cmd_client_env ;;
+    uninstall) cmd_client_uninstall ;;
+  esac
+}
+
+# ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
 main() {
@@ -1967,6 +2415,7 @@ main() {
     env)       cmd_env ;;
     metrics)   cmd_metrics ;;
     gateway)   cmd_gateway ;;
+    client)    cmd_client ;;
     uninstall) cmd_uninstall ;;
   esac
 }
