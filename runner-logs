@@ -8,6 +8,10 @@
 #   runner-logs metrics [--interval SEC] [--once]
 #   runner-logs tail [--runner N] [--kind runner|worker|stdout|stderr] [--lines N] [--json]
 #   runner-logs jobs [--runner N] [--limit N] [--json]
+#   runner-logs steps [--runner N] [--interval SEC] [--once]
+#   runner-logs tests ingest [--junit-glob GLOB] [PATH ...]
+#   runner-logs tests report [--suite NAME] [--limit N] [--json]
+#   runner-logs dashboard [--output FILE] [--limit N]
 #
 # ship:    tails every runner's _diag/*.log (Runner_*.log, Worker_*.log, plus
 #          the runner-stdout.log / runner-stderr.log written by the LaunchDaemon
@@ -29,6 +33,24 @@
 #          duration) across runners, newest first. No sudo. Both tail and
 #          jobs accept --json for agents and scripts (docs/agent-tools.md).
 #
+# steps:   samples per-runner CPU/memory with ps (read-only) while jobs run
+#          and correlates the samples with step boundaries (StepsRunner
+#          lines) parsed from Worker_*.log, emitting one JSON line per
+#          completed step: name, start/end, duration, mean/peak CPU %, and
+#          peak RSS. --once reconstructs post-hoc from the logs plus the
+#          recorded samples without taking new ones. No sudo.
+#
+# tests:   ingests JUnit XML results into a JSON-lines history database and
+#          reports per-suite pass/fail/error counts plus flaky tests (tests
+#          whose result flips between consecutive runs of the same suite).
+#
+# dashboard: renders a self-contained static HTML report (inline CSS, no
+#          external assets) with per-runner online status, recent job
+#          results and durations, and the top flaky tests. No sudo.
+#
+# steps/tests/dashboard use python3 (stdlib only) for the heavier parsing
+# and reporting; everything else is bash 3.2.
+#
 # The script never runs any runner process and never sets
 # RUNNER_ALLOW_RUNASROOT; it only READS runner state. Secrets (bearer token,
 # GITHUB_PAT) come from env vars and are passed to curl via a 0600 config
@@ -43,12 +65,12 @@ PROG_NAME="$(basename "$0")"
 RUNNER_ROOT="/opt/github-runners"
 GITHUB_API="https://api.github.com"
 
-MODE=""                          # ship | metrics | tail | jobs
-RUNNER_FILTER=""                 # tail/jobs: only this runner (runner-N or N)
+MODE=""                          # ship | metrics | tail | jobs | steps | tests | dashboard
+RUNNER_FILTER=""                 # tail/jobs/steps: only this runner (runner-N or N)
 LOG_KIND="runner"                # tail: runner | worker | stdout | stderr
 LINES=200                        # tail: lines to print
-LIMIT=20                         # jobs: completions to list
-JSON=0                           # tail/jobs: JSON output on stdout
+LIMIT=20                         # jobs/report/dashboard: rows to list
+JSON=0                           # tail/jobs/tests report: JSON output on stdout
 SUDO="sudo"                      # metrics: "sudo -n" when launchctl print is passwordless
 SINK="file"                      # file | http
 OUTPUT_DIR=""                    # default resolved after arg parse
@@ -57,6 +79,13 @@ ONCE=0
 STATE_FILE=""                    # default resolved after arg parse
 BATCH_SIZE=500                   # max JSON lines per HTTP POST
 ENDPOINT=""                      # default: LOG_HTTP_ENDPOINT env
+TESTS_CMD=""                     # tests: ingest | report
+JUNIT_GLOBS=""                   # tests ingest: colon-separated paths/globs
+SUITE_FILTER=""                  # tests report: only this suite
+SAMPLES_FILE=""                  # steps: ps sample history (default resolved after parse)
+STEPS_STATE_FILE=""              # steps: incremental emit state (default resolved after parse)
+HISTORY_FILE=""                  # tests: JSON-lines run history DB (default after parse)
+DASHBOARD_OUTPUT=""              # dashboard: HTML output path (default after parse)
 
 HOST_LABEL=""
 WORK_TMPDIR=""
@@ -82,6 +111,10 @@ USAGE:
   ${PROG_NAME} metrics [--interval SEC] [--once]
   ${PROG_NAME} tail [--runner N] [--kind runner|worker|stdout|stderr] [--lines N] [--json]
   ${PROG_NAME} jobs [--runner N] [--limit N] [--json]
+  ${PROG_NAME} steps [--runner N] [--interval SEC] [--once]
+  ${PROG_NAME} tests ingest [--junit-glob GLOB] [PATH ...]
+  ${PROG_NAME} tests report [--suite NAME] [--limit N] [--json]
+  ${PROG_NAME} dashboard [--output FILE] [--limit N]
 
 MODES:
   ship (default)   Tail ${RUNNER_ROOT}/runner-*/_diag/*.log (Runner_*,
@@ -100,6 +133,23 @@ MODES:
                    when --runner is omitted and exactly one exists. No sudo.
   jobs             List recent job completions parsed from Worker_*.log files
                    (name, result, started, duration), newest first. No sudo.
+  steps            Sample per-runner CPU/memory with ps (read-only) every
+                   --interval and correlate the samples with step boundaries
+                   (StepsRunner lines) in Worker_*.log, emitting one JSON
+                   line per completed step: name, start/end, duration,
+                   mean/peak CPU %, peak RSS MB. Samples are appended to
+                   --samples-file; --once skips sampling and reconstructs
+                   post-hoc from the logs plus recorded samples. No sudo.
+  tests ingest     Parse JUnit XML files (paths or --junit-glob globs; '**'
+                   recurses) into the JSON-lines history DB (--history-file).
+                   Files whose mtime is unchanged are not re-ingested.
+  tests report     Per-suite run/pass/fail/error/skip counts and flaky
+                   tests — tests whose status flips between consecutive
+                   runs of the same suite. --json for scripts and agents.
+  dashboard        Write a self-contained static HTML report (inline CSS,
+                   no external assets) to --output: per-runner online
+                   status, recent job results and durations, and the top
+                   flaky tests. No sudo.
 
 SINKS (ship mode):
   --sink file      Append JSON lines to OUTPUT_DIR/runner-logs-YYYYMMDD.jsonl
@@ -115,13 +165,19 @@ OPTIONS:
   --state-file PATH Offset state file (default: ~/.runner-logs/offsets.tsv)
   --endpoint URL    HTTP sink endpoint (default: LOG_HTTP_ENDPOINT env)
   --batch-size N    Max JSON lines per HTTP POST (default: ${BATCH_SIZE})
-  --interval SEC    Seconds between passes (default: 10 ship / 60 metrics)
-  --once            Run a single pass and exit (for cron/launchd/manual runs)
-  --runner N        tail/jobs: restrict to runner-N (accepts 'runner-N' or 'N')
+  --interval SEC    Seconds between passes (default: 10 ship/steps / 60 metrics)
+  --once            Run a single pass and exit (for cron/launchd/manual runs);
+                    steps: reconstruct from logs + recorded samples only
+  --runner N        tail/jobs/steps: restrict to runner-N (accepts 'runner-N' or 'N')
   --kind KIND       tail: runner (default) | worker | stdout | stderr
   --lines N         tail: number of trailing lines (default: ${LINES})
-  --limit N         jobs: maximum completions to list (default: ${LIMIT})
-  --json            tail/jobs: emit JSON on stdout instead of text
+  --limit N         jobs/report/dashboard: maximum rows to list (default: ${LIMIT})
+  --samples-file PATH  steps: ps sample history (default: ~/.runner-logs/steps-samples.jsonl)
+  --history-file PATH  tests/dashboard: run history DB (default: ~/.runner-logs/test-history.jsonl)
+  --junit-glob GLOB tests ingest: glob of JUnit XML files (repeatable; '**' recurses)
+  --suite NAME      tests report: restrict to one suite
+  --output FILE     dashboard: HTML output path (default: ~/.runner-logs/dashboard.html)
+  --json            tail/jobs/tests report: emit JSON on stdout instead of text
   -h, --help        Show this help and exit
 
 ENVIRONMENT:
@@ -130,6 +186,7 @@ ENVIRONMENT:
   GITHUB_PAT         PAT (actions:read) enabling queue metrics in metrics mode
   GITHUB_QUEUE_REPO  OWNER/REPO override for queue metrics (default: derived
                      from a repo-scoped runner's .runner gitHubUrl)
+  RUNNER_LOGS_JUNIT_GLOBS  Colon-separated default globs for tests ingest
 
 EXAMPLES:
   ${PROG_NAME} ship --once
@@ -139,6 +196,11 @@ EXAMPLES:
   GITHUB_PAT=ghp_... GITHUB_QUEUE_REPO=acme/monorepo ${PROG_NAME} metrics --once
   ${PROG_NAME} tail --runner 2 --kind worker --lines 50
   ${PROG_NAME} jobs --limit 5 --json
+  ${PROG_NAME} steps --interval 5
+  ${PROG_NAME} steps --once --runner 1
+  ${PROG_NAME} tests ingest --junit-glob '/opt/github-runners/runner-*/_work/**/*.xml'
+  ${PROG_NAME} tests report --json
+  ${PROG_NAME} dashboard --output ~/Desktop/runners.html
 
   Emit a synthetic 'job' event for every Worker completion line — each such
   shipped line also carries job_name / job_result / job_duration_s so
@@ -177,7 +239,7 @@ parse_args() {
   # Optional leading mode word; default is ship.
   if [[ $# -gt 0 ]]; then
     case "$1" in
-      ship|metrics|tail|jobs) MODE="$1"; shift ;;
+      ship|metrics|tail|jobs|steps|tests|dashboard) MODE="$1"; shift ;;
     esac
   fi
   [[ -n "${MODE}" ]] || MODE="ship"
@@ -225,12 +287,45 @@ parse_args() {
         [[ $# -ge 2 ]] || { err "--limit requires a value"; usage; exit 2; }
         LIMIT="$2"; shift 2 ;;
       --limit=*)   LIMIT="${1#*=}"; shift ;;
+      --samples-file)
+        [[ $# -ge 2 ]] || { err "--samples-file requires a value"; usage; exit 2; }
+        SAMPLES_FILE="$2"; shift 2 ;;
+      --samples-file=*) SAMPLES_FILE="${1#*=}"; shift ;;
+      --history-file)
+        [[ $# -ge 2 ]] || { err "--history-file requires a value"; usage; exit 2; }
+        HISTORY_FILE="$2"; shift 2 ;;
+      --history-file=*) HISTORY_FILE="${1#*=}"; shift ;;
+      --junit-glob)
+        [[ $# -ge 2 ]] || { err "--junit-glob requires a value"; usage; exit 2; }
+        if [[ -n "${JUNIT_GLOBS}" ]]; then JUNIT_GLOBS="${JUNIT_GLOBS}:$2"; else JUNIT_GLOBS="$2"; fi
+        shift 2 ;;
+      --junit-glob=*)
+        if [[ -n "${JUNIT_GLOBS}" ]]; then JUNIT_GLOBS="${JUNIT_GLOBS}:${1#*=}"; else JUNIT_GLOBS="${1#*=}"; fi
+        shift ;;
+      --suite)
+        [[ $# -ge 2 ]] || { err "--suite requires a value"; usage; exit 2; }
+        SUITE_FILTER="$2"; shift 2 ;;
+      --suite=*)   SUITE_FILTER="${1#*=}"; shift ;;
+      --output)
+        [[ $# -ge 2 ]] || { err "--output requires a value"; usage; exit 2; }
+        DASHBOARD_OUTPUT="$2"; shift 2 ;;
+      --output=*)  DASHBOARD_OUTPUT="${1#*=}"; shift ;;
       --json)      JSON=1; shift ;;
       -h|--help)   usage; exit 0 ;;
       *)
-        err "Unknown argument: $1"
-        usage
-        exit 2 ;;
+        if [[ "${MODE}" == "tests" && -z "${TESTS_CMD}" ]]; then
+          case "$1" in
+            ingest|report) TESTS_CMD="$1"; shift ;;
+            *) err "tests subcommand must be 'ingest' or 'report' (got: '$1')"; exit 2 ;;
+          esac
+        elif [[ "${MODE}" == "tests" && "${TESTS_CMD}" == "ingest" ]]; then
+          if [[ -n "${JUNIT_GLOBS}" ]]; then JUNIT_GLOBS="${JUNIT_GLOBS}:$1"; else JUNIT_GLOBS="$1"; fi
+          shift
+        else
+          err "Unknown argument: $1"
+          usage
+          exit 2
+        fi ;;
     esac
   done
 
@@ -262,6 +357,22 @@ parse_args() {
   [[ -n "${OUTPUT_DIR}" ]] || OUTPUT_DIR="${HOME}/Library/Logs/github-runners"
   [[ -n "${STATE_FILE}" ]] || STATE_FILE="${HOME}/.runner-logs/offsets.tsv"
   [[ -n "${ENDPOINT}" ]] || ENDPOINT="${LOG_HTTP_ENDPOINT:-}"
+  [[ -n "${JUNIT_GLOBS}" ]] || JUNIT_GLOBS="${RUNNER_LOGS_JUNIT_GLOBS:-}"
+  [[ -n "${SAMPLES_FILE}" ]] || SAMPLES_FILE="${HOME}/.runner-logs/steps-samples.jsonl"
+  [[ -n "${STEPS_STATE_FILE}" ]] || STEPS_STATE_FILE="${HOME}/.runner-logs/steps-state.tsv"
+  [[ -n "${HISTORY_FILE}" ]] || HISTORY_FILE="${HOME}/.runner-logs/test-history.jsonl"
+  [[ -n "${DASHBOARD_OUTPUT}" ]] || DASHBOARD_OUTPUT="${HOME}/.runner-logs/dashboard.html"
+  if [[ "${MODE}" == "tests" ]]; then
+    if [[ -z "${TESTS_CMD}" ]]; then
+      err "tests requires a subcommand: ingest or report"
+      usage
+      exit 2
+    fi
+    if [[ "${TESTS_CMD}" == "ingest" && -z "${JUNIT_GLOBS}" ]]; then
+      err "tests ingest requires JUnit XML path(s) or --junit-glob GLOB"
+      exit 2
+    fi
+  fi
   if [[ -z "${INTERVAL}" ]]; then
     if [[ "${MODE}" == "metrics" ]]; then INTERVAL=60; else INTERVAL=10; fi
   fi
@@ -296,6 +407,12 @@ require_cmds() {
     cmds="${cmds} sudo launchctl df head sleep"
   elif [[ "${MODE}" == "tail" || "${MODE}" == "jobs" ]]; then
     cmds="${cmds} head sort"
+  elif [[ "${MODE}" == "steps" ]]; then
+    cmds="${cmds} ps sleep python3"
+  elif [[ "${MODE}" == "tests" ]]; then
+    cmds="${cmds} python3"
+  elif [[ "${MODE}" == "dashboard" ]]; then
+    cmds="${cmds} python3 head sort"
   fi
   if [[ "${SINK}" == "http" && "${MODE}" == "ship" ]] \
       || [[ "${MODE}" == "metrics" && -n "${GITHUB_PAT:-}" ]]; then
@@ -839,6 +956,547 @@ run_jobs() {
 }
 
 # ----------------------------------------------------------------------------
+# STEPS mode — per-step CPU/memory timeline.
+# Sampling (ps) stays in bash; step-boundary parsing and sample correlation
+# are heavier, so they run in an embedded python3 (stdlib only).
+# ----------------------------------------------------------------------------
+
+# Append one {"ts","runner","cpu_pct","rss_mb"} sample per runner. A process
+# is attributed to a runner when its command line references the runner
+# directory (Runner.Worker lives in runner-N/bin/, step scripts in
+# runner-N/_work/), so attribution is best-effort but needs no sudo.
+sample_runners() {
+  local list d name stats cpu rss
+  list="$(runner_dirs)" || return 1
+  while IFS= read -r d; do
+    [[ -n "${d}" ]] || continue
+    name="${d##*/}"
+    stats="$(ps -axo pcpu=,rss=,args= 2>/dev/null \
+      | grep -F "${d}/" | grep -v 'grep' \
+      | awk '{cpu+=$1; rss+=$2} END {printf "%.1f %d", cpu+0, int(rss/1024)}')"
+    cpu="${stats%% *}"; rss="${stats##* }"
+    printf '{"ts":"%s","runner":"%s","cpu_pct":%s,"rss_mb":%s}\n' \
+      "$(iso_now)" "$(json_escape "${name}")" "${cpu}" "${rss}" >> "${SAMPLES_FILE}"
+  done <<< "${list}"
+}
+
+# Emit one JSON line per completed step on stdout. mode=full parses every
+# Worker log from scratch (post-hoc reconstruction); mode=incr emits only
+# steps not yet emitted and persists per-file progress in the state file.
+steps_emit() {
+  python3 - "$1" "${RUNNER_ROOT}" "${SAMPLES_FILE}" "${STEPS_STATE_FILE}" "${RUNNER_FILTER}" <<'PYEOF'
+import glob
+import json
+import os
+import re
+import sys
+from datetime import datetime, timezone
+
+mode, runner_root, samples_file, state_file, runner_filter = sys.argv[1:6]
+
+TS_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})Z")
+STEP_RE = re.compile(r"INFO StepsRunner\] Processing step: DisplayName='?(.+?)'?\s*$")
+RESULT_RE = re.compile(r"INFO StepsRunner\] Step result:\s*([A-Za-z]+)")
+DONE_RE = re.compile(r"Job '([^']+)' completed with result:\s*([A-Za-z]+)")
+RUNNER_DIR_RE = re.compile(r"^runner-\d+$")
+
+
+def parse_ts(line):
+    match = TS_RE.match(line)
+    if not match:
+        return None
+    return int(datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S")
+               .replace(tzinfo=timezone.utc).timestamp())
+
+
+def iso(epoch_s):
+    return datetime.fromtimestamp(epoch_s, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+samples = {}
+if os.path.exists(samples_file):
+    with open(samples_file) as handle:
+        for line in handle:
+            try:
+                rec = json.loads(line)
+                stamp = int(datetime.strptime(rec["ts"], "%Y-%m-%dT%H:%M:%SZ")
+                            .replace(tzinfo=timezone.utc).timestamp())
+                samples.setdefault(rec.get("runner", ""), []).append(
+                    (stamp, float(rec.get("cpu_pct") or 0), float(rec.get("rss_mb") or 0)))
+            except (ValueError, KeyError, TypeError):
+                continue
+
+
+def parse_steps(path):
+    steps, current, job, job_result = [], None, "", ""
+    with open(path, errors="replace") as handle:
+        for line in handle:
+            match = STEP_RE.search(line)
+            if match:
+                stamp = parse_ts(line)
+                if current is not None and stamp is not None:
+                    current["end"] = stamp
+                    steps.append(current)
+                current = {"step": match.group(1).strip(), "start": stamp,
+                           "end": None, "result": ""}
+                continue
+            match = RESULT_RE.search(line)
+            if match and current is not None:
+                stamp = parse_ts(line)
+                current["result"] = match.group(1)
+                if stamp is not None:
+                    current["end"] = stamp
+                    steps.append(current)
+                    current = None
+                continue
+            match = DONE_RE.search(line)
+            if match:
+                job, job_result = match.group(1), match.group(2)
+                stamp = parse_ts(line)
+                if current is not None and stamp is not None:
+                    current["end"] = stamp
+                    steps.append(current)
+                    current = None
+    return job, job_result, [s for s in steps
+                             if s["start"] is not None and s["end"] is not None]
+
+
+def emit(runner, path, job, job_result, step):
+    window = [entry for entry in samples.get(runner, [])
+              if step["start"] <= entry[0] <= step["end"]]
+    cpus = [entry[1] for entry in window]
+    rss = [entry[2] for entry in window]
+    print(json.dumps({
+        "runner": runner,
+        "job": job or None,
+        "job_result": job_result or None,
+        "step": step["step"],
+        "result": step["result"] or None,
+        "start": iso(step["start"]),
+        "end": iso(step["end"]),
+        "duration_s": step["end"] - step["start"],
+        "samples": len(window),
+        "cpu_mean_pct": round(sum(cpus) / len(cpus), 1) if cpus else None,
+        "cpu_peak_pct": round(max(cpus), 1) if cpus else None,
+        "rss_peak_mb": int(max(rss)) if rss else None,
+        "file": path,
+    }))
+
+
+state = {}
+if mode == "incr" and os.path.exists(state_file):
+    with open(state_file) as handle:
+        for line in handle:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) == 3 and parts[2].isdigit():
+                state[parts[0]] = (parts[1], int(parts[2]))
+
+new_state = {}
+pattern = os.path.join(runner_root, "runner-*", "_diag", "Worker_*.log")
+for path in sorted(glob.glob(pattern)):
+    runner = path.split(os.sep)[-3]
+    if not RUNNER_DIR_RE.match(runner):
+        continue
+    if runner_filter and runner != runner_filter:
+        continue
+    try:
+        inode = str(os.stat(path).st_ino)
+    except OSError:
+        continue
+    job, job_result, steps = parse_steps(path)
+    start = 0
+    if mode == "incr":
+        previous = state.get(path)
+        if previous and previous[0] == inode:
+            start = previous[1]
+    for step in steps[start:]:
+        emit(runner, path, job, job_result, step)
+    new_state[path] = (inode, len(steps))
+
+if mode == "incr":
+    os.makedirs(os.path.dirname(state_file), exist_ok=True)
+    tmp_path = state_file + ".tmp"
+    with open(tmp_path, "w") as handle:
+        for path in sorted(new_state):
+            handle.write("%s\t%s\t%d\n" % (path, new_state[path][0], new_state[path][1]))
+    os.replace(tmp_path, state_file)
+PYEOF
+}
+
+run_steps() {
+  mkdir -p "$(dirname "${SAMPLES_FILE}")"
+  if [[ "${ONCE}" -eq 1 ]]; then
+    steps_emit full
+    return 0
+  fi
+  log "Sampling per-runner CPU/memory and emitting step timelines (interval ${INTERVAL}s)"
+  while :; do
+    sample_runners || warn "No runners found under ${RUNNER_ROOT}."
+    steps_emit incr
+    sleep "${INTERVAL}"
+  done
+}
+
+# ----------------------------------------------------------------------------
+# TESTS mode — JUnit ingestion + flake history (python3 stdlib).
+# ----------------------------------------------------------------------------
+
+# Append one history record per (file, testsuite); unchanged files (same
+# path+mtime already in the history) are skipped.
+tests_ingest() {
+  python3 - "${HISTORY_FILE}" "${JUNIT_GLOBS}" <<'PYEOF'
+import glob
+import json
+import os
+import sys
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+
+history_file, patterns = sys.argv[1], sys.argv[2].split(":")
+
+seen = set()
+if os.path.exists(history_file):
+    with open(history_file) as handle:
+        for line in handle:
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            seen.add((rec.get("source", ""), rec.get("source_mtime", 0)))
+
+files = set()
+for pattern in patterns:
+    if glob.has_magic(pattern):
+        files.update(p for p in glob.glob(pattern, recursive=True) if os.path.isfile(p))
+    elif os.path.isfile(pattern):
+        files.add(pattern)
+
+if not files:
+    sys.stderr.write("ERROR: no JUnit XML files matched.\n")
+    sys.exit(1)
+
+
+def parse_suites(path):
+    root = ET.parse(path).getroot()
+    suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+    records = []
+    for suite in suites:
+        cases = []
+        for case in suite.iter("testcase"):
+            status = "passed"
+            if case.find("failure") is not None:
+                status = "failed"
+            elif case.find("error") is not None:
+                status = "error"
+            elif case.find("skipped") is not None:
+                status = "skipped"
+            try:
+                seconds = float(case.get("time") or 0)
+            except ValueError:
+                seconds = 0.0
+            cases.append({"name": case.get("name", ""),
+                          "classname": case.get("classname", ""),
+                          "status": status, "time_s": seconds})
+        records.append({
+            "suite": suite.get("name") or os.path.splitext(os.path.basename(path))[0],
+            "tests": len(cases),
+            "failures": sum(1 for c in cases if c["status"] == "failed"),
+            "errors": sum(1 for c in cases if c["status"] == "error"),
+            "skipped": sum(1 for c in cases if c["status"] == "skipped"),
+            "cases": cases,
+        })
+    return records
+
+
+os.makedirs(os.path.dirname(history_file), exist_ok=True)
+ingested = 0
+with open(history_file, "a") as out:
+    for path in sorted(files):
+        try:
+            mtime = int(os.stat(path).st_mtime)
+        except OSError:
+            continue
+        if (path, mtime) in seen:
+            continue
+        try:
+            suites = parse_suites(path)
+        except Exception as exc:
+            sys.stderr.write("WARN: skipping unreadable JUnit file %s: %s\n" % (path, exc))
+            continue
+        for record in suites:
+            record.update({"ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                           "source": path, "source_mtime": mtime})
+            out.write(json.dumps(record) + "\n")
+            ingested += 1
+            print("ingested %s: suite=%s tests=%d failures=%d errors=%d skipped=%d"
+                  % (path, record["suite"], record["tests"], record["failures"],
+                     record["errors"], record["skipped"]))
+sys.stderr.write("%d suite run(s) recorded in %s\n" % (ingested, history_file))
+PYEOF
+}
+
+# Per-suite totals across all recorded runs, plus flaky tests: tests whose
+# status changes between consecutive runs of the same suite.
+tests_report() {
+  if [[ ! -f "${HISTORY_FILE}" ]]; then
+    err "No test history at ${HISTORY_FILE}; run '${PROG_NAME} tests ingest' first."
+    exit 1
+  fi
+  python3 - "${HISTORY_FILE}" "${SUITE_FILTER}" "${LIMIT}" "${JSON}" <<'PYEOF'
+import json
+import sys
+
+history_file, suite_filter = sys.argv[1], sys.argv[2]
+limit, as_json = int(sys.argv[3]), sys.argv[4] == "1"
+
+by_suite = {}
+with open(history_file) as handle:
+    for line in handle:
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if suite_filter and rec.get("suite") != suite_filter:
+            continue
+        by_suite.setdefault(rec.get("suite", ""), []).append(rec)
+
+if not by_suite:
+    sys.stderr.write("ERROR: no matching suite runs in history.\n")
+    sys.exit(1)
+
+
+def case_key(case):
+    if case.get("classname"):
+        return case["classname"] + "." + case.get("name", "")
+    return case.get("name", "")
+
+
+suites, flaky = [], []
+for suite in sorted(by_suite):
+    runs = by_suite[suite]
+    totals = {}
+    history = {}
+    for run in runs:
+        for case in run.get("cases", []):
+            totals[case["status"]] = totals.get(case["status"], 0) + 1
+            history.setdefault(case_key(case), []).append(case["status"])
+    suites.append({"suite": suite, "runs": len(runs),
+                   "passed": totals.get("passed", 0), "failed": totals.get("failed", 0),
+                   "errors": totals.get("error", 0), "skipped": totals.get("skipped", 0)})
+    for key in sorted(history):
+        statuses = history[key]
+        flips = sum(1 for a, b in zip(statuses, statuses[1:]) if a != b)
+        if flips:
+            flaky.append({"suite": suite, "test": key, "flips": flips,
+                          "runs": len(statuses), "last_status": statuses[-1]})
+
+flaky.sort(key=lambda row: (-row["flips"], row["test"]))
+flaky = flaky[:limit]
+
+if as_json:
+    print(json.dumps({"suites": suites, "flaky": flaky}))
+    sys.exit(0)
+
+print("%-30s %5s %7s %7s %7s %8s" % ("SUITE", "RUNS", "PASSED", "FAILED", "ERRORS", "SKIPPED"))
+for row in suites:
+    print("%-30s %5d %7d %7d %7d %8d" % (row["suite"][:30], row["runs"], row["passed"],
+                                        row["failed"], row["errors"], row["skipped"]))
+print("")
+print("FLAKY TESTS (status flips between consecutive runs):")
+if not flaky:
+    print("  none")
+for row in flaky:
+    print("  flips=%d last=%-8s %s :: %s"
+          % (row["flips"], row["last_status"], row["suite"], row["test"]))
+PYEOF
+}
+
+run_tests() {
+  case "${TESTS_CMD}" in
+    ingest) tests_ingest ;;
+    report) tests_report ;;
+  esac
+}
+
+# ----------------------------------------------------------------------------
+# DASHBOARD mode — self-contained static HTML report. Runner status here is
+# inferred from diag logs only (no sudo): the newest Runner log must have
+# been touched within the last 10 minutes to count as online.
+# ----------------------------------------------------------------------------
+
+# One TSV record per runner: <name>\t<status>\t<last diag activity ISO|- >
+dashboard_runners() {
+  local d name diag newest marker mtime now status
+  now="$(date -u '+%s')"
+  shopt -s nullglob
+  for d in "${RUNNER_ROOT}"/runner-*; do
+    [[ -d "${d}" && "${d##*/}" =~ ^runner-[0-9]+$ ]] || continue
+    name="${d##*/}"
+    diag="${d}/_diag"
+    status="offline"; marker=""; mtime=0
+    newest="$(ls -t "${diag}"/Runner_*.log 2>/dev/null | head -n1 || true)"
+    if [[ -n "${newest}" ]]; then
+      mtime="$(stat -f %m "${newest}" 2>/dev/null || echo 0)"
+      marker="$(tail -n 300 "${newest}" 2>/dev/null \
+        | grep -E 'Listening for Jobs|Running job' | tail -n1 || true)"
+      if [[ $((now - mtime)) -lt 600 ]]; then
+        case "${marker}" in
+          *"Running job"*)        status="busy" ;;
+          *"Listening for Jobs"*) status="idle" ;;
+          *)                      status="unknown" ;;
+        esac
+      fi
+    fi
+    printf '%s\t%s\t%s\n' "${name}" "${status}" \
+      "$([[ "${mtime}" -gt 0 ]] && date -u -r "${mtime}" '+%Y-%m-%dT%H:%M:%SZ' || echo '-')"
+  done
+  shopt -u nullglob
+}
+
+run_dashboard() {
+  mkdir -p "$(dirname "${DASHBOARD_OUTPUT}")"
+  WORK_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/runner-logs.XXXXXX")"
+  local runners_tsv="${WORK_TMPDIR}/runners.tsv" jobs_tsv="${WORK_TMPDIR}/jobs.tsv"
+  dashboard_runners > "${runners_tsv}"
+  job_records | sort -t $'\t' -k1,1nr | head -n "${LIMIT}" > "${jobs_tsv}"
+  python3 - "${DASHBOARD_OUTPUT}" "${HOST_LABEL}" "${runners_tsv}" "${jobs_tsv}" \
+    "${HISTORY_FILE}" "${LIMIT}" <<'PYEOF'
+import html
+import json
+import os
+import sys
+from datetime import datetime, timezone
+
+out_path, host, runners_tsv, jobs_tsv, history_file = sys.argv[1:6]
+limit = int(sys.argv[6])
+
+
+def esc(text):
+    return html.escape(text, quote=True)
+
+
+runners = []
+with open(runners_tsv) as handle:
+    for line in handle:
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) >= 3:
+            runners.append(parts[:3])
+
+jobs = []
+with open(jobs_tsv) as handle:
+    for line in handle:
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) >= 6:
+            jobs.append(parts)
+
+by_suite = {}
+if os.path.exists(history_file):
+    with open(history_file) as handle:
+        for line in handle:
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            by_suite.setdefault(rec.get("suite", ""), []).append(rec)
+
+flaky = []
+for suite, runs in by_suite.items():
+    history = {}
+    for run in runs:
+        for case in run.get("cases", []):
+            key = (case.get("classname", "") + "." + case.get("name", "")
+                   if case.get("classname") else case.get("name", ""))
+            history.setdefault(key, []).append(case.get("status", ""))
+    for key in sorted(history):
+        statuses = history[key]
+        flips = sum(1 for a, b in zip(statuses, statuses[1:]) if a != b)
+        if flips:
+            flaky.append({"suite": suite, "test": key, "flips": flips,
+                          "last_status": statuses[-1]})
+flaky.sort(key=lambda row: (-row["flips"], row["test"]))
+flaky = flaky[:limit]
+
+generated = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def badge(text, kind):
+    return '<span class="badge %s">%s</span>' % (kind, esc(text or "?"))
+
+
+rows_runners = []
+for name, status, seen in runners:
+    kind = "ok" if status in ("idle", "busy") else ("warn" if status == "unknown" else "bad")
+    rows_runners.append("<tr><td>%s</td><td>%s</td><td>%s</td></tr>"
+                        % (esc(name), badge(status, kind), esc(seen)))
+
+rows_jobs = []
+for parts in jobs:
+    _, runner, started, duration, result, job = parts[:6]
+    kind = "ok" if result == "Succeeded" else ("bad" if result in ("Failed", "Cancelled") else "warn")
+    rows_jobs.append("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
+                     % (esc(runner), esc(job or "?"), badge(result, kind),
+                        esc(started or "?"), esc(duration + "s" if duration else "?")))
+
+rows_flaky = []
+for row in flaky:
+    rows_flaky.append("<tr><td>%d</td><td>%s</td><td>%s</td><td>%s</td></tr>"
+                      % (row["flips"], esc(row["last_status"]), esc(row["suite"]), esc(row["test"])))
+
+
+def table(headers, rows, empty):
+    if not rows:
+        return '<p class="empty">%s</p>' % esc(empty)
+    return "<table><thead><tr>%s</tr></thead><tbody>%s</tbody></table>" % (
+        "".join("<th>%s</th>" % esc(h) for h in headers), "".join(rows))
+
+
+page = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>runner-logs dashboard - %(host)s</title>
+<style>
+body { font-family: -apple-system, Helvetica, Arial, sans-serif; margin: 2rem; color: #1a1a1a; }
+h1 { font-size: 1.4rem; }
+h2 { font-size: 1.1rem; margin-top: 2rem; }
+.meta { color: #666; font-size: 0.85rem; }
+table { border-collapse: collapse; width: 100%%; }
+th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #ddd; font-size: 0.9rem; }
+th { background: #f5f5f5; }
+.badge { padding: 2px 8px; border-radius: 10px; font-size: 0.8rem; color: #fff; }
+.badge.ok { background: #22863a; }
+.badge.bad { background: #cb2431; }
+.badge.warn { background: #b08800; }
+.empty { color: #666; font-style: italic; }
+</style>
+</head>
+<body>
+<h1>runner-logs dashboard &mdash; %(host)s</h1>
+<p class="meta">Generated %(generated)s. Self-contained report; no external assets.</p>
+<h2>Runners</h2>
+%(runners)s
+<h2>Recent jobs</h2>
+%(jobs)s
+<h2>Top flaky tests</h2>
+%(flaky)s
+</body>
+</html>
+""" % {
+    "host": esc(host),
+    "generated": generated,
+    "runners": table(["Runner", "Status", "Last diag activity"], rows_runners, "No runners found."),
+    "jobs": table(["Runner", "Job", "Result", "Started", "Duration"], rows_jobs,
+                  "No job completions found."),
+    "flaky": table(["Flips", "Last", "Suite", "Test"], rows_flaky, "No flaky tests detected."),
+}
+
+with open(out_path, "w") as handle:
+    handle.write(page)
+PYEOF
+  step "Dashboard written to ${DASHBOARD_OUTPUT}"
+}
+
+# ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
 main() {
@@ -847,11 +1505,14 @@ main() {
   require_cmds
   detect_host
   case "${MODE}" in
-    ship)    run_ship ;;
-    metrics) run_metrics ;;
-    tail)    run_tail ;;
-    jobs)    run_jobs ;;
+    ship)      run_ship ;;
+    metrics)   run_metrics ;;
+    tail)      run_tail ;;
+    jobs)      run_jobs ;;
+    steps)     run_steps ;;
+    tests)     run_tests ;;
+    dashboard) run_dashboard ;;
   esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi

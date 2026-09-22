@@ -1,0 +1,1121 @@
+#!/usr/bin/env bash
+#
+# runner-git-mirror — local bare Git mirrors for GitHub Actions self-hosted
+# runners on macOS.
+#
+# Usage:
+#   runner-git-mirror add --repo OWNER/REPO [--url URL] [--token-file PATH]
+#   runner-git-mirror remove --repo OWNER/REPO
+#   runner-git-mirror list
+#   runner-git-mirror update [--repo OWNER/REPO]
+#   runner-git-mirror install-git-config (--runner N | --all)
+#   runner-git-mirror uninstall-git-config (--runner N | --all)
+#   runner-git-mirror status [--json]
+#   runner-git-mirror metrics
+#
+# Maintains one bare mirror per repository under
+# /opt/github-runner-git/mirrors, refreshed with `git fetch --prune` on demand
+# and by the com.github.runner-git-mirror LaunchDaemon (a StartInterval timer
+# that runs `runner-git-mirror update`). install-git-config wires each
+# runner's .env (sourced by bin/runsvc.sh before every job) to a generated
+# gitconfig via GIT_CONFIG_GLOBAL; its url.<mirror>.insteadOf rules make
+# actions/checkout clone from the local mirror while the recorded origin URL
+# stays the canonical one, and repositories without a mirror fall through to
+# the network unchanged.
+#
+# sudo is used ONLY for /opt and /Library/LaunchDaemons (mirroring
+# runner-cache / runner-setup); all git operations run as the invoking
+# non-root user. Credentials for private mirrors live in 0600 files and reach
+# git only through an askpass wrapper — never on a command line where `ps`
+# could expose them. See docs/git-mirror.md.
+
+set -euo pipefail
+
+# ----------------------------------------------------------------------------
+# Constants / globals
+# ----------------------------------------------------------------------------
+PROG_NAME="$(basename "$0")"
+PROG_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)/$(basename "${BASH_SOURCE[0]}")"
+GIT_ROOT="/opt/github-runner-git"
+MIRROR_ROOT="${GIT_ROOT}/mirrors"
+CONFIG_DIR="${GIT_ROOT}/config"
+REPOS_DIR="${CONFIG_DIR}/repos"
+TOKENS_DIR="${CONFIG_DIR}/tokens"
+STATE_DIR="${GIT_ROOT}/state"
+GITCONFIG_DIR="${GIT_ROOT}/gitconfig"
+BIN_DIR="${GIT_ROOT}/bin"
+ASKPASS_WRAPPER="${BIN_DIR}/git-mirror-askpass.sh"
+LOG_DIR="${GIT_ROOT}/logs"
+RUNNER_ROOT="/opt/github-runners"
+LAUNCH_DAEMON_DIR="/Library/LaunchDaemons"
+DAEMON_LABEL="com.github.runner-git-mirror"
+PLIST_DEST="${LAUNCH_DAEMON_DIR}/${DAEMON_LABEL}.plist"
+UPDATE_INTERVAL=300
+
+COMMAND=""
+REPO=""
+URL=""
+TOKEN_FILE=""
+RUNNER_NUM=""
+ALL_RUNNERS=0
+JSON=0
+
+# Derived from --repo.
+OWNER=""
+NAME=""
+SLUG=""
+MIRROR_PATH=""
+CONF_FILE=""
+
+# Populated during detection / setup.
+REAL_USER=""
+REAL_GROUP=""
+REAL_UID=""
+REAL_HOME=""
+WORK_TMPDIR=""
+
+# Per-mirror values loaded from config/state files.
+LAST_FETCH_EPOCH=0
+LAST_FETCH_STATUS="never"
+LAST_FETCH_DURATION_S=0
+FETCH_COUNT=0
+FAIL_COUNT=0
+
+# ----------------------------------------------------------------------------
+# Output helpers — progress goes to stderr; secrets are NEVER interpolated.
+# ----------------------------------------------------------------------------
+log()  { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
+step() { printf '\033[1;32m  ->\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[1;33mWARN:\033[0m %s\n' "$*" >&2; }
+err()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; }
+
+usage() {
+  cat >&2 <<EOF
+${PROG_NAME} — local bare Git mirrors for macOS runners
+
+USAGE:
+  ${PROG_NAME} <command> [options]
+
+COMMANDS:
+  add                 Clone a bare mirror of a repository into ${MIRROR_ROOT},
+                      record it, and install the ${DAEMON_LABEL} refresh timer
+                      (StartInterval ${UPDATE_INTERVAL}s) on first use.
+  remove              Delete a mirror, its config/token/state, and refresh any
+                      installed runner gitconfigs. Removes the refresh timer
+                      when the last mirror is removed.
+  list                List mirrored repositories with canonical URL and size.
+  update              Run git fetch --prune for one mirror (--repo) or all of
+                      them. A per-mirror lock prevents a concurrent job fetch
+                      or timer tick from corrupting a mirror mid-update.
+  install-git-config  Generate a gitconfig with url.<mirror>.insteadOf rules
+                      for every mirror and point the runner's .env at it via
+                      GIT_CONFIG_GLOBAL (bin/runsvc.sh sources .env before
+                      each job). actions/checkout then clones from the local
+                      mirror; the stored origin URL stays canonical.
+  uninstall-git-config
+                      Remove the GIT_CONFIG_GLOBAL wiring and the generated
+                      gitconfig for the selected runner(s).
+  status              Show timer state plus per-mirror freshness (last fetch,
+                      age, status) and sizes. --json emits one JSON object.
+  metrics             Aggregate fetch counters, total size, oldest mirror age,
+                      and runner git-config coverage.
+  -h, --help          Show this help and exit.
+
+OPTIONS:
+  --repo OWNER/REPO   GitHub repository (required for add/remove; optional
+                      for update — omit to update every mirror).
+  --url URL           (add) Canonical clone URL. Default:
+                      https://github.com/OWNER/REPO.git. Use for Enterprise
+                      hosts or local mirrors.
+  --token-file PATH   (add) File holding a read-only token for a PRIVATE
+                      repository. Copied to ${TOKENS_DIR}/<slug> (0600) and
+                      used only through an askpass wrapper; it never appears
+                      on a git command line.
+  --runner N          (install/uninstall-git-config) Wire runner N only.
+  --all               (install/uninstall-git-config) Wire every provisioned
+                      runner under ${RUNNER_ROOT}.
+  --json              (status) Emit one JSON object on stdout.
+
+EXAMPLES:
+  ${PROG_NAME} add --repo acme/monorepo
+  ${PROG_NAME} add --repo acme/private --token-file ~/.github-mirror-pat
+  ${PROG_NAME} update
+  ${PROG_NAME} install-git-config --all
+  ${PROG_NAME} status
+  ${PROG_NAME} metrics
+
+HOW CHECKOUT USES THE MIRROR:
+  The generated gitconfig maps each canonical URL to the local bare mirror:
+      [url "${MIRROR_ROOT}/<owner>--<repo>.git"]
+          insteadOf = <canonical-url>
+          insteadOf = <canonical-url>.git
+  git applies the rewrite at transport time only, so the clone/fetch reads
+  from the mirror while remote.origin.url in the checkout keeps the canonical
+  URL — no post-clone repair step is needed. A reverse rule maps the mirror
+  path back to the canonical URL so nothing ever treats the mirror as a
+  remote. Repositories without a mirror match no rule and use the network.
+  Re-run install-git-config after add/remove to refresh the rules (add/remove
+  also regenerate already-installed gitconfigs automatically).
+  The mirror's own fetch runs with GIT_CONFIG_GLOBAL=/dev/null and
+  GIT_CONFIG_NOSYSTEM=1 so these rewrites can never redirect it to itself.
+
+CREDENTIALS AND TRUST:
+  Mirror tokens are stored 0600 under ${TOKENS_DIR} and read by the askpass
+  wrapper (${ASKPASS_WRAPPER}) — never passed on a git command line.
+  Mirrors are PLAIN FILES readable by every job that runs as the runner user
+  on this Mac. Only mirror repositories whose full history may be visible to
+  every workload on this host; private mirrors cross no trust boundary here.
+
+EOF
+}
+
+# ----------------------------------------------------------------------------
+# Cleanup / signal traps
+# ----------------------------------------------------------------------------
+cleanup() {
+  local code=$?
+  if [[ -n "${WORK_TMPDIR}" && -d "${WORK_TMPDIR}" ]]; then
+    rm -rf "${WORK_TMPDIR}" 2>/dev/null || true
+  fi
+  return "${code}"
+}
+trap cleanup EXIT
+trap 'err "Interrupted."; exit 130' INT TERM
+
+# ----------------------------------------------------------------------------
+# Environment detection (mirrors runner-cache / runner-setup)
+# ----------------------------------------------------------------------------
+detect_platform() {
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    err "This tool only supports macOS."
+    exit 1
+  fi
+}
+
+detect_user() {
+  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+    REAL_USER="${SUDO_USER}"
+  else
+    REAL_USER="$(whoami)"
+  fi
+  if [[ "${REAL_USER}" == "root" ]]; then
+    err "Refusing to run the git mirror service as root. Run this script as a"
+    err "normal user; it uses sudo only internally for /opt and"
+    err "${LAUNCH_DAEMON_DIR}."
+    exit 1
+  fi
+  REAL_GROUP="$(id -gn "${REAL_USER}")"
+  REAL_UID="$(id -u "${REAL_USER}")"
+  # `|| true`: dscl exits non-zero for a non-local (e.g. MDM/AD) user record,
+  # and with `pipefail` that would abort the whole script before the fallback.
+  REAL_HOME="$(dscl . -read "/Users/${REAL_USER}" NFSHomeDirectory 2>/dev/null \
+    | awk '{print $2}' || true)"
+  [[ -n "${REAL_HOME}" ]] || REAL_HOME="/Users/${REAL_USER}"
+  step "Service owner: ${REAL_USER}:${REAL_GROUP} (uid ${REAL_UID}, home ${REAL_HOME})"
+}
+
+require_cmds() {
+  local missing=()
+  local c
+  for c in "$@"; do
+    command -v "${c}" >/dev/null 2>&1 || missing+=("${c}")
+  done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    err "Required command(s) not found: ${missing[*]}"
+    exit 1
+  fi
+}
+
+ensure_sudo() {
+  log "Requesting administrator privileges (needed for /opt and LaunchDaemons)"
+  if ! sudo -v; then
+    err "Could not obtain sudo privileges."
+    exit 1
+  fi
+}
+
+# Run a command as the real (non-root) user, forcing HOME/USER/LOGNAME so a
+# `sudo runner-git-mirror ...` invocation does not leak root's HOME into git.
+as_user() {
+  if [[ "$(id -un)" == "${REAL_USER}" ]]; then
+    HOME="${REAL_HOME}" USER="${REAL_USER}" LOGNAME="${REAL_USER}" "$@"
+  else
+    sudo -H -u "${REAL_USER}" env \
+      HOME="${REAL_HOME}" \
+      USER="${REAL_USER}" \
+      LOGNAME="${REAL_USER}" \
+      "$@"
+  fi
+}
+
+# Write stdin to a file owned by the real user, mode 0600. Credential bytes
+# flow through a pipe, never through argv (ps) or the (world-readable) plist.
+write_secret_file() {
+  local dest="$1"
+  as_user bash -c 'umask 077; cat > "$1" && chmod 600 "$1"' _ "${dest}"
+}
+
+# ----------------------------------------------------------------------------
+# Repo identity helpers
+# ----------------------------------------------------------------------------
+validate_repo_name() {
+  if ! [[ "${REPO}" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100}$ ]]; then
+    err "--repo must be a valid GitHub OWNER/REPO name (got: '${REPO}')."
+    exit 2
+  fi
+}
+
+# GitHub owner names cannot contain '.' or '_' and neither side can contain
+# '/', so owner--repo is an injective, filesystem-safe mirror name.
+resolve_repo() {
+  validate_repo_name
+  OWNER="${REPO%%/*}"
+  NAME="${REPO##*/}"
+  local owner_lc name_lc
+  owner_lc="$(printf '%s' "${OWNER}" | tr 'A-Z' 'a-z')"
+  name_lc="$(printf '%s' "${NAME}" | tr 'A-Z' 'a-z')"
+  SLUG="${owner_lc}--${name_lc}"
+  MIRROR_PATH="${MIRROR_ROOT}/${SLUG}.git"
+  CONF_FILE="${REPOS_DIR}/${SLUG}.env"
+}
+
+validate_url() {
+  if [[ -z "${URL}" || "${URL}" == -* || "${URL}" =~ [[:space:]] ]]; then
+    err "--url must be a non-empty URL without whitespace and must not start with '-'."
+    exit 2
+  fi
+}
+
+conf_exists() {
+  [[ -f "${CONF_FILE}" ]]
+}
+
+# Load a repo config + its fetch state. $1 = conf file path.
+load_mirror() {
+  SLUG="$(basename "$1" .env)"
+  REPO=""
+  URL=""
+  MIRROR_PATH="${MIRROR_ROOT}/${SLUG}.git"
+  # shellcheck disable=SC1090
+  . "$1"
+  LAST_FETCH_EPOCH=0
+  LAST_FETCH_STATUS="never"
+  LAST_FETCH_DURATION_S=0
+  FETCH_COUNT=0
+  FAIL_COUNT=0
+  if [[ -r "${STATE_DIR}/${SLUG}.state" ]]; then
+    # shellcheck disable=SC1090
+    . "${STATE_DIR}/${SLUG}.state"
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# Argument parsing
+# ----------------------------------------------------------------------------
+parse_args() {
+  COMMAND="${1:-}"
+  if [[ $# -gt 0 ]]; then shift; fi
+
+  case "${COMMAND}" in
+    ""|-h|--help|help)
+      usage; exit 0 ;;
+    add|remove|list|update|install-git-config|uninstall-git-config|status|metrics) ;;
+    *)
+      err "Unknown command: ${COMMAND}"
+      usage
+      exit 2 ;;
+  esac
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --repo)
+        [[ $# -ge 2 ]] || { err "--repo requires a value"; usage; exit 2; }
+        REPO="$2"; shift 2 ;;
+      --repo=*)    REPO="${1#*=}"; shift ;;
+      --url)
+        [[ $# -ge 2 ]] || { err "--url requires a value"; usage; exit 2; }
+        URL="$2"; shift 2 ;;
+      --url=*)     URL="${1#*=}"; shift ;;
+      --token-file)
+        [[ $# -ge 2 ]] || { err "--token-file requires a value"; usage; exit 2; }
+        TOKEN_FILE="$2"; shift 2 ;;
+      --token-file=*) TOKEN_FILE="${1#*=}"; shift ;;
+      --runner)
+        [[ $# -ge 2 ]] || { err "--runner requires a value"; usage; exit 2; }
+        RUNNER_NUM="$2"; shift 2 ;;
+      --runner=*)  RUNNER_NUM="${1#*=}"; shift ;;
+      --all)       ALL_RUNNERS=1; shift ;;
+      --json)      JSON=1; shift ;;
+      -h|--help)   usage; exit 0 ;;
+      *)
+        err "Unknown argument: $1"
+        usage
+        exit 2 ;;
+    esac
+  done
+
+  case "${COMMAND}" in
+    add|remove)
+      if [[ -z "${REPO}" ]]; then
+        err "${COMMAND} requires --repo OWNER/REPO."
+        usage
+        exit 2
+      fi
+      validate_repo_name
+      if [[ "${COMMAND}" == "add" && -n "${URL}" ]]; then
+        validate_url
+      fi
+      ;;
+    update)
+      [[ -z "${REPO}" ]] || validate_repo_name
+      ;;
+    install-git-config|uninstall-git-config)
+      if [[ "${ALL_RUNNERS}" -eq 1 && -n "${RUNNER_NUM}" ]]; then
+        err "Choose only one of --runner N or --all."
+        exit 2
+      fi
+      if [[ "${ALL_RUNNERS}" -ne 1 && -z "${RUNNER_NUM}" ]]; then
+        err "${COMMAND} requires --runner N or --all."
+        usage
+        exit 2
+      fi
+      if [[ -n "${RUNNER_NUM}" ]] && ! [[ "${RUNNER_NUM}" =~ ^[0-9]+$ ]]; then
+        err "--runner must be a positive integer (got: '${RUNNER_NUM}')."
+        exit 2
+      fi
+      ;;
+  esac
+}
+
+# ----------------------------------------------------------------------------
+# Askpass wrapper — private-mirror tokens reach git through GIT_ASKPASS, so
+# the secret appears in neither argv (ps) nor the world-readable plist.
+# ----------------------------------------------------------------------------
+write_askpass_wrapper() {
+  as_user mkdir -p "${BIN_DIR}"
+  as_user bash -c 'cat > "$1" && chmod 755 "$1"' _ "${ASKPASS_WRAPPER}" <<'EOF'
+#!/usr/bin/env bash
+# Generated by runner-git-mirror — do not edit; re-run `runner-git-mirror add`.
+# git invokes this with the prompt as $1. The token is read from the 0600 file
+# named by MIRROR_TOKEN_FILE at prompt time; it is never a command-line word.
+set -euo pipefail
+case "${1:-}" in
+  *[Uu]sername*) printf '%s\n' "${MIRROR_TOKEN_USER:-x-access-token}" ;;
+  *) tr -d '[:space:]' < "${MIRROR_TOKEN_FILE:?GIT_ASKPASS wrapper requires MIRROR_TOKEN_FILE}" ;;
+esac
+EOF
+}
+
+# ----------------------------------------------------------------------------
+# git plumbing — every service-side git invocation is isolated from ambient
+# configuration so installed url.insteadOf rewrites can never redirect the
+# mirror's own fetch (e.g. back to itself, which would silently go stale).
+# ----------------------------------------------------------------------------
+git_isolated() {
+  GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null "$@"
+}
+
+git_mirror_op() {
+  # $1 = token file path ("" for public mirrors); remaining args = git argv.
+  local token_file="$1"
+  shift
+  if [[ -n "${token_file}" && -f "${token_file}" ]]; then
+    GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+      GIT_ASKPASS="${ASKPASS_WRAPPER}" \
+      MIRROR_TOKEN_FILE="${token_file}" \
+      MIRROR_TOKEN_USER="x-access-token" \
+      git "$@"
+  else
+    git_isolated git "$@"
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# Fetch state (per mirror, plain KEY=VALUE file, no secrets)
+# ----------------------------------------------------------------------------
+write_state() {
+  # $1 = fetch result (ok|failed), $2 = duration in seconds
+  local result="$1" duration="$2"
+  local state="${STATE_DIR}/${SLUG}.state"
+  local prev_fetch=0 prev_fail=0
+  if [[ -r "${state}" ]]; then
+    prev_fetch="$(. "${state}"; printf '%s' "${FETCH_COUNT:-0}")"
+    prev_fail="$(. "${state}"; printf '%s' "${FAIL_COUNT:-0}")"
+  fi
+  [[ "${prev_fetch}" =~ ^[0-9]+$ ]] || prev_fetch=0
+  [[ "${prev_fail}" =~ ^[0-9]+$ ]] || prev_fail=0
+  prev_fetch=$((prev_fetch + 1))
+  [[ "${result}" == "ok" ]] || prev_fail=$((prev_fail + 1))
+  cat > "${state}" <<EOF
+REPO="${REPO}"
+URL="${URL}"
+LAST_FETCH_EPOCH="$(date +%s)"
+LAST_FETCH_STATUS="${result}"
+LAST_FETCH_DURATION_S="${duration}"
+FETCH_COUNT="${prev_fetch}"
+FAIL_COUNT="${prev_fail}"
+EOF
+}
+
+# ----------------------------------------------------------------------------
+# Locking — mkdir is atomic on macOS; a live PID inside the lock directory
+# marks an in-flight update. Stale locks (dead PID) are reclaimed.
+# ----------------------------------------------------------------------------
+lock_acquire() {
+  local mirror="$1"
+  local lockdir="${mirror}.lock"
+  local pid=""
+  if mkdir "${lockdir}" 2>/dev/null; then
+    printf '%s\n' "$$" > "${lockdir}/pid"
+    return 0
+  fi
+  if [[ -f "${lockdir}/pid" ]]; then
+    pid="$(tr -d '[:space:]' < "${lockdir}/pid")"
+  fi
+  if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+    return 1
+  fi
+  warn "Reclaiming stale lock ${lockdir} (pid ${pid:-unknown} is gone)."
+  rm -rf "${lockdir}"
+  if mkdir "${lockdir}" 2>/dev/null; then
+    printf '%s\n' "$$" > "${lockdir}/pid"
+    return 0
+  fi
+  return 1
+}
+
+lock_release() {
+  local mirror="$1"
+  local lockdir="${mirror}.lock"
+  local pid=""
+  if [[ -f "${lockdir}/pid" ]]; then
+    pid="$(tr -d '[:space:]' < "${lockdir}/pid")"
+  fi
+  # Only remove our own lock; never one reclaimed by a racing updater.
+  if [[ "${pid}" == "$$" ]]; then
+    rm -rf "${lockdir}"
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# add / remove / list / update
+# ----------------------------------------------------------------------------
+ensure_layout() {
+  if [[ ! -d "${GIT_ROOT}" ]]; then
+    log "Creating ${GIT_ROOT} (sudo) and chowning to ${REAL_USER}:${REAL_GROUP}"
+    sudo mkdir -p "${GIT_ROOT}"
+    sudo chown "${REAL_USER}:${REAL_GROUP}" "${GIT_ROOT}"
+  fi
+  as_user mkdir -p "${MIRROR_ROOT}" "${REPOS_DIR}" "${TOKENS_DIR}" \
+    "${STATE_DIR}" "${GITCONFIG_DIR}" "${BIN_DIR}" "${LOG_DIR}"
+  as_user chmod 700 "${CONFIG_DIR}" "${TOKENS_DIR}"
+}
+
+cmd_add() {
+  detect_platform
+  require_cmds git awk tr uname id dscl plutil date
+  detect_user
+  resolve_repo
+  [[ -z "${URL}" ]] && URL="https://github.com/${REPO}.git"
+  validate_url
+
+  if [[ -d "${MIRROR_PATH}" ]] || conf_exists; then
+    err "'${REPO}' is already mirrored (${MIRROR_PATH})."
+    err "Run '${PROG_NAME} update --repo ${REPO}' or remove it first."
+    exit 1
+  fi
+  if [[ -n "${TOKEN_FILE}" ]]; then
+    if [[ ! -r "${TOKEN_FILE}" ]]; then
+      err "--token-file is not readable: ${TOKEN_FILE}"
+      exit 1
+    fi
+  fi
+
+  ensure_sudo
+  ensure_layout
+  write_askpass_wrapper
+
+  local token_dest=""
+  if [[ -n "${TOKEN_FILE}" ]]; then
+    token_dest="${TOKENS_DIR}/${SLUG}"
+    write_secret_file "${token_dest}" < "${TOKEN_FILE}"
+    step "Mirror token copied to ${token_dest} (0600, never displayed)"
+  fi
+
+  log "Cloning bare mirror of ${URL} into ${MIRROR_PATH}"
+  local start now rc=0
+  start="$(date +%s)"
+  # --mirror (not --bare) configures remote.origin.fetch as +refs/*:refs/*,
+  # so `fetch --prune` tracks branch/tag deletion upstream.
+  git_mirror_op "${token_dest}" clone --mirror -- "${URL}" "${MIRROR_PATH}" || rc=$?
+  now="$(date +%s)"
+  if [[ "${rc}" -ne 0 ]]; then
+    rm -rf "${MIRROR_PATH}"
+    [[ -z "${token_dest}" ]] || rm -f "${token_dest}"
+    err "Initial mirror clone failed for ${REPO}; nothing was recorded."
+    exit 1
+  fi
+  step "Mirrored $(( $(du -sk "${MIRROR_PATH}" | awk '{print $1}') / 1024 )) MB in $((now - start))s"
+
+  cat > "${CONF_FILE}" <<EOF
+REPO="${REPO}"
+URL="${URL}"
+CREATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+EOF
+  chmod 644 "${CONF_FILE}"
+  write_state "ok" "$((now - start))"
+
+  ensure_timer
+  refresh_gitconfigs
+
+  printf '\n'
+  log "Mirror installed: ${REPO} -> ${MIRROR_PATH}"
+  log "Refresh:          every ${UPDATE_INTERVAL}s via system/${DAEMON_LABEL}, or '${PROG_NAME} update'"
+  log "Next step:        ${PROG_NAME} install-git-config --all   (route checkouts through the mirror)"
+}
+
+cmd_remove() {
+  detect_platform
+  require_cmds uname id dscl
+  detect_user
+  resolve_repo
+
+  if ! conf_exists; then
+    err "'${REPO}' is not mirrored (no ${CONF_FILE})."
+    exit 1
+  fi
+  load_mirror "${CONF_FILE}"
+
+  log "Removing mirror ${MIRROR_PATH}"
+  rm -rf "${MIRROR_PATH}" "${MIRROR_PATH}.lock"
+  rm -f "${CONF_FILE}" "${TOKENS_DIR}/${SLUG}" "${STATE_DIR}/${SLUG}.state"
+
+  refresh_gitconfigs
+
+  shopt -s nullglob
+  local remaining=("${REPOS_DIR}"/*.env)
+  shopt -u nullglob
+  if [[ ${#remaining[@]} -eq 0 ]]; then
+    teardown_timer
+  fi
+  log "Removed ${REPO}."
+}
+
+cmd_list() {
+  detect_platform
+  shopt -s nullglob
+  local confs=("${REPOS_DIR}"/*.env)
+  shopt -u nullglob
+  if [[ ${#confs[@]} -eq 0 ]]; then
+    printf 'No mirrors installed. Add one with: %s add --repo OWNER/REPO\n' "${PROG_NAME}"
+    return 0
+  fi
+  local conf size
+  printf '%-28s %-44s %s\n' "REPOSITORY" "CANONICAL URL" "SIZE"
+  for conf in "${confs[@]}"; do
+    load_mirror "${conf}"
+    if [[ -d "${MIRROR_PATH}" ]]; then
+      size="$(du -sh "${MIRROR_PATH}" 2>/dev/null | awk '{print $1}' || true)"
+    else
+      size="MISSING"
+    fi
+    printf '%-28s %-44s %s\n' "${REPO}" "${URL}" "${size:-?}"
+  done
+}
+
+cmd_update() {
+  detect_platform
+  require_cmds git awk tr date
+  local confs=()
+  shopt -s nullglob
+  if [[ -n "${REPO}" ]]; then
+    resolve_repo
+    if ! conf_exists; then
+      err "'${REPO}' is not mirrored. Add it first: ${PROG_NAME} add --repo ${REPO}"
+      exit 1
+    fi
+    confs=("${CONF_FILE}")
+  else
+    confs=("${REPOS_DIR}"/*.env)
+  fi
+  shopt -u nullglob
+
+  if [[ ${#confs[@]} -eq 0 ]]; then
+    log "No mirrors installed; nothing to update."
+    return 0
+  fi
+
+  local failures=0 conf start now rc
+  for conf in "${confs[@]}"; do
+    load_mirror "${conf}"
+    if [[ ! -d "${MIRROR_PATH}" ]]; then
+      warn "Mirror directory missing for ${REPO} (${MIRROR_PATH}); skipping."
+      failures=$((failures + 1))
+      continue
+    fi
+    if ! lock_acquire "${MIRROR_PATH}"; then
+      warn "Another update is in flight for ${REPO}; skipping this pass."
+      failures=$((failures + 1))
+      continue
+    fi
+    log "Fetching ${REPO} (${URL})"
+    start="$(date +%s)"
+    rc=0
+    git_mirror_op "${TOKENS_DIR}/${SLUG}" --git-dir="${MIRROR_PATH}" fetch --prune origin || rc=$?
+    now="$(date +%s)"
+    if [[ "${rc}" -eq 0 ]]; then
+      write_state "ok" "$((now - start))"
+      step "Updated ${REPO} in $((now - start))s"
+    else
+      write_state "failed" "$((now - start))"
+      err "Fetch failed for ${REPO} (mirror left at last good state)."
+      failures=$((failures + 1))
+    fi
+    lock_release "${MIRROR_PATH}"
+  done
+
+  if [[ "${failures}" -gt 0 ]]; then
+    err "${failures} mirror(s) failed to update."
+    return 1
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# LaunchDaemon refresh timer (StartInterval, runs `${PROG_PATH} update`)
+# ----------------------------------------------------------------------------
+bootout_system() {
+  local label="$1"
+  local _i
+  sudo launchctl bootout "system/${label}" 2>/dev/null || true
+  for _i in 1 2 3 4 5 6 7 8 9 10; do
+    sudo launchctl print "system/${label}" >/dev/null 2>&1 || return 0
+    sleep 1
+  done
+  err "Timed out waiting for system/${label} to stop; refusing to replace or remove live service files."
+  return 1
+}
+
+# Non-interactive load check for read-only commands: never prompts.
+daemon_loaded_n() {
+  sudo -n launchctl print "system/${DAEMON_LABEL}" >/dev/null 2>&1
+}
+
+ensure_timer() {
+  if [[ -f "${PLIST_DEST}" ]]; then
+    step "Refresh timer ${DAEMON_LABEL} already installed."
+    return 0
+  fi
+  WORK_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/runner-git-mirror.XXXXXX")"
+  local tmp_plist="${WORK_TMPDIR}/${DAEMON_LABEL}.plist"
+  cat > "${tmp_plist}" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${DAEMON_LABEL}</string>
+  <key>UserName</key>
+  <string>${REAL_USER}</string>
+  <key>WorkingDirectory</key>
+  <string>${GIT_ROOT}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${PROG_PATH}</string>
+    <string>update</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>${REAL_HOME}</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>StartInterval</key>
+  <integer>${UPDATE_INTERVAL}</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>${LOG_DIR}/update-stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>${LOG_DIR}/update-stderr.log</string>
+</dict>
+</plist>
+EOF
+  if ! plutil -lint "${tmp_plist}" >/dev/null 2>&1; then
+    err "Generated plist failed plutil -lint."
+    exit 1
+  fi
+  log "Installing refresh timer ${PLIST_DEST} (every ${UPDATE_INTERVAL}s)"
+  bootout_system "${DAEMON_LABEL}"
+  sudo rm -f "${PLIST_DEST}"
+  sudo cp "${tmp_plist}" "${PLIST_DEST}"
+  sudo chown root:wheel "${PLIST_DEST}"
+  sudo chmod 644 "${PLIST_DEST}"
+  as_user touch "${LOG_DIR}/update-stdout.log" "${LOG_DIR}/update-stderr.log" \
+    || warn "Could not pre-create log files in ${LOG_DIR}; launchd will create them."
+  if ! sudo launchctl bootstrap system "${PLIST_DEST}"; then
+    sleep 2
+    if ! sudo launchctl bootstrap system "${PLIST_DEST}"; then
+      warn "launchctl bootstrap failed for ${DAEMON_LABEL}; the mirror works but"
+      warn "will not auto-refresh. Re-run 'add' (after remove) or install the"
+      warn "plist manually once launchd is healthy."
+      return 0
+    fi
+  fi
+  sudo launchctl enable "system/${DAEMON_LABEL}" 2>/dev/null || true
+  step "Timer installed: system/${DAEMON_LABEL} runs '${PROG_PATH} update'."
+}
+
+teardown_timer() {
+  log "Removing refresh timer ${DAEMON_LABEL} (no mirrors remain)"
+  if ! sudo -n true 2>/dev/null; then
+    ensure_sudo
+  fi
+  bootout_system "${DAEMON_LABEL}"
+  sudo rm -f "${PLIST_DEST}"
+}
+
+# ----------------------------------------------------------------------------
+# install-git-config / uninstall-git-config
+#
+# The generated gitconfig carries, per mirror, FORWARD rules mapping the
+# canonical URL (with and without the .git suffix — git picks the longest
+# match) to the local bare mirror, plus a REVERSE rule mapping the mirror
+# path back to the canonical URL. Rewrites apply at transport time only:
+# remote.origin.url in the checkout keeps the canonical URL, so no repair
+# step is required after clone, and unmirrored repositories match nothing
+# and fall through to the network.
+# ----------------------------------------------------------------------------
+write_gitconfig() {
+  # $1 = runner name (e.g. runner-1)
+  local name="$1"
+  local file="${GITCONFIG_DIR}/${name}.gitconfig"
+  local tmp="${file}.tmp.$$"
+  {
+    printf '# Generated by runner-git-mirror — do not edit; re-run install-git-config.\n'
+    printf '# Re-applies the user global config (GIT_CONFIG_GLOBAL replaces it):\n'
+    if [[ -f "${REAL_HOME}/.gitconfig" ]]; then
+      printf '[include]\n\tpath = %s/.gitconfig\n' "${REAL_HOME}"
+    fi
+    local conf base gh_path
+    shopt -s nullglob
+    for conf in "${REPOS_DIR}"/*.env; do
+      load_mirror "${conf}"
+      base="${URL%.git}"
+      printf '[url "%s"]\n' "${MIRROR_PATH}"
+      printf '\tinsteadOf = %s\n' "${base}"
+      printf '\tinsteadOf = %s.git\n' "${base}"
+      if [[ "${base}" =~ ^https://github\.com/(.+)$ ]]; then
+        gh_path="${BASH_REMATCH[1]}"
+        printf '\tinsteadOf = git@github.com:%s\n' "${gh_path}"
+        printf '\tinsteadOf = git@github.com:%s.git\n' "${gh_path}"
+        printf '\tinsteadOf = ssh://git@github.com/%s\n' "${gh_path}"
+        printf '\tinsteadOf = ssh://git@github.com/%s.git\n' "${gh_path}"
+      fi
+      # Reverse repair: any use of the mirror path resolves to canonical.
+      printf '[url "%s.git"]\n\tinsteadOf = %s\n' "${base}" "${MIRROR_PATH}"
+    done
+    shopt -u nullglob
+  } > "${tmp}"
+  chmod 644 "${tmp}"
+  mv "${tmp}" "${file}"
+}
+
+# Regenerate every installed runner gitconfig so add/remove take effect
+# without a manual re-run of install-git-config.
+refresh_gitconfigs() {
+  shopt -s nullglob
+  local installed=("${GITCONFIG_DIR}"/*.gitconfig)
+  shopt -u nullglob
+  # bash 3.2 (macOS /bin/bash) errors on "${empty[@]}" under set -u.
+  [[ ${#installed[@]} -eq 0 ]] && return 0
+  local f name
+  for f in "${installed[@]}"; do
+    name="$(basename "${f}" .gitconfig)"
+    write_gitconfig "${name}"
+    step "Refreshed ${f}"
+  done
+}
+
+selected_runners() {
+  # Prints runner dir names (runner-N), one per line.
+  if [[ "${ALL_RUNNERS}" -eq 1 ]]; then
+    local d
+    shopt -s nullglob
+    for d in "${RUNNER_ROOT}"/runner-*; do
+      [[ -d "${d}" ]] || continue
+      basename "${d}"
+    done
+    shopt -u nullglob
+  else
+    printf 'runner-%s\n' "$((10#${RUNNER_NUM}))"
+  fi
+}
+
+cmd_install_git_config() {
+  detect_platform
+  require_cmds git uname id dscl
+  detect_user
+
+  shopt -s nullglob
+  local confs=("${REPOS_DIR}"/*.env)
+  shopt -u nullglob
+  if [[ ${#confs[@]} -eq 0 ]]; then
+    err "No mirrors installed. Add one first: ${PROG_NAME} add --repo OWNER/REPO"
+    exit 1
+  fi
+
+  local names name dir env_file line installed=0
+  names="$(selected_runners)"
+  if [[ -z "${names}" ]]; then
+    err "No runners found under ${RUNNER_ROOT} (provision with runner-setup first)."
+    exit 1
+  fi
+  while IFS= read -r name; do
+    [[ -n "${name}" ]] || continue
+    dir="${RUNNER_ROOT}/${name}"
+    if [[ ! -d "${dir}" ]]; then
+      err "Runner ${name} is not provisioned (no ${dir})."
+      exit 1
+    fi
+    write_gitconfig "${name}"
+    env_file="${dir}/.env"
+    line="GIT_CONFIG_GLOBAL=${GITCONFIG_DIR}/${name}.gitconfig"
+    as_user touch "${env_file}"
+    if grep -qxF "${line}" "${env_file}" 2>/dev/null; then
+      step "${name}: .env already wired"
+    else
+      as_user bash -c 'printf "%s\n" "$1" >> "$2"' _ "${line}" "${env_file}"
+      step "${name}: added ${line} to .env (sourced by bin/runsvc.sh)"
+    fi
+    installed=$((installed + 1))
+  done <<< "${names}"
+
+  printf '\n'
+  log "Wired ${installed} runner(s) to the git mirrors."
+  log "Checkouts of mirrored repos now read from ${MIRROR_ROOT}; origin URLs stay canonical."
+  log "Restart idle runners (sudo launchctl kickstart -k system/com.github.<name>) to pick up .env."
+}
+
+cmd_uninstall_git_config() {
+  detect_platform
+  require_cmds uname id dscl
+  detect_user
+
+  local names name dir env_file line perms tmp
+  names="$(selected_runners)"
+  if [[ -z "${names}" ]]; then
+    log "No runners found under ${RUNNER_ROOT}; nothing to uninstall."
+    return 0
+  fi
+  while IFS= read -r name; do
+    [[ -n "${name}" ]] || continue
+    dir="${RUNNER_ROOT}/${name}"
+    if [[ ! -d "${dir}" ]]; then
+      warn "Runner ${name} is not provisioned; skipping."
+      continue
+    fi
+    env_file="${dir}/.env"
+    line="GIT_CONFIG_GLOBAL=${GITCONFIG_DIR}/${name}.gitconfig"
+    if [[ -f "${env_file}" ]] && grep -qxF "${line}" "${env_file}" 2>/dev/null; then
+      perms="$(stat -f '%Lp' "${env_file}" 2>/dev/null || printf '644')"
+      tmp="${env_file}.tmp.$$"
+      grep -vxF "${line}" "${env_file}" > "${tmp}" || true
+      chmod "${perms}" "${tmp}"
+      mv "${tmp}" "${env_file}"
+      step "${name}: removed GIT_CONFIG_GLOBAL from .env"
+    fi
+    if [[ -f "${GITCONFIG_DIR}/${name}.gitconfig" ]]; then
+      rm -f "${GITCONFIG_DIR}/${name}.gitconfig"
+      step "${name}: removed generated gitconfig"
+    fi
+  done <<< "${names}"
+  log "Git mirror wiring removed; checkouts use the network again."
+}
+
+# ----------------------------------------------------------------------------
+# status / metrics
+# ----------------------------------------------------------------------------
+json_escape() {
+  printf '%s' "$1" \
+    | tr -d '\000-\010\013-\037' \
+    | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/\\t/g'
+}
+
+human_age() {
+  # $1 = seconds
+  local s="$1"
+  if [[ "${s}" -lt 60 ]]; then
+    printf '%ds' "${s}"
+  elif [[ "${s}" -lt 3600 ]]; then
+    printf '%dm' $((s / 60))
+  elif [[ "${s}" -lt 86400 ]]; then
+    printf '%dh' $((s / 3600))
+  else
+    printf '%dd' $((s / 86400))
+  fi
+}
+
+mirror_size_kb() {
+  local kb=""
+  if [[ -d "${MIRROR_PATH}" ]]; then
+    kb="$(du -sk "${MIRROR_PATH}" 2>/dev/null | awk '{print $1}' || true)"
+  fi
+  [[ "${kb}" =~ ^[0-9]+$ ]] || kb=0
+  printf '%s' "${kb}"
+}
+
+# Runner coverage: provisioned runners whose .env points at a generated
+# gitconfig, over all provisioned runners. This is WIRING coverage — actual
+# checkout hit rates are not observable from the host.
+runner_coverage() {
+  local detected=0 configured=0 d
+  shopt -s nullglob
+  for d in "${RUNNER_ROOT}"/runner-*; do
+    [[ -d "${d}" ]] || continue
+    detected=$((detected + 1))
+    if [[ -f "${d}/.env" ]] && grep -q "^GIT_CONFIG_GLOBAL=${GITCONFIG_DIR}/" "${d}/.env" 2>/dev/null; then
+      configured=$((configured + 1))
+    fi
+  done
+  shopt -u nullglob
+  printf '%s %s' "${configured}" "${detected}"
+}
+
+cmd_status() {
+  detect_platform
+  require_cmds awk sed tr date du
+  shopt -s nullglob
+  local confs=("${REPOS_DIR}"/*.env)
+  shopt -u nullglob
+
+  local loaded=false
+  daemon_loaded_n && loaded=true
+
+  if [[ "${JSON}" -eq 1 ]]; then
+    local now conf first=1 mirrors="" age
+    now="$(date +%s)"
+    if [[ ${#confs[@]} -gt 0 ]]; then
+      for conf in "${confs[@]}"; do
+        load_mirror "${conf}"
+        if [[ "${LAST_FETCH_EPOCH}" -gt 0 ]]; then
+          age=$((now - LAST_FETCH_EPOCH))
+        else
+          age=null
+        fi
+        [[ "${first}" -eq 1 ]] && first=0 || mirrors="${mirrors},"
+        mirrors="${mirrors}{\"repo\":\"$(json_escape "${REPO}")\",\"url\":\"$(json_escape "${URL}")\",\"mirror\":\"$(json_escape "${MIRROR_PATH}")\",\"size_kb\":$(mirror_size_kb),\"last_fetch_epoch\":${LAST_FETCH_EPOCH},\"age_s\":${age},\"last_fetch_status\":\"$(json_escape "${LAST_FETCH_STATUS}")\",\"fetch_count\":${FETCH_COUNT},\"fail_count\":${FAIL_COUNT}}"
+      done
+    fi
+    local coverage configured detected
+    coverage="$(runner_coverage)"
+    configured="${coverage%% *}"
+    detected="${coverage##* }"
+    printf '{"daemon":"%s","launchd_loaded":%s,"mirror_root":"%s","update_interval_s":%s,"runners_configured":%s,"runners_detected":%s,"mirrors":[%s]}\n' \
+      "$(json_escape "${DAEMON_LABEL}")" "${loaded}" "$(json_escape "${MIRROR_ROOT}")" \
+      "${UPDATE_INTERVAL}" "${configured}" "${detected}" "${mirrors}"
+    return 0
+  fi
+
+  local now
+  now="$(date +%s)"
+  printf '\n'
+  printf '==> runner-git-mirror status\n'
+  printf '  %-22s %s\n' "Timer:" "${DAEMON_LABEL} (every ${UPDATE_INTERVAL}s)"
+  if [[ "${loaded}" == true ]]; then
+    printf '  %-22s %s\n' "launchd:" "loaded"
+  else
+    printf '  %-22s %s\n' "launchd:" "NOT loaded (or requires sudo to inspect)"
+  fi
+  printf '  %-22s %s\n' "Mirror root:" "${MIRROR_ROOT}"
+  if [[ ${#confs[@]} -eq 0 ]]; then
+    printf '  %-22s %s\n' "Mirrors:" "(none — add one with '${PROG_NAME} add --repo OWNER/REPO')"
+  fi
+  local conf size age
+  if [[ ${#confs[@]} -gt 0 ]]; then
+    for conf in "${confs[@]}"; do
+      load_mirror "${conf}"
+      size="$(du -sh "${MIRROR_PATH}" 2>/dev/null | awk '{print $1}' || true)"
+      printf '  %s\n' "${REPO}"
+      printf '    %-20s %s\n' "url:" "${URL}"
+      printf '    %-20s %s (%s)\n' "mirror:" "${MIRROR_PATH}" "${size:-missing}"
+      if [[ "${LAST_FETCH_EPOCH}" -gt 0 ]]; then
+        age="$(human_age $((now - LAST_FETCH_EPOCH)))"
+        printf '    %-20s %s (%s ago, %s, %ss)\n' "last fetch:" \
+          "$(date -u -r "${LAST_FETCH_EPOCH}" +%Y-%m-%dT%H:%M:%SZ)" \
+          "${age}" "${LAST_FETCH_STATUS}" "${LAST_FETCH_DURATION_S}"
+      else
+        printf '    %-20s %s\n' "last fetch:" "never"
+      fi
+      printf '    %-20s %s (%s failed)\n' "fetches:" "${FETCH_COUNT}" "${FAIL_COUNT}"
+    done
+  fi
+  printf '\n'
+}
+
+cmd_metrics() {
+  detect_platform
+  require_cmds awk date du
+  shopt -s nullglob
+  local confs=("${REPOS_DIR}"/*.env)
+  shopt -u nullglob
+
+  local now conf total_kb=0 fetches=0 failures=0 oldest_age=0 oldest_repo="" age kb
+  now="$(date +%s)"
+  if [[ ${#confs[@]} -gt 0 ]]; then
+    for conf in "${confs[@]}"; do
+      load_mirror "${conf}"
+      kb="$(mirror_size_kb)"
+      total_kb=$((total_kb + kb))
+      fetches=$((fetches + FETCH_COUNT))
+      failures=$((failures + FAIL_COUNT))
+      if [[ "${LAST_FETCH_EPOCH}" -gt 0 ]]; then
+        age=$((now - LAST_FETCH_EPOCH))
+        if [[ "${age}" -gt "${oldest_age}" ]]; then
+          oldest_age="${age}"
+          oldest_repo="${REPO}"
+        fi
+      fi
+    done
+  fi
+  local coverage configured detected
+  coverage="$(runner_coverage)"
+  configured="${coverage%% *}"
+  detected="${coverage##* }"
+
+  printf '\n'
+  printf '==> runner-git-mirror metrics\n'
+  printf '  %-34s %s\n' "Mirrors installed:" "${#confs[@]}"
+  printf '  %-34s %s KB\n' "Total mirror size:" "${total_kb}"
+  printf '  %-34s %s (%s failed)\n' "Fetch operations:" "${fetches}" "${failures}"
+  if [[ -n "${oldest_repo}" ]]; then
+    printf '  %-34s %s (%s)\n' "Oldest mirror age:" "$(human_age "${oldest_age}")" "${oldest_repo}"
+  else
+    printf '  %-34s %s\n' "Oldest mirror age:" "n/a (no fetch recorded)"
+  fi
+  printf '  %-34s %s of %s runners wired\n' "Git-config coverage:" "${configured}" "${detected}"
+  printf '  %-34s %s\n' "Checkout hit rate:" "unavailable from host state; measure clone time in jobs."
+  printf '\n'
+  log "Freshness per mirror: ${PROG_NAME} status [--json]"
+}
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+main() {
+  parse_args "$@"
+  case "${COMMAND}" in
+    add)                  cmd_add ;;
+    remove)               cmd_remove ;;
+    list)                 cmd_list ;;
+    update)               cmd_update ;;
+    install-git-config)   cmd_install_git_config ;;
+    uninstall-git-config) cmd_uninstall_git_config ;;
+    status)               cmd_status ;;
+    metrics)              cmd_metrics ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

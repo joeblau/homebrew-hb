@@ -44,43 +44,74 @@ elif name == "colima":
     if args[:2] == ["start", "default"]:
         state["colima_running"] = True
         save()
+    elif args[:1] == ["ssh"]:
+        (root / "vm_stdin.txt").write_text(sys.stdin.read())
     else:
         sys.exit(99)
 elif name == "docker":
-    if args == ["--version"]:
-        print("Docker version test")
-    elif args == ["buildx", "version"]:
-        plugin = pathlib.Path(os.environ["DOCKER_CONFIG"]) / "cli-plugins/docker-buildx"
-        sys.exit(0 if state.get("plugin_available", True) or plugin.is_file() else 1)
-    elif args[:1] == ["--host"]:
-        assert args[2:] == ["info", "--format", "{{.OSType}}"]
+    a = list(args)
+    if a[:1] in (["--host"], ["--context"]):
         if state.get("unreachable"):
             sys.exit(1)
+        a = a[2:]
+    if a == ["--version"]:
+        print("Docker version test")
+    elif a == ["info"]:
+        pass
+    elif a == ["info", "--format", "{{.OSType}}"]:
         print(state.get("remote_os", "linux"))
-    elif args[:1] == ["--context"]:
-        assert args[2:] == ["info"]
-    elif args[:2] == ["buildx", "inspect"]:
-        rest = [a for a in args[2:] if a != "--bootstrap"]
+    elif a == ["buildx", "version"]:
+        plugin = pathlib.Path(os.environ["DOCKER_CONFIG"]) / "cli-plugins/docker-buildx"
+        sys.exit(0 if state.get("plugin_available", True) or plugin.is_file() else 1)
+    elif a[:2] == ["buildx", "inspect"]:
+        rest = [x for x in a[2:] if x != "--bootstrap"]
         inspect(rest[0] if rest else state.get("selected", "runner-remote"))
-    elif args[:2] == ["buildx", "create"]:
-        builder = args[args.index("--name") + 1]
+    elif a[:2] == ["buildx", "create"]:
+        builder = a[a.index("--name") + 1]
         assert builder not in state.get("builders", {}), "duplicate builder creation"
         state.setdefault("builders", {})[builder] = {
-            "driver": args[args.index("--driver") + 1], "endpoint": args[-1]
+            "driver": a[a.index("--driver") + 1], "endpoint": a[-1]
         }
         save()
-    elif args[:2] == ["buildx", "use"]:
-        state["selected"] = args[-1]
+    elif a[:2] == ["buildx", "use"]:
+        state["selected"] = a[-1]
         save()
-    elif args == ["buildx", "ls"]:
+    elif a == ["buildx", "ls"]:
         print("NAME/NODE DRIVER/ENDPOINT STATUS")
         print(state.get("selected", "runner-remote") + "* docker-container")
-    elif args == ["context", "show"]:
+    elif a[:2] == ["buildx", "du"]:
+        # No du_total recorded behaves like an unavailable builder (exit 1), so
+        # status --json reports cache_total null; gc tests opt in via state.
+        if "du_total" not in state:
+            sys.exit(1)
+        print("Reclaimable: 5GB")
+        print("Total: " + state["du_total"])
+    elif a == ["context", "show"]:
         print(state.get("context", "desktop-linux"))
-    elif args == ["context", "inspect", "desktop-linux"]:
+    elif a == ["context", "inspect", "desktop-linux"]:
         sys.exit(0 if state.get("desktop_available", True) else 1)
-    elif args == ["context", "use", "desktop-linux"]:
+    elif a == ["context", "use", "desktop-linux"]:
         state["context"] = "desktop-linux"
+        save()
+    elif a[:1] == ["inspect"]:
+        container = state.get("containers", {}).get(a[-1])
+        if container is None:
+            sys.exit(1)
+        print("true" if container.get("running") else "false")
+    elif a[:1] == ["run"]:
+        container = a[a.index("--name") + 1]
+        assert container not in state.get("containers", {}), "duplicate container"
+        state.setdefault("containers", {})[container] = {"running": True}
+        save()
+        print("fake-container-id")
+    elif a[:1] == ["start"]:
+        state["containers"][a[-1]]["running"] = True
+        save()
+    elif a[:1] == ["rm"]:
+        state.get("containers", {}).pop(a[-1], None)
+        save()
+    elif a[:2] == ["volume", "rm"]:
+        state.setdefault("volumes_removed", []).append(a[-1])
         save()
     else:
         sys.exit(99)
@@ -227,6 +258,112 @@ class BuilderTests(unittest.TestCase):
     def test_invalid_size_fails_before_install_or_provisioning(self):
         self.run_helper("setup-colima", "--cpu", "0", success=False)
         self.assertEqual(self.calls(), [])
+
+    def gc_config(self, builder="runner-remote"):
+        return self.config / "buildkitd" / f"{builder}.toml"
+
+    def test_gc_configure_writes_policy_applied_at_creation(self):
+        self.run_helper("gc", "configure", "--builder", "runner-remote", "--keep-bytes", "30")
+        cfg = self.gc_config().read_text()
+        self.assertIn('reservedSpace = "10GB"', cfg)
+        self.assertIn('maxUsedSpace = "50GB"', cfg)
+        self.assertIn("keepBytes = 32212254720", cfg)
+        self.assertIn("keepDuration = 172800", cfg)
+        self.remote()
+        create = next(c for c in self.calls() if c[:3] == ["docker", "buildx", "create"])
+        self.assertIn("--config", create)
+        self.assertIn(str(self.gc_config()), create)
+
+    def test_gc_configure_existing_builder_never_recreates_it(self):
+        self.write_state({"builders": {"runner-remote": {"driver": "docker-container", "endpoint": "ssh://ci@builder:2222"}}})
+        result = self.run_helper("gc", "configure", "--builder", "runner-remote")
+        self.assertIn("rm --keep-state", result.stderr)
+        self.assertIn("cache are unchanged", result.stderr)
+        self.assertFalse(any(c[:3] in [["docker", "buildx", "rm"], ["docker", "buildx", "create"]] for c in self.calls()))
+
+    def test_gc_configure_rejects_nonpositive_sizes(self):
+        self.run_helper("gc", "configure", "--builder", "runner-remote", "--keep-bytes", "0", success=False)
+        self.assertFalse(self.gc_config().exists())
+
+    def test_gc_status_reports_buildkit_disk_usage(self):
+        self.remote()
+        state = json.loads((self.root / "state.json").read_text())
+        state["du_total"] = "8GB"
+        self.write_state(state)
+        result = self.run_helper("gc", "status")
+        self.assertIn("Total: 8GB", result.stdout)
+        self.assertIn("runner-remote", result.stderr)
+
+    def test_gc_configure_colima_vm_writes_buildkitd_toml_inside_vm(self):
+        self.write_state({"colima_running": True})
+        result = self.run_helper("gc", "configure", "--colima-vm", "--max-used-space", "80")
+        vm_config = (self.root / "vm_stdin.txt").read_text()
+        self.assertIn('maxUsedSpace = "80GB"', vm_config)
+        self.assertIn("[worker.oci]", vm_config)
+        ssh_call = next(c for c in self.calls() if c[:2] == ["colima", "ssh"])
+        self.assertIn("/etc/buildkit/buildkitd.toml", ssh_call[-1])
+        self.assertIn("colima stop && colima start", result.stderr)
+
+    def test_registry_mirror_setup_wires_container_buildkit_and_daemon(self):
+        self.write_state({"colima_running": True})
+        result = self.run_helper("registry-mirror", "setup", "--builder", "runner-colima")
+        run = next(c for c in self.calls() if c[:2] == ["docker", "--context"] and "run" in c)
+        self.assertIn("runner-registry-mirror", run)
+        self.assertIn("127.0.0.1:5001:5000", run)
+        self.assertIn("REGISTRY_PROXY_REMOTEURL=https://registry-1.docker.io", run)
+        self.assertIn("registry:2", run)
+        toml = self.gc_config("runner-colima").read_text()
+        self.assertIn('[registry."docker.io"]', toml)
+        self.assertIn('mirrors = ["127.0.0.1:5001"]', toml)
+        daemon = json.loads((self.root / ".colima/docker/daemon.json").read_text())
+        self.assertEqual(daemon["registry-mirrors"], ["http://127.0.0.1:5001"])
+        self.assertIn("WORKFLOW-FACING NOTES", result.stderr)
+
+    def test_registry_mirror_setup_reuses_running_container(self):
+        self.write_state({"colima_running": True})
+        self.run_helper("registry-mirror", "setup", "--builder", "runner-colima")
+        result = self.run_helper("registry-mirror", "setup", "--builder", "runner-colima")
+        self.assertIn("Reusing running mirror container", result.stderr)
+        runs = [c for c in self.calls() if c[:1] == ["docker"] and "run" in c]
+        self.assertEqual(len(runs), 1)
+
+    def test_registry_mirror_rejects_public_bind(self):
+        self.write_state({"colima_running": True})
+        self.run_helper("registry-mirror", "setup", "--bind", "0.0.0.0", success=False)
+        self.assertFalse(any(c[:1] == ["docker"] and "run" in c for c in self.calls()))
+
+    def test_registry_mirror_teardown_removes_wiring_but_keeps_data(self):
+        self.write_state({"colima_running": True})
+        self.run_helper("registry-mirror", "setup", "--builder", "runner-colima")
+        result = self.run_helper("registry-mirror", "teardown")
+        self.assertIn(["docker", "--context", "colima", "rm", "-f", "runner-registry-mirror"], self.calls())
+        self.assertFalse(any("volume" in c for c in self.calls()))
+        self.assertIn("kept", result.stderr)
+        self.assertNotIn('[registry."docker.io"]', self.gc_config("runner-colima").read_text())
+        daemon = json.loads((self.root / ".colima/docker/daemon.json").read_text())
+        self.assertNotIn("registry-mirrors", daemon)
+
+    def test_registry_mirror_teardown_remove_data_deletes_volume(self):
+        self.write_state({"colima_running": True})
+        self.run_helper("registry-mirror", "setup", "--builder", "runner-colima")
+        self.run_helper("registry-mirror", "teardown", "--remove-data")
+        self.assertIn(["docker", "--context", "colima", "volume", "rm", "runner-registry-mirror-data"], self.calls())
+
+    def test_registry_mirror_status_reports_endpoint_and_wiring(self):
+        self.write_state({"colima_running": True})
+        self.run_helper("registry-mirror", "setup", "--builder", "runner-colima")
+        result = self.run_helper("registry-mirror", "status")
+        self.assertIn("running", result.stderr)
+        self.assertIn("http://127.0.0.1:5001", result.stderr)
+        self.assertIn("buildkit wired: runner-colima", result.stderr)
+
+    def test_mirrored_builder_is_created_with_host_network(self):
+        self.write_state({"colima_running": True})
+        self.run_helper("registry-mirror", "setup", "--builder", "runner-remote")
+        self.remote()
+        create = next(c for c in self.calls() if c[:3] == ["docker", "buildx", "create"])
+        self.assertIn("--config", create)
+        self.assertEqual(create[create.index("--driver-opt") + 1], "network=host")
 
 
 if __name__ == "__main__":

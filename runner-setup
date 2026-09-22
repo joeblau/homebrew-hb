@@ -42,6 +42,12 @@ NAME_PREFIX=""        # GitHub runner-name prefix; defaults to this machine's na
 NAME_PREFIX_SET=0     # 1 once --name-prefix was given (even if empty)
 EPHEMERAL=0           # 1 => LaunchDaemon runs runner-ephemeral, not runsvc.sh
 EPHEMERAL_BIN=""      # resolved absolute path of the runner-ephemeral supervisor
+TOOL_CACHE_DIR=""     # --tool-cache-dir override; default is per-runner DIR/_toolcache
+RAM_SCRATCH=0         # --ram-scratch: opt into RAM-backed per-job build scratch
+RAM_SCRATCH_BUDGET_MB=0  # --ram-scratch-budget-mb: host-wide total across runners
+RAM_SCRATCH_JOB_MB=0     # --ram-scratch-job-mb: per-runner per-job share
+RAM_SCRATCH_MIN_FREE_MB=0  # --ram-scratch-min-free-mb (0 = helper default)
+RAMSCRATCH_BIN=""     # resolved absolute path of the runner-ramscratch helper
 
 # Derived from the chosen registration scope (--org / --repo / --url).
 RUNNER_URL=""
@@ -118,6 +124,37 @@ OPTIONS:
                         mode-600 .github_pat file per runner dir) with
                         admin:org (org runners) or repo (repo runners) scope.
                         See docs/ephemeral-runners.md.
+  --tool-cache-dir DIR  Persistent tool cache location exported to every runner
+                        as AGENT_TOOLSDIRECTORY (the runner also exposes it to
+                        job steps as RUNNER_TOOL_CACHE; the setup-* actions
+                        install there). Default: a per-runner
+                        RUNNER_DIR/_toolcache, OUTSIDE the disposable _work
+                        tree, so ephemeral job resets keep installed tools and
+                        two runners never write a shared cache. Must be an
+                        absolute path outside any runner's _work. Pointing
+                        several runners at ONE shared DIR is at your own risk:
+                        setup-* actions tolerate concurrent reads, but
+                        concurrent first-time installs of the same tool
+                        version can race.
+  --ram-scratch       Opt into RAM-backed per-job build scratch (requires
+                      --ephemeral). The LaunchDaemons pass --ram-scratch to the
+                      runner-ephemeral supervisor, which allocates a bounded,
+                      per-job scratch directory on the host's shared RAM volume
+                      before each job and exposes it to job steps as
+                      RUNNER_RAM_SCRATCH (SSD fallback when unavailable). See
+                      docs/ram-scratch.md.
+  --ram-scratch-budget-mb N
+                      Host-wide total RAM scratch budget in MB across ALL
+                      runners (required with --ram-scratch; written to the
+                      runner-ramscratch config). Must be smaller than physical
+                      RAM; the helper also enforces a memory-headroom floor.
+  --ram-scratch-job-mb N
+                      Per-runner per-job share of the budget (required with
+                      --ram-scratch). N runners each take up to this share, so
+                      keep job-mb x --runners <= budget-mb.
+  --ram-scratch-min-free-mb N
+                      Memory (free + inactive) that must remain after any
+                      allocation (default: the helper's 4096).
   -h, --help            Show this help and exit
 
 EXAMPLES:
@@ -196,6 +233,23 @@ parse_args() {
         NAME_PREFIX="$2"; NAME_PREFIX_SET=1; shift 2 ;;
       --name-prefix=*) NAME_PREFIX="${1#*=}"; NAME_PREFIX_SET=1; shift ;;
       --ephemeral) EPHEMERAL=1; shift ;;
+      --tool-cache-dir)
+        [[ $# -ge 2 ]] || { err "--tool-cache-dir requires a value"; usage; exit 2; }
+        TOOL_CACHE_DIR="$2"; shift 2 ;;
+      --tool-cache-dir=*) TOOL_CACHE_DIR="${1#*=}"; shift ;;
+      --ram-scratch) RAM_SCRATCH=1; shift ;;
+      --ram-scratch-budget-mb)
+        [[ $# -ge 2 ]] || { err "--ram-scratch-budget-mb requires a value"; usage; exit 2; }
+        RAM_SCRATCH_BUDGET_MB="$2"; shift 2 ;;
+      --ram-scratch-budget-mb=*) RAM_SCRATCH_BUDGET_MB="${1#*=}"; shift ;;
+      --ram-scratch-job-mb)
+        [[ $# -ge 2 ]] || { err "--ram-scratch-job-mb requires a value"; usage; exit 2; }
+        RAM_SCRATCH_JOB_MB="$2"; shift 2 ;;
+      --ram-scratch-job-mb=*) RAM_SCRATCH_JOB_MB="${1#*=}"; shift ;;
+      --ram-scratch-min-free-mb)
+        [[ $# -ge 2 ]] || { err "--ram-scratch-min-free-mb requires a value"; usage; exit 2; }
+        RAM_SCRATCH_MIN_FREE_MB="$2"; shift 2 ;;
+      --ram-scratch-min-free-mb=*) RAM_SCRATCH_MIN_FREE_MB="${1#*=}"; shift ;;
       -h|--help)   usage; exit 0 ;;
       *)
         err "Unknown argument: $1"
@@ -230,6 +284,56 @@ parse_args() {
   if ! [[ "${RUNNERS}" =~ ^[0-9]+$ ]] || [[ "${RUNNERS}" -lt 1 ]]; then
     err "--runners must be a positive integer (got: '${RUNNERS}')"
     exit 2
+  fi
+
+  # The tool cache must live outside any runner's disposable _work tree:
+  # ephemeral resets delete _work, so a cache inside it cannot persist.
+  if [[ -n "${TOOL_CACHE_DIR}" ]]; then
+    while [[ "${TOOL_CACHE_DIR}" == */ && "${TOOL_CACHE_DIR}" != "/" ]]; do
+      TOOL_CACHE_DIR="${TOOL_CACHE_DIR%/}"
+    done
+    case "${TOOL_CACHE_DIR}" in
+      /*) ;;
+      *)
+        err "--tool-cache-dir must be an absolute path (got: '${TOOL_CACHE_DIR}')"
+        exit 2 ;;
+    esac
+    case "${TOOL_CACHE_DIR}" in
+      */_work|*/_work/*)
+        err "--tool-cache-dir must live outside every runner's _work directory."
+        exit 2 ;;
+    esac
+  fi
+
+  # Opt-in RAM scratch: per-job lifecycle needs the ephemeral supervisor, and
+  # sizing must be explicit — a host-wide budget plus this fleet's per-job
+  # share (which can never exceed the budget).
+  if [[ "${RAM_SCRATCH}" -eq 1 ]]; then
+    if [[ "${EPHEMERAL}" -ne 1 ]]; then
+      err "--ram-scratch requires --ephemeral: per-job scratch lifecycle hooks"
+      err "live in the runner-ephemeral supervisor."
+      exit 2
+    fi
+    if ! [[ "${RAM_SCRATCH_BUDGET_MB}" =~ ^[0-9]+$ ]] || [[ "${RAM_SCRATCH_BUDGET_MB}" -lt 1 ]]; then
+      err "--ram-scratch requires an explicit --ram-scratch-budget-mb N"
+      err "(host-wide total across ALL runners; got: '${RAM_SCRATCH_BUDGET_MB}')"
+      exit 2
+    fi
+    if ! [[ "${RAM_SCRATCH_JOB_MB}" =~ ^[0-9]+$ ]] || [[ "${RAM_SCRATCH_JOB_MB}" -lt 1 ]]; then
+      err "--ram-scratch requires an explicit --ram-scratch-job-mb N"
+      err "(per-runner per-job share; got: '${RAM_SCRATCH_JOB_MB}')"
+      exit 2
+    fi
+    if [[ "${RAM_SCRATCH_JOB_MB}" -gt "${RAM_SCRATCH_BUDGET_MB}" ]]; then
+      err "--ram-scratch-job-mb (${RAM_SCRATCH_JOB_MB}) exceeds the host-wide"
+      err "--ram-scratch-budget-mb (${RAM_SCRATCH_BUDGET_MB}); it could never allocate."
+      exit 2
+    fi
+    if [[ "${RAM_SCRATCH_MIN_FREE_MB}" != "0" ]] \
+        && ! [[ "${RAM_SCRATCH_MIN_FREE_MB}" =~ ^[0-9]+$ ]]; then
+      err "--ram-scratch-min-free-mb must be a non-negative integer (got: '${RAM_SCRATCH_MIN_FREE_MB}')"
+      exit 2
+    fi
   fi
 
   # Resolve the registration URL and a scope slug. The slug is only used to spot
@@ -495,6 +599,28 @@ prepare_root_dir() {
 }
 
 # ----------------------------------------------------------------------------
+# Opt-in RAM scratch (--ram-scratch): write the host-wide runner-ramscratch
+# config (owned by the runner user, mode 600) so the supervisor's per-cycle
+# allocations enforce one shared budget across every runner on this host.
+# ----------------------------------------------------------------------------
+write_ramscratch_config() {
+  [[ "${RAM_SCRATCH}" -eq 1 ]] || return 0
+  local state_dir="${RUNNER_ROOT}/_ramscratch"
+  local config="${state_dir}/config"
+  if ! as_user mkdir -p "${state_dir}"; then
+    err "Could not create RAM scratch state dir ${state_dir}."
+    return 1
+  fi
+  {
+    printf 'TOTAL_BUDGET_MB=%s\n' "${RAM_SCRATCH_BUDGET_MB}"
+    if [[ "${RAM_SCRATCH_MIN_FREE_MB}" != "0" ]]; then
+      printf 'MIN_FREE_MEMORY_MB=%s\n' "${RAM_SCRATCH_MIN_FREE_MB}"
+    fi
+  } | as_user sh -c 'umask 077 && cat > "$1"' _ "${config}" || return 1
+  step "RAM scratch config: ${config} (host-wide budget ${RAM_SCRATCH_BUDGET_MB} MB)"
+}
+
+# ----------------------------------------------------------------------------
 # Per-runner provisioning
 # ----------------------------------------------------------------------------
 record_status() {
@@ -608,6 +734,18 @@ configure_runner() {
   sudo chown -R "${REAL_USER}:${REAL_GROUP}" "${dir}"
   xattr -rc "${dir}" 2>/dev/null || true
 
+  # --- Persistent tool cache, owned by the runner user. --------------------
+  # Default: per-runner ${dir}/_toolcache, OUTSIDE the disposable _work tree,
+  # so ephemeral job resets keep installed tools and runners never share a
+  # writable cache. Exported as AGENT_TOOLSDIRECTORY in the LaunchDaemon below
+  # (runner-ephemeral also exports it, which covers older installed plists).
+  local tool_cache_dir="${TOOL_CACHE_DIR:-${dir}/_toolcache}"
+  if ! as_user mkdir -p "${tool_cache_dir}"; then
+    err "Could not create tool cache directory ${tool_cache_dir} for ${name}."
+    record_status "${name}" "FAILED (tool cache dir)"
+    return 1
+  fi
+
   # --- Configure unattended. MUST run as the invoking user (not root). -----
   # On success config.sh registers the runner with GitHub and writes .runner +
   # .credentials into ${dir}. We MUST NOT proceed to install a LaunchDaemon when
@@ -718,6 +856,12 @@ configure_runner() {
 
     program_args+=(--name "${runner_name}")
 
+    # Opt-in RAM scratch: the supervisor allocates a bounded per-job scratch
+    # dir on the shared RAM volume before each job (SSD fallback inside).
+    if [[ "${RAM_SCRATCH}" -eq 1 ]]; then
+      program_args+=(--ram-scratch --ram-scratch-mb "${RAM_SCRATCH_JOB_MB}")
+    fi
+
     # The supervisor needs a GitHub PAT to mint fresh registration tokens on
     # every cycle. The plist must NOT contain it (plists are world-readable),
     # so store it as a mode-600 file owned by the runner user; GITHUB_PAT from
@@ -747,6 +891,15 @@ configure_runner() {
 "
   done
 
+  # Opt-in RAM scratch also lands as a plist env var, so a supervisor launched
+  # with older argument sets still sees the toggle (sizing stays in argv).
+  local ramscratch_env_xml=""
+  if [[ "${RAM_SCRATCH}" -eq 1 ]]; then
+    ramscratch_env_xml="    <key>RUNNER_RAMSCRATCH</key>
+    <string>1</string>
+"
+  fi
+
   local tmp_plist="${WORK_TMPDIR}/${label}.plist"
   cat > "${tmp_plist}" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -770,7 +923,9 @@ ${args_xml}  </array>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>ACTIONS_RUNNER_SVC</key>
     <string>1</string>
-  </dict>
+    <key>AGENT_TOOLSDIRECTORY</key>
+    <string>${tool_cache_dir}</string>
+${ramscratch_env_xml}  </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
@@ -881,6 +1036,13 @@ main() {
   log "Provisioning ${RUNNERS} runner(s) under ${RUNNER_ROOT}"
   PROVISIONING_STARTED=1
 
+  if [[ -n "${TOOL_CACHE_DIR}" ]]; then
+    warn "--tool-cache-dir points every provisioned runner at ONE shared tool"
+    warn "cache (${TOOL_CACHE_DIR}). setup-* actions tolerate concurrent reads,"
+    warn "but concurrent first-time installs of the same tool version can race;"
+    warn "the per-runner default (RUNNER_DIR/_toolcache) avoids this."
+  fi
+
   # --ephemeral: the LaunchDaemons launch the runner-ephemeral supervisor, so
   # it must exist as an absolute path BEFORE any plist is written. Prefer the
   # copy next to this script (repo checkout / Homebrew bin), then PATH.
@@ -902,6 +1064,28 @@ main() {
       warn "supervisor cannot mint fresh registration tokens without a PAT."
     fi
     step "Ephemeral mode: daemons launch ${EPHEMERAL_BIN}"
+  fi
+
+  # --ram-scratch: the supervisor allocates via the runner-ramscratch helper,
+  # which must exist as an absolute path BEFORE any plist is written; the
+  # host-wide budget config is written once, owned by the runner user.
+  if [[ "${RAM_SCRATCH}" -eq 1 ]]; then
+    local self_dir
+    self_dir="$(cd "$(dirname "$0")" && pwd)"
+    if [[ -x "${self_dir}/runner-ramscratch" ]]; then
+      RAMSCRATCH_BIN="${self_dir}/runner-ramscratch"
+    elif command -v runner-ramscratch >/dev/null 2>&1; then
+      RAMSCRATCH_BIN="$(command -v runner-ramscratch)"
+    else
+      err "--ram-scratch requires the runner-ramscratch helper, but it was"
+      err "not found next to ${PROG_NAME} or on PATH."
+      exit 1
+    fi
+    if ! write_ramscratch_config; then
+      err "Could not write the RAM scratch configuration; aborting."
+      exit 1
+    fi
+    step "RAM scratch: per-job ${RAM_SCRATCH_JOB_MB} MB via ${RAMSCRATCH_BIN}"
   fi
 
   local overall_rc=0

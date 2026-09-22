@@ -4,13 +4,14 @@
 class RunnerSetup < Formula
   desc "Provision and tear down GitHub Actions self-hosted runners on macOS"
   homepage "https://github.com/joeblau/homebrew-hb"
-  url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/v1.10.0.tar.gz"
-  sha256 "a139986819888c45019823e0e9d2e8cbc3940955d759632453c080a5a65a21ac"
+  url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/v1.11.0.tar.gz"
+  sha256 "2db66a8c43ab26badfa58e6285c13f528140e4b9eb69328a9305adbbe26b6326"
   license "MIT"
 
   depends_on "docker"
   depends_on "jq"
   depends_on :macos
+  depends_on "python@3.14"
 
   def install
     bin.install %w[
@@ -18,14 +19,19 @@ class RunnerSetup < Formula
       runner-cleanup
       runner-ephemeral
       runner-prune
+      runner-ramscratch
       runner-health
       runner-cache
       runner-logs
+      runner-bench
       runner-upgrade
       runner-autoscale
       runner-token
       runner-netisolate
       runner-docker-builder
+      runner-bazel-cache
+      runner-sccache
+      runner-git-mirror
       runner-mcp
       runner-agent
     ]
@@ -79,14 +85,19 @@ class RunnerSetup < Formula
       runner-cleanup
       runner-ephemeral
       runner-prune
+      runner-ramscratch
       runner-health
       runner-cache
       runner-logs
+      runner-bench
       runner-upgrade
       runner-autoscale
       runner-token
       runner-netisolate
       runner-docker-builder
+      runner-bazel-cache
+      runner-sccache
+      runner-git-mirror
       runner-mcp
       runner-agent
     ].each do |tool|

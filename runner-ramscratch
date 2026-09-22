@@ -1,0 +1,708 @@
+#!/usr/bin/env bash
+#
+# runner-ramscratch — bounded, opt-in RAM-backed build scratch for macOS runners
+#
+# Usage:
+#   runner-ramscratch config --total-budget-mb N [--min-free-mb N]
+#   runner-ramscratch alloc --runner NAME --job ID --size-mb N
+#   runner-ramscratch inspect
+#   runner-ramscratch clean (--runner NAME --job ID | --all --offline)
+#
+# Manages ONE host-wide RAM volume (hdiutil ram:// + newfs_hfs, mounted from a
+# state directory and owned by the invoking runner user) and hands each job its
+# own subdirectory of it. This is deliberately narrower than a root-disk
+# accelerator: only explicitly selected temporary/build directories live on RAM.
+# Installed tools (_toolcache / AGENT_TOOLSDIRECTORY), compiler and dependency
+# caches (sccache, bazel, runner-cache), credentials, and retained _diag logs
+# stay on SSD — never allocate scratch paths for them.
+#
+# The feature is OFF until `config` writes an explicit host-wide total budget.
+# alloc enforces that budget across ALL runners (a ledger in the state
+# directory, guarded by a lock) plus a memory-headroom check from vm_stat, so
+# two simultaneous jobs get separate scratch directories within the bounded
+# total, and an exhausted budget or low memory makes alloc fail loudly — the
+# caller (runner-ephemeral) then falls back to an SSD path.
+#
+# Lifecycle: the RAM volume does not survive a reboot, but the ledger does, so
+# alloc/inspect/clean detect and reset stale state. clean removes only the
+# named job's directory (never another job's), refuses symlinked targets, and
+# detaches the volume only once no allocations remain; hdiutil itself refuses
+# to detach while a consumer still holds files open on the mount. clean --all
+# is an offline maintenance operation (mirrors runner-prune's --offline
+# acknowledgement) and tears everything down.
+#
+# This script never uses sudo and refuses to run as root: the RAM volume must
+# be owned by the runner user, so it is created and mounted as that user.
+
+set -euo pipefail
+
+# ----------------------------------------------------------------------------
+# Constants / globals
+# ----------------------------------------------------------------------------
+PROG_NAME="$(basename "$0")"
+VOLUME_NAME="runner-ramscratch"
+
+EXIT_UNCONFIGURED=3    # feature not configured / platform or tools unavailable
+EXIT_INSUFFICIENT=4    # budget exhausted or memory headroom too low
+
+# State layout (override the root with RUNNER_RAMSCRATCH_DIR; the config file
+# with RUNNER_RAMSCRATCH_CONFIG). All paths are resolved by resolve_paths().
+STATE_DIR="${RUNNER_RAMSCRATCH_DIR:-/opt/github-runners/_ramscratch}"
+CONFIG_FILE=""
+MOUNT_POINT=""
+ALLOC_DIR=""
+STATE_FILE=""
+LOCK_DIR=""
+
+TOTAL_BUDGET_MB=0
+MIN_FREE_MEMORY_MB=4096   # default headroom floor; config may override
+
+VOLUME_DEVICE=""
+VOLUME_SIZE_MB=0
+
+# ----------------------------------------------------------------------------
+# Output helpers — progress goes to stderr; alloc prints ONLY the scratch path
+# on stdout so callers can capture it.
+# ----------------------------------------------------------------------------
+log()  { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
+step() { printf '\033[1;32m  ->\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[1;33mWARN:\033[0m %s\n' "$*" >&2; }
+err()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; }
+
+usage() {
+  cat >&2 <<EOF
+${PROG_NAME} — bounded, opt-in RAM-backed build scratch for macOS runners
+
+USAGE:
+  ${PROG_NAME} config --total-budget-mb N [--min-free-mb N]
+  ${PROG_NAME} alloc --runner NAME --job ID --size-mb N
+  ${PROG_NAME} inspect
+  ${PROG_NAME} clean --runner NAME --job ID
+  ${PROG_NAME} clean --all --offline
+
+COMMANDS:
+  config    Write the host-wide configuration (state dir must be writable by
+            the runner user). REQUIRED before any alloc succeeds:
+              --total-budget-mb N   Total RAM volume size in MB, shared across
+                                    ALL runners on this host. Explicit; there
+                                    is no default. Must be smaller than
+                                    physical RAM.
+              --min-free-mb N       Minimum memory (free + inactive) that must
+                                    remain AFTER an allocation (default:
+                                    ${MIN_FREE_MEMORY_MB}).
+  alloc     Allocate a per-job scratch directory and print its absolute path
+            on stdout. Creates the RAM volume on first use.
+              --runner NAME         Runner identity (e.g. runner-1).
+              --job ID              Job/cycle identity (e.g. cycle-7).
+              --size-mb N           This job's share of the total budget.
+            Names accept only [A-Za-z0-9._-]; the request is refused when the
+            host-wide budget or the memory-headroom floor would be exceeded.
+  inspect   Print configuration, volume, and allocation state (read-only).
+  clean     Remove ONE job's scratch directory (--runner/--job). Never touches
+            another job's directory and refuses symlinked targets. Detaches the
+            RAM volume only when no allocations remain. With --all --offline
+            (consumers stopped, mirrors runner-prune's acknowledgement),
+            removes every allocation and unmounts the volume.
+
+EXIT CODES:
+  0    Success.
+  1    Operation failed.
+  2    Usage error.
+  ${EXIT_UNCONFIGURED}    Feature unavailable: not configured, wrong platform, or missing tools.
+       Callers should fall back to an SSD scratch path.
+  ${EXIT_INSUFFICIENT}    Budget exhausted or memory headroom too low. Callers should
+       fall back to an SSD scratch path.
+
+ENVIRONMENT:
+  RUNNER_RAMSCRATCH_DIR      State/mount root (default: /opt/github-runners/_ramscratch).
+  RUNNER_RAMSCRATCH_CONFIG   Config file (default: STATE_DIR/config).
+
+BOUNDARIES:
+  Scratch is for explicitly selected temporary/build directories ONLY. Keep
+  installed tools (RUNNER_DIR/_toolcache), compiler/dependency caches
+  (sccache/bazel/runner-cache), credentials, and retained logs (_diag) on SSD.
+
+EXAMPLES:
+  ${PROG_NAME} config --total-budget-mb 4096 --min-free-mb 4096
+  scratch="\$(${PROG_NAME} alloc --runner runner-1 --job cycle-3 --size-mb 1024)"
+  ${PROG_NAME} inspect
+  ${PROG_NAME} clean --runner runner-1 --job cycle-3
+
+  This tool runs as the invoking (non-root) runner user and never uses sudo;
+  the RAM volume is created, mounted, and owned by that user.
+EOF
+}
+
+# ----------------------------------------------------------------------------
+# Path / environment plumbing
+# ----------------------------------------------------------------------------
+resolve_paths() {
+  while [[ "${STATE_DIR}" == */ && "${STATE_DIR}" != "/" ]]; do
+    STATE_DIR="${STATE_DIR%/}"
+  done
+  if [[ -n "${RUNNER_RAMSCRATCH_CONFIG:-}" ]]; then
+    CONFIG_FILE="${RUNNER_RAMSCRATCH_CONFIG}"
+  else
+    CONFIG_FILE="${STATE_DIR}/config"
+  fi
+  MOUNT_POINT="${STATE_DIR}/volume"
+  ALLOC_DIR="${STATE_DIR}/allocs"
+  STATE_FILE="${STATE_DIR}/state"
+  LOCK_DIR="${STATE_DIR}/lock"
+}
+
+detect_platform() {
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    err "This tool only supports macOS."
+    exit "${EXIT_UNCONFIGURED}"
+  fi
+}
+
+detect_user() {
+  if [[ "$(whoami)" == "root" ]]; then
+    err "Refusing to run as root: the RAM volume must be owned by the runner"
+    err "user. Run this as the invoking (non-root) user; no sudo is needed."
+    exit 1
+  fi
+}
+
+require_cmds() {
+  local missing=() c
+  for c in hdiutil newfs_hfs sysctl vm_stat df awk sed stat mkdir rm rmdir sleep cat head uname whoami; do
+    command -v "${c}" >/dev/null 2>&1 || missing+=("${c}")
+  done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    err "Required command(s) not found: ${missing[*]}"
+    exit "${EXIT_UNCONFIGURED}"
+  fi
+}
+
+# Names become ledger file names and mount subdirectories; keep them free of
+# separators and traversal so clean can never escape the mount point.
+valid_name() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]
+}
+
+# ----------------------------------------------------------------------------
+# Configuration
+# ----------------------------------------------------------------------------
+load_config() {
+  if [[ ! -f "${CONFIG_FILE}" ]]; then
+    err "RAM scratch is not configured (no ${CONFIG_FILE})."
+    err "The feature is opt-in: run '${PROG_NAME} config --total-budget-mb N' first."
+    return "${EXIT_UNCONFIGURED}"
+  fi
+  local line key value
+  TOTAL_BUDGET_MB=0
+  while IFS='=' read -r key value; do
+    case "${key}" in
+      TOTAL_BUDGET_MB)    TOTAL_BUDGET_MB="${value}" ;;
+      MIN_FREE_MEMORY_MB) MIN_FREE_MEMORY_MB="${value}" ;;
+    esac
+  done < "${CONFIG_FILE}"
+  if ! [[ "${TOTAL_BUDGET_MB}" =~ ^[0-9]+$ ]] || [[ "${TOTAL_BUDGET_MB}" -lt 1 ]]; then
+    err "Config ${CONFIG_FILE} lacks a valid TOTAL_BUDGET_MB."
+    return "${EXIT_UNCONFIGURED}"
+  fi
+  if ! [[ "${MIN_FREE_MEMORY_MB}" =~ ^[0-9]+$ ]]; then
+    err "Config ${CONFIG_FILE} has an invalid MIN_FREE_MEMORY_MB."
+    return "${EXIT_UNCONFIGURED}"
+  fi
+  return 0
+}
+
+cmd_config() {
+  local budget="" min_free=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --total-budget-mb)
+        [[ $# -ge 2 ]] || { err "--total-budget-mb requires a value"; exit 2; }
+        budget="$2"; shift 2 ;;
+      --total-budget-mb=*) budget="${1#*=}"; shift ;;
+      --min-free-mb)
+        [[ $# -ge 2 ]] || { err "--min-free-mb requires a value"; exit 2; }
+        min_free="$2"; shift 2 ;;
+      --min-free-mb=*) min_free="${1#*=}"; shift ;;
+      *) err "Unknown argument: $1"; usage; exit 2 ;;
+    esac
+  done
+  if ! [[ "${budget}" =~ ^[0-9]+$ ]] || [[ "${budget}" -lt 1 ]]; then
+    err "config requires an explicit positive --total-budget-mb (got: '${budget}')"
+    exit 2
+  fi
+  if [[ -z "${min_free}" ]]; then
+    min_free="${MIN_FREE_MEMORY_MB}"
+  elif ! [[ "${min_free}" =~ ^[0-9]+$ ]]; then
+    err "--min-free-mb must be a non-negative integer (got: '${min_free}')"
+    exit 2
+  fi
+
+  detect_platform
+  require_cmds
+  detect_user
+  resolve_paths
+
+  mkdir -p "${STATE_DIR}"
+  local tmp="${CONFIG_FILE}.tmp.$$"
+  {
+    printf 'TOTAL_BUDGET_MB=%s\n' "${budget}"
+    printf 'MIN_FREE_MEMORY_MB=%s\n' "${min_free}"
+  } > "${tmp}"
+  chmod 600 "${tmp}"
+  mv -f "${tmp}" "${CONFIG_FILE}"
+  step "Wrote ${CONFIG_FILE}: host-wide budget ${budget} MB, min free ${min_free} MB"
+  log "RAM scratch configured. The volume is created on the first alloc."
+}
+
+# ----------------------------------------------------------------------------
+# Inter-runner lock: allocs from two runners race the shared budget ledger, so
+# ledger mutations run under a mkdir lock. A lock whose owner process is gone
+# (hard kill, reboot) is broken and retaken.
+# ----------------------------------------------------------------------------
+acquire_lock() {
+  local tries=0 owner=""
+  while :; do
+    if mkdir "${LOCK_DIR}" 2>/dev/null; then
+      printf '%s\n' "$$" > "${LOCK_DIR}/pid" 2>/dev/null || true
+      return 0
+    fi
+    if [[ -f "${LOCK_DIR}/pid" ]]; then
+      owner="$(cat "${LOCK_DIR}/pid" 2>/dev/null || true)"
+      if [[ -n "${owner}" ]] && ! kill -0 "${owner}" 2>/dev/null; then
+        rm -rf "${LOCK_DIR}" 2>/dev/null || true
+        continue
+      fi
+    fi
+    tries=$((tries + 1))
+    if [[ "${tries}" -ge 100 ]]; then
+      err "Timed out waiting for the ramscratch lock (${LOCK_DIR})."
+      return 1
+    fi
+    sleep 0.1
+  done
+}
+
+release_lock() {
+  rm -rf "${LOCK_DIR}" 2>/dev/null || true
+}
+
+# ----------------------------------------------------------------------------
+# Volume state. The RAM volume does not survive a reboot; the ledger does.
+# volume_mounted is the ground truth; stale state is reset before any use.
+# ----------------------------------------------------------------------------
+read_state() {
+  VOLUME_DEVICE=""
+  VOLUME_SIZE_MB=0
+  [[ -f "${STATE_FILE}" ]] || return 1
+  local key value
+  while IFS='=' read -r key value; do
+    case "${key}" in
+      DEVICE)  VOLUME_DEVICE="${value}" ;;
+      SIZE_MB) VOLUME_SIZE_MB="${value}" ;;
+    esac
+  done < "${STATE_FILE}"
+  [[ -n "${VOLUME_DEVICE}" ]]
+}
+
+volume_mounted() {
+  read_state || return 1
+  [[ -d "${MOUNT_POINT}" && ! -L "${MOUNT_POINT}" ]] || return 1
+  local dev
+  dev="$(df -P "${MOUNT_POINT}" 2>/dev/null | awk 'NR==2 {print $1}')"
+  [[ -n "${dev}" && "${dev}" == "${VOLUME_DEVICE}" ]]
+}
+
+reset_stale_state() {
+  if [[ -e "${STATE_FILE}" || -d "${ALLOC_DIR}" ]] && ! volume_mounted; then
+    warn "Stale RAM scratch state (volume not mounted — host rebooted?); resetting."
+    rm -f "${STATE_FILE}"
+    rm -rf "${ALLOC_DIR}"
+  fi
+}
+
+# Sum of every runner's outstanding allocations (MB).
+allocated_mb() {
+  local total=0 f mb
+  if [[ -d "${ALLOC_DIR}" ]]; then
+    for f in "${ALLOC_DIR}"/*; do
+      [[ -f "${f}" ]] || continue
+      mb="$(head -n1 "${f}" 2>/dev/null || true)"
+      [[ "${mb}" =~ ^[0-9]+$ ]] || mb=0
+      total=$((total + mb))
+    done
+  fi
+  printf '%s\n' "${total}"
+}
+
+# Available memory (MB) from vm_stat: free + inactive pages at the reported
+# page size. Inactive pages are reclaimable under pressure, matching what the
+# kernel could actually give a new RAM volume.
+available_memory_mb() {
+  local stats pagesize free inactive
+  if ! stats="$(vm_stat)"; then
+    return 1
+  fi
+  pagesize="$(printf '%s\n' "${stats}" \
+    | sed -n 's/.*page size of \([0-9][0-9]*\) bytes.*/\1/p' | head -n1)"
+  [[ "${pagesize}" =~ ^[0-9]+$ ]] || pagesize=4096
+  free="$(printf '%s\n' "${stats}" \
+    | awk '$1 == "Pages" && $2 == "free:" { gsub(/\./, "", $3); print $3 }')"
+  inactive="$(printf '%s\n' "${stats}" \
+    | awk '$1 == "Pages" && $2 == "inactive:" { gsub(/\./, "", $3); print $3 }')"
+  [[ "${free}" =~ ^[0-9]+$ ]] || free=0
+  [[ "${inactive}" =~ ^[0-9]+$ ]] || inactive=0
+  printf '%s\n' $(( (free + inactive) * pagesize / 1048576 ))
+}
+
+memory_headroom_ok() {
+  local need_mb="$1" avail
+  if ! avail="$(available_memory_mb)"; then
+    warn "Could not read vm_stat; refusing to allocate RAM scratch."
+    return 1
+  fi
+  if (( avail < MIN_FREE_MEMORY_MB + need_mb )); then
+    warn "Insufficient memory headroom: ${avail} MB available,"
+    warn "need ${need_mb} MB plus a ${MIN_FREE_MEMORY_MB} MB floor."
+    return 1
+  fi
+  return 0
+}
+
+detach_volume() {
+  read_state || return 0
+  # hdiutil itself refuses to detach while a consumer holds files open on the
+  # mount; that failure is a warning (state kept) so a later clean can retry.
+  if ! hdiutil detach "${VOLUME_DEVICE}" >/dev/null 2>&1; then
+    warn "Could not detach ${VOLUME_DEVICE} (consumers may still hold the mount)."
+    return 1
+  fi
+  rm -f "${STATE_FILE}"
+  step "Detached RAM scratch volume ${VOLUME_DEVICE}."
+  return 0
+}
+
+create_volume() {
+  local mem_bytes sectors out device owner
+  mem_bytes="$(sysctl -n hw.memsize 2>/dev/null || true)"
+  if [[ "${mem_bytes}" =~ ^[0-9]+$ ]] \
+      && (( TOTAL_BUDGET_MB * 1048576 >= mem_bytes )); then
+    err "TOTAL_BUDGET_MB=${TOTAL_BUDGET_MB} is not smaller than physical RAM"
+    err "($(( mem_bytes / 1048576 )) MB). Lower the budget in ${CONFIG_FILE}."
+    return "${EXIT_INSUFFICIENT}"
+  fi
+  # Creating the volume reserves up to the whole budget, so the headroom check
+  # runs against the budget, not the individual request.
+  if ! memory_headroom_ok "${TOTAL_BUDGET_MB}"; then
+    return "${EXIT_INSUFFICIENT}"
+  fi
+
+  sectors=$((TOTAL_BUDGET_MB * 2048))   # ram:// takes 512-byte sectors
+  if ! out="$(hdiutil attach -nomount "ram://${sectors}" 2>/dev/null)"; then
+    err "hdiutil could not create a ${TOTAL_BUDGET_MB} MB RAM device."
+    return 1
+  fi
+  device="$(printf '%s\n' "${out}" | awk 'NF {print $NF}' | tail -n1)"
+  case "${device}" in
+    /dev/*) ;;
+    *) err "Could not parse a device from hdiutil output."; return 1 ;;
+  esac
+
+  if ! newfs_hfs -v "${VOLUME_NAME}" "${device}" >/dev/null 2>&1; then
+    err "newfs_hfs failed on ${device}."
+    hdiutil detach "${device}" >/dev/null 2>&1 || true
+    return 1
+  fi
+  mkdir -p "${MOUNT_POINT}" "${ALLOC_DIR}"
+  if [[ -L "${MOUNT_POINT}" ]]; then
+    err "Refusing symlinked mount point: ${MOUNT_POINT}"
+    hdiutil detach "${device}" >/dev/null 2>&1 || true
+    return 1
+  fi
+  if ! hdiutil attach -nobrowse -mountpoint "${MOUNT_POINT}" "${device}" >/dev/null 2>&1; then
+    err "Could not mount ${device} at ${MOUNT_POINT}."
+    hdiutil detach "${device}" >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  # The volume must be owned by (and writable by) the runner user — never
+  # hand jobs a root-owned scratch space.
+  owner="$(stat -f %Su "${MOUNT_POINT}" 2>/dev/null || true)"
+  if [[ "${owner}" != "$(whoami)" || ! -w "${MOUNT_POINT}" ]]; then
+    err "RAM scratch volume is not owned by the invoking user (owner: ${owner:-unknown})."
+    hdiutil detach "${device}" >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  {
+    printf 'DEVICE=%s\n' "${device}"
+    printf 'SIZE_MB=%s\n' "${TOTAL_BUDGET_MB}"
+  } > "${STATE_FILE}"
+  step "RAM scratch volume: ${device}, ${TOTAL_BUDGET_MB} MB at ${MOUNT_POINT}"
+  return 0
+}
+
+# ----------------------------------------------------------------------------
+# alloc
+# ----------------------------------------------------------------------------
+cmd_alloc() {
+  local runner="" job="" size_mb=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --runner)
+        [[ $# -ge 2 ]] || { err "--runner requires a value"; exit 2; }
+        runner="$2"; shift 2 ;;
+      --runner=*) runner="${1#*=}"; shift ;;
+      --job)
+        [[ $# -ge 2 ]] || { err "--job requires a value"; exit 2; }
+        job="$2"; shift 2 ;;
+      --job=*) job="${1#*=}"; shift ;;
+      --size-mb)
+        [[ $# -ge 2 ]] || { err "--size-mb requires a value"; exit 2; }
+        size_mb="$2"; shift 2 ;;
+      --size-mb=*) size_mb="${1#*=}"; shift ;;
+      *) err "Unknown argument: $1"; usage; exit 2 ;;
+    esac
+  done
+  if ! valid_name "${runner}"; then
+    err "--runner must match [A-Za-z0-9][A-Za-z0-9._-]* (got: '${runner}')"
+    exit 2
+  fi
+  if ! valid_name "${job}"; then
+    err "--job must match [A-Za-z0-9][A-Za-z0-9._-]* (got: '${job}')"
+    exit 2
+  fi
+  if ! [[ "${size_mb}" =~ ^[0-9]+$ ]] || [[ "${size_mb}" -lt 1 ]]; then
+    err "alloc requires an explicit positive --size-mb (got: '${size_mb}')"
+    exit 2
+  fi
+
+  detect_platform
+  require_cmds
+  detect_user
+  resolve_paths
+  local rc=0
+  load_config || rc=$?
+  [[ "${rc}" -eq 0 ]] || exit "${rc}"
+
+  acquire_lock || exit 1
+  trap release_lock EXIT
+
+  reset_stale_state
+  if ! volume_mounted; then
+    rc=0
+    create_volume || rc=$?
+    if [[ "${rc}" -ne 0 ]]; then exit "${rc}"; fi
+  fi
+
+  # Host-wide budget across ALL runners: the new request must fit inside the
+  # ledger total, so two simultaneous jobs share one bounded volume.
+  local allocation="${ALLOC_DIR}/${runner}:${job}"
+  if [[ -e "${allocation}" ]]; then
+    err "Scratch allocation already exists for ${runner}/${job}; clean it before reallocating."
+    exit 1
+  fi
+  local used
+  used="$(allocated_mb)"
+  if (( used + size_mb > TOTAL_BUDGET_MB )); then
+    warn "RAM scratch budget exhausted: ${used} MB allocated of"
+    warn "${TOTAL_BUDGET_MB} MB; refusing ${size_mb} MB for ${runner}/${job}."
+    exit "${EXIT_INSUFFICIENT}"
+  fi
+  if ! memory_headroom_ok "${size_mb}"; then
+    exit "${EXIT_INSUFFICIENT}"
+  fi
+
+  local scratch="${MOUNT_POINT}/${runner}/${job}"
+  mkdir -p "${scratch}"
+  printf '%s\n' "${size_mb}" > "${ALLOC_DIR}/${runner}:${job}"
+  step "Allocated ${size_mb} MB scratch for ${runner}/${job} ($(( used + size_mb ))/${TOTAL_BUDGET_MB} MB in use)."
+  release_lock
+  trap - EXIT
+  printf '%s\n' "${scratch}"
+}
+
+# ----------------------------------------------------------------------------
+# clean
+# ----------------------------------------------------------------------------
+# Guarded removal of ONE path inside the mount point: never follows a symlinked
+# target or parent, never touches anything outside the RAM volume, and never
+# touches another job's directory (the caller names exactly one runner/job).
+remove_scratch_path() {
+  local target="$1"
+  [[ -e "${target}" || -L "${target}" ]] || return 0
+  case "${target}/" in
+    "${MOUNT_POINT}/"*) ;;
+    *) err "Refusing to clean outside the RAM scratch mount: ${target}"; return 1 ;;
+  esac
+  if [[ -L "${MOUNT_POINT}" || -L "${target}" || -L "${target%/*}" ]]; then
+    err "Refusing symlinked scratch path: ${target}"
+    return 1
+  fi
+  rm -rf "${target}"
+}
+
+ledger_has_entries() {
+  local f
+  [[ -d "${ALLOC_DIR}" ]] || return 1
+  for f in "${ALLOC_DIR}"/*; do
+    [[ -f "${f}" ]] && return 0
+  done
+  return 1
+}
+
+cmd_clean() {
+  local runner="" job="" all=0 offline=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --runner)
+        [[ $# -ge 2 ]] || { err "--runner requires a value"; exit 2; }
+        runner="$2"; shift 2 ;;
+      --runner=*) runner="${1#*=}"; shift ;;
+      --job)
+        [[ $# -ge 2 ]] || { err "--job requires a value"; exit 2; }
+        job="$2"; shift 2 ;;
+      --job=*) job="${1#*=}"; shift ;;
+      --all) all=1; shift ;;
+      --offline) offline=1; shift ;;
+      *) err "Unknown argument: $1"; usage; exit 2 ;;
+    esac
+  done
+
+  if [[ "${all}" -eq 1 ]]; then
+    if [[ -n "${runner}" || -n "${job}" ]]; then
+      err "Choose --runner/--job or --all, not both."; exit 2
+    fi
+    if [[ "${offline}" -ne 1 ]]; then
+      err "clean --all tears down the shared volume; it requires --offline"
+      err "(confirm every runner/job consumer is stopped), like runner-prune."
+      exit 2
+    fi
+  else
+    if ! valid_name "${runner}" || ! valid_name "${job}"; then
+      err "clean requires --runner NAME --job ID ([A-Za-z0-9][A-Za-z0-9._-]*),"
+      err "or --all --offline."
+      exit 2
+    fi
+  fi
+
+  detect_platform
+  require_cmds
+  detect_user
+  resolve_paths
+
+  acquire_lock || exit 1
+  trap release_lock EXIT
+
+  if [[ "${all}" -eq 1 ]]; then
+    local runner_dir rc=0
+    shopt -s nullglob
+    for runner_dir in "${MOUNT_POINT}"/*; do
+      [[ -e "${runner_dir}" || -L "${runner_dir}" ]] || continue
+      if [[ -L "${runner_dir}" ]]; then
+        err "Refusing symlinked entry in the mount point: ${runner_dir}"
+        rc=1
+        continue
+      fi
+      rm -rf "${runner_dir}"
+    done
+    shopt -u nullglob
+    if [[ "${rc}" -ne 0 ]]; then
+      release_lock
+      trap - EXIT
+      return "${rc}"
+    fi
+    rm -rf "${ALLOC_DIR}"
+    if volume_mounted; then
+      detach_volume || warn "Volume left mounted; re-run clean --all --offline after consumers stop."
+    else
+      rm -f "${STATE_FILE}"
+    fi
+    step "RAM scratch fully cleaned (offline)."
+    release_lock
+    trap - EXIT
+    return 0
+  fi
+
+  local target="${MOUNT_POINT}/${runner}/${job}"
+  if ! remove_scratch_path "${target}"; then
+    release_lock
+    trap - EXIT
+    return 1
+  fi
+  rm -f "${ALLOC_DIR}/${runner}:${job}"
+  rmdir "${MOUNT_POINT}/${runner}" 2>/dev/null || true   # drop the empty runner dir
+  step "Cleaned scratch for ${runner}/${job}."
+
+  # Detach only once no allocations remain — never unmount the shared volume
+  # out from under another job.
+  if ! ledger_has_entries; then
+    if volume_mounted; then
+      detach_volume || warn "Volume left mounted; a later clean will retry."
+    fi
+  else
+    step "Other allocations remain; volume stays mounted."
+  fi
+  release_lock
+  trap - EXIT
+  return 0
+}
+
+# ----------------------------------------------------------------------------
+# inspect (read-only)
+# ----------------------------------------------------------------------------
+cmd_inspect() {
+  resolve_paths
+  log "RAM scratch status"
+  if [[ -f "${CONFIG_FILE}" ]]; then
+    if load_config 2>/dev/null; then
+      step "Config: ${CONFIG_FILE} (budget ${TOTAL_BUDGET_MB} MB, min free ${MIN_FREE_MEMORY_MB} MB)"
+    fi
+  else
+    step "Config: none (${CONFIG_FILE}) — feature is OFF until configured."
+  fi
+  step "State dir: ${STATE_DIR}"
+
+  if volume_mounted; then
+    step "Volume: ${VOLUME_DEVICE} (${VOLUME_SIZE_MB} MB) mounted at ${MOUNT_POINT}"
+    df -h "${MOUNT_POINT}" 2>/dev/null | awk 'NR==2 {print "       used: " $3 " of " $2 " (" $5 ")"}' >&2 || true
+  else
+    step "Volume: not mounted"
+    if [[ -e "${STATE_FILE}" || -d "${ALLOC_DIR}" ]]; then
+      warn "Stale state present (volume not mounted — host rebooted?)."
+    fi
+  fi
+
+  local used
+  used="$(allocated_mb)"
+  step "Allocated: ${used} MB${TOTAL_BUDGET_MB:+ of ${TOTAL_BUDGET_MB} MB budget}"
+  local f entry mb count=0
+  if [[ -d "${ALLOC_DIR}" ]]; then
+    for f in "${ALLOC_DIR}"/*; do
+      [[ -f "${f}" ]] || continue
+      entry="$(basename "${f}")"
+      mb="$(head -n1 "${f}" 2>/dev/null || true)"
+      printf '       - %s: %s MB\n' "${entry//://}" "${mb}" >&2
+      count=$((count + 1))
+    done
+  fi
+  [[ "${count}" -gt 0 ]] || step "Allocations: none"
+  return 0
+}
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+main() {
+  local cmd="${1:-}"
+  case "${cmd}" in
+    config|alloc|clean|inspect) ;;
+    -h|--help|"") usage; [[ "${cmd}" == "-h" || "${cmd}" == "--help" ]] && exit 0; exit 2 ;;
+    *) err "Unknown command: ${cmd}"; usage; exit 2 ;;
+  esac
+  shift
+  "cmd_${cmd}" "$@"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

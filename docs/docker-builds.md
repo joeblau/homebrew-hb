@@ -184,11 +184,100 @@ multi-node builder using `docker buildx create --append`. See
 [Docker multi-platform builds](https://docs.docker.com/build/building/multi-platform/).
 
 BuildKit supports registry mirrors, garbage collection, and maximum
-parallelism through a daemon configuration file. Set those for the builder's
+parallelism through a daemon configuration file. `runner-docker-builder`
+manages GC policy and a loopback registry mirror for you — see the next two
+sections. Settings apply at builder creation, so tune them for the builder's
 actual CPU/RAM, disk capacity, and registry access before creating it; the
-helper honors Buildx's standard `buildkitd.default.toml` lookup. Keep cache
-space bounded without pruning every job. See
+helper also honors Buildx's standard `buildkitd.default.toml` lookup. Keep
+cache space bounded without pruning every job. See
 [BuildKit configuration](https://docs.docker.com/build/buildkit/toml-configuration/).
+
+## BuildKit garbage collection
+
+```sh
+runner-docker-builder gc status                            # docker buildx du for the selected builder
+runner-docker-builder gc status --builder runner-remote --verbose
+runner-docker-builder gc configure --builder runner-remote # write the default GC policy
+runner-docker-builder gc configure --builder runner-remote --max-used-space 80 --keep-hours 72
+```
+
+`gc configure` writes a managed `buildkitd.toml` per builder under
+`${DOCKER_CONFIG:-~/.docker}/buildkitd/` with these defaults (all overridable):
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `reservedSpace` | 10GB (`--reserved-space`) | Always kept; GC never reclaims below it |
+| `maxUsedSpace` | 50GB (`--max-used-space`) | Above this, GC reclaims aggressively |
+| `keepBytes` | 20GB (`--keep-bytes`) | Per-rule retention for the default GC rules |
+| `keepDuration` | 48h (`--keep-hours`, 0 disables) | Age after which cache mounts/sources expire |
+
+The config carries two default rules: one expiring cache mounts and VCS/local
+sources after `keepDuration`, and a catch-all `all = true` rule, each retaining
+up to `keepBytes`. `reservedSpace`/`maxUsedSpace` require BuildKit v0.20+; the
+`gcpolicy` rules are honored by every version and older daemons ignore unknown
+keys.
+
+GC configuration is **creation-time only**: the next `setup-remote` or
+`setup-colima` passes the file to `docker buildx create --config`. If the
+builder already exists, the helper refuses to touch it — the existing builder
+and its cache are left unchanged, exactly like the setup mismatch guard. To
+apply a new policy, schedule a maintenance window and recreate with the cache
+volume preserved:
+
+```sh
+docker buildx rm --keep-state runner-remote   # keeps the BuildKit state volume
+runner-docker-builder setup-remote --host ssh://ci@linux-builder.internal
+```
+
+For plain `docker build` on Colima's default builder (the VM daemon's embedded
+BuildKit), manage `/etc/buildkit/buildkitd.toml` inside the VM:
+
+```sh
+runner-docker-builder gc configure --colima-vm --max-used-space 40
+colima stop && colima start   # between jobs, to load the new policy
+```
+
+The VM write uses the Colima VM's own non-interactive sudo via `colima ssh`;
+the script never invokes sudo on the macOS host.
+
+## Registry mirror (pull-through cache)
+
+A local `registry:2` pull-through cache removes repeated upstream downloads of
+base images across jobs and runners:
+
+```sh
+runner-docker-builder registry-mirror setup
+runner-docker-builder registry-mirror status
+runner-docker-builder registry-mirror teardown   # keeps cached blobs; --remove-data deletes them
+```
+
+`setup` runs the `runner-registry-mirror` container with `--restart=always` and
+a persistent volume, bound to `127.0.0.1:5001` by default (port 5000 is macOS
+AirPlay Receiver). The target is the running Colima VM, or `--context CTX` /
+`--host ssh://...` for another reachable Docker host. `--bind` accepts only
+loopback or private/local-network addresses — the cache has no authentication
+of its own and is never exposed publicly. Rerunning setup reuses a running
+mirror container and its cached blobs.
+
+The mirror is wired in two places:
+
+- **BuildKit**: a `[registry."docker.io"]` stanza is merged into the managed
+  per-builder `buildkitd.toml` (shared with `gc configure`), and builders are
+  created with `--driver-opt network=host` so the builder container can reach
+  the loopback mirror. As with GC policy, this applies at builder creation;
+  recreate an existing builder with `docker buildx rm --keep-state` plus setup
+  during a maintenance window — the helper will not remove it for you.
+- **Docker daemon**: the mirror URL is merged into `registry-mirrors` in the
+  daemon config — `${COLIMA_HOME:-~/.colima}/docker/daemon.json` for Colima,
+  `${DOCKER_CONFIG:-~/.docker}/daemon.json` for Docker Desktop — preserving
+  other keys. Remote daemons get printed instructions instead. Restart the
+  daemon (or Colima) between jobs to load it.
+
+Workflows need no changes: builds through the persistent builder and plain
+`docker pull`/`docker build` use the mirror transparently once the builder and
+daemon have been restarted as noted above. The mirror proxies
+`https://registry-1.docker.io` by default (`--upstream` to change it) and never
+accepts pushes.
 
 ## Existing builder migration and maintenance
 
@@ -201,7 +290,8 @@ registration during a maintenance window, then rerun setup. For a
 same builder/node name. It does not transfer volumes to a new host. See
 [Docker's cache persistence instructions](https://docs.docker.com/build/builders/drivers/docker-container/).
 
-Track `docker buildx du --builder runner-remote`, available disk, BuildKit
+Track `runner-docker-builder gc status --builder runner-remote` (or
+`docker buildx du --builder runner-remote` directly), available disk, BuildKit
 version, and job queue time. Preserve the cache during planned upgrades,
 verify a representative build afterward, and schedule maintenance while jobs
 are drained. The helper does not automatically upgrade an existing BuildKit

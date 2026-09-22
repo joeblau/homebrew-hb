@@ -11,7 +11,10 @@
 #   2. boots out and removes any leftover gui LaunchAgent (actions.runner.*),
 #   3. OPTIONALLY deregisters the runner from GitHub (only when a *removal*
 #      token is supplied — registration tokens will NOT work for removal),
-#   4. deletes the runner directory under /opt/github-runners.
+#   4. deletes the runner directory under /opt/github-runners,
+#   5. when --all removes every runner, also unmounts the shared
+#      runner-ramscratch RAM volume (clean --all --offline) once the daemons
+#      that consume it are stopped.
 #
 # Like runner-setup, it runs config.sh as the INVOKING (non-root) user and uses
 # sudo ONLY for the privileged /opt and /Library/LaunchDaemons operations. It is
@@ -297,6 +300,49 @@ cleanup_one() {
 }
 
 # ----------------------------------------------------------------------------
+# RAM scratch teardown. The runner-ramscratch volume is HOST-WIDE (shared by
+# every runner under one bounded budget), so it is torn down only when ALL
+# runners are being removed — after their daemons are booted out, which is
+# what stops the consumers. helper clean --all --offline then unmounts only
+# after the allocation ledger is empty; a mounted volume that refuses to
+# detach is left for a later clean. Removing one runner of many leaves the
+# volume (and the other runners' allocations) untouched.
+# ----------------------------------------------------------------------------
+teardown_ramscratch() {
+  local state_dir="${RUNNER_ROOT}/_ramscratch"
+  [[ -d "${state_dir}" ]] || return 0
+  local helper="" self_dir=""
+  if [[ -n "${RUNNER_RAMSCRATCH_BIN:-}" && -x "${RUNNER_RAMSCRATCH_BIN}" ]]; then
+    helper="${RUNNER_RAMSCRATCH_BIN}"
+  else
+    # Script-adjacent lookup only when executed by path (sourcing carries no
+    # real location); otherwise fall back to PATH.
+    case "${BASH_SOURCE[0]:-}" in
+      */*)
+        self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd || true)"
+        if [[ -n "${self_dir}" && -x "${self_dir}/runner-ramscratch" ]]; then
+          helper="${self_dir}/runner-ramscratch"
+        fi ;;
+    esac
+    if [[ -z "${helper}" ]] && command -v runner-ramscratch >/dev/null 2>&1; then
+      helper="$(command -v runner-ramscratch)"
+    fi
+  fi
+  if [[ -z "${helper}" ]]; then
+    warn "RAM scratch state exists at ${state_dir} but runner-ramscratch was"
+    warn "not found; leaving it (detach any mounted volume manually)."
+    return 0
+  fi
+  step "Unmounting the shared RAM scratch volume (all runners removed)"
+  if ! as_user "${helper}" clean --all --offline; then
+    warn "RAM scratch teardown failed; leaving ${state_dir} for manual cleanup."
+    return 0
+  fi
+  sudo rm -rf "${state_dir}"
+  return 0
+}
+
+# ----------------------------------------------------------------------------
 # Confirmation (skipped with --yes; refuses to proceed without a TTY)
 # ----------------------------------------------------------------------------
 confirm() {
@@ -363,6 +409,7 @@ main() {
 
   # Remove the root dir if it is now empty (only meaningful for --all).
   if [[ -z "${TARGET_RUNNER}" && -d "${RUNNER_ROOT}" ]]; then
+    teardown_ramscratch
     if sudo rmdir "${RUNNER_ROOT}" 2>/dev/null; then
       step "Removed empty ${RUNNER_ROOT}"
     fi

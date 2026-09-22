@@ -7,6 +7,7 @@
 #   runner-agent install            # install Claude Code, verify the toolchain
 #   runner-agent check              # verify only (also the workflow preflight)
 #   runner-agent snippet            # print the caller workflow to paste
+#   runner-agent notify <msg> [url] # post a Slack notification (best-effort)
 #
 # Usage (inside a job, by .github/workflows/runner-agent.yml):
 #   runner-agent gate               # decide whether/what to do from the event
@@ -33,6 +34,14 @@
 #
 # Secrets: ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN and GITHUB_TOKEN come
 # from the job environment only; nothing is written to disk or logged.
+#
+# Slack: gate/publish post best-effort outcome notifications (mention
+# acknowledged; fix PR opened/updated; diagnosis with no code change) to a
+# Slack incoming webhook. The URL comes from SLACK_WEBHOOK_URL or the first
+# line of a 0600 file (~/.runner-agent/slack-webhook) and is handed to curl
+# via a 0600 -K config file, never on the command line where `ps` could see
+# it. Notifications never fail the job; payloads carry repo/run/PR identifiers
+# and links only — no secrets, no log contents.
 
 set -euo pipefail
 
@@ -56,6 +65,7 @@ LOG_LINES="${RUNNER_AGENT_LOG_LINES:-300}"
 ALLOWED_ASSOCIATIONS="${RUNNER_AGENT_ALLOWED_ASSOCIATIONS:-OWNER MEMBER COLLABORATOR}"
 GIT_USER_NAME="${RUNNER_AGENT_GIT_NAME:-runner-agent[bot]}"
 GIT_USER_EMAIL="${RUNNER_AGENT_GIT_EMAIL:-runner-agent[bot]@users.noreply.github.com}"
+SLACK_WEBHOOK_FILE="${RUNNER_AGENT_SLACK_WEBHOOK_FILE:-${HOME:+${HOME}/.runner-agent/slack-webhook}}"
 COMMAND=""
 
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
@@ -72,6 +82,7 @@ USAGE:
   ${PROG_NAME} check                Verify claude, runner-mcp, gh, jq, git
   ${PROG_NAME} snippet              Print the caller workflow YAML
   ${PROG_NAME} gate | run | publish Job steps used by the reusable workflow
+  ${PROG_NAME} notify <text> [url]  Post a Slack notification (best-effort)
 
 HOW IT FITS TOGETHER:
   1. On each runner Mac, as the runner service user:  ${PROG_NAME} install
@@ -94,6 +105,10 @@ ENVIRONMENT (set by the reusable workflow from its inputs):
   RUNNER_AGENT_ALLOWED_ASSOCIATIONS  Comment authors allowed to trigger
   ANTHROPIC_API_KEY | CLAUDE_CODE_OAUTH_TOKEN   Claude credentials (job secret)
   GITHUB_TOKEN                       Used by gh for reading runs and writing PRs
+  SLACK_WEBHOOK_URL                  Slack incoming-webhook URL for outcome
+                                     notifications; else read from the 0600 file
+                                     ~/.runner-agent/slack-webhook
+  RUNNER_AGENT_SLACK_WEBHOOK_FILE    Override the webhook file path
 
 See docs/runner-agent.md for the trust model and tuning.
 EOF
@@ -138,6 +153,60 @@ skip() {
   mkdir -p "${STATE_DIR}"
   jq -n --arg reason "${reason}" '{skip:true, reason:$reason}' > "${CONTEXT_FILE}"
   exit 0
+}
+
+# ----------------------------------------------------------------------------
+# Slack notifications — best-effort, compact, identifiers and links only
+# ----------------------------------------------------------------------------
+# Webhook URL: SLACK_WEBHOOK_URL env, else the first line of the 0600 file.
+slack_webhook_url() {
+  if [[ -n "${SLACK_WEBHOOK_URL:-}" ]]; then
+    printf '%s' "${SLACK_WEBHOOK_URL}"
+  elif [[ -n "${SLACK_WEBHOOK_FILE}" && -f "${SLACK_WEBHOOK_FILE}" ]]; then
+    local perms
+    perms="$(stat -f '%Lp' "${SLACK_WEBHOOK_FILE}" 2>/dev/null || echo '?')"
+    [[ "${perms}" == "600" || "${perms}" == "?" ]] \
+      || warn "${SLACK_WEBHOOK_FILE} is mode ${perms}; chmod 600 is recommended."
+    head -n1 "${SLACK_WEBHOOK_FILE}" | tr -d '[:space:]'
+  fi
+  return 0
+}
+
+# Post one plain-text message (Slack mrkdwn, so <url|label> links work) to the
+# incoming webhook. The webhook URL is itself a secret, so it travels in a
+# 0600 curl -K config file (url = "..."), never on the curl command line where
+# `ps` could expose it. Delivery problems are logged and never fail the job.
+slack_send() {
+  local text="$1" url
+  url="$(slack_webhook_url)"
+  if [[ -z "${url}" ]]; then
+    step "No Slack webhook configured (SLACK_WEBHOOK_URL); skipping notification."
+    return 0
+  fi
+  command -v curl >/dev/null 2>&1 || { warn "curl not found; Slack notification skipped."; return 0; }
+  local tmp rc=0
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/runner-agent-slack.XXXXXX")"
+  printf 'url = "%s"\n' "${url}" > "${tmp}/slack.conf"
+  chmod 600 "${tmp}/slack.conf"
+  jq -cn --arg text "${text}" '{text:$text}' \
+    | curl -fsS -o /dev/null --connect-timeout 5 --max-time 15 \
+        -K "${tmp}/slack.conf" \
+        -H 'Content-Type: application/json' \
+        --data-binary @- || rc=$?
+  rm -rf "${tmp}"
+  if [[ "${rc}" -ne 0 ]]; then
+    warn "Slack notification failed (curl rc=${rc}); continuing."
+  else
+    step "Slack notified: ${text}"
+  fi
+  return 0
+}
+
+cmd_notify() {
+  local text="${1:-}" link="${2:-}"
+  [[ -n "${text}" ]] || { err "notify requires a message: ${PROG_NAME} notify <text> [url]"; exit 2; }
+  [[ -z "${link}" ]] || text="${text} — <${link}|link>"
+  slack_send "${text}"
 }
 
 # ----------------------------------------------------------------------------
@@ -363,6 +432,12 @@ cmd_gate() {
     issue_comment|pull_request_review_comment) gate_comment ;;
     *) skip "unsupported event ${GITHUB_EVENT_NAME}" ;;
   esac
+  # skip() exits, so reaching here means the event was accepted.
+  case "$(ctx .mode)" in
+    pr-comment|issue-comment)
+      slack_send "runner-agent: acknowledged ${MENTION} on ${GITHUB_REPOSITORY} #$(ctx .number) — working on it."
+      ;;
+  esac
 }
 
 # ----------------------------------------------------------------------------
@@ -534,6 +609,37 @@ comment_origin() {
   fi
 }
 
+# Compact Slack message for a publish outcome; repo/run/PR identifiers and a
+# link only — never the agent's summary, log contents, or secrets.
+notify_outcome() {
+  local outcome="$1" link="${2:-}" mode number what msg
+  mode="$(ctx .mode)"; number="$(ctx .number)"
+  case "${mode}" in
+    ci-fix) what="CI run $(ctx .run_id) in ${GITHUB_REPOSITORY}" ;;
+    *)      what="${MENTION} request on ${GITHUB_REPOSITORY} #${number}" ;;
+  esac
+  if [[ -z "${link}" ]]; then
+    case "${outcome}" in
+      pushed) link="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY}/pull/${number}" ;;
+      comment)
+        if [[ "${mode}" == "ci-fix" ]]; then
+          link="$(ctx .run_url)"
+        else
+          link="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY}/issues/${number}"
+        fi
+        ;;
+    esac
+  fi
+  case "${outcome}" in
+    pr)      msg="runner-agent: opened a fix PR for ${what}" ;;
+    pushed)  msg="runner-agent: pushed a fix for ${what}" ;;
+    comment) msg="runner-agent: ${what} finished with no code change; diagnosis posted as a comment" ;;
+    *)       return 0 ;;
+  esac
+  [[ -z "${link}" || "${link}" == "null" ]] || msg="${msg} — <${link}|view>"
+  slack_send "${msg}"
+}
+
 cmd_publish() {
   require_cmds jq git gh || exit 1
   [[ -f "${CONTEXT_FILE}" && -f "${SUMMARY_FILE}" ]] || { err "Run gate and run before publish."; exit 1; }
@@ -566,6 +672,7 @@ cmd_publish() {
 
 ${body}"
     gh_output outcome comment
+    notify_outcome comment
     exit 0
   fi
 
@@ -585,6 +692,7 @@ Pushed $(git rev-parse --short HEAD) to \`${work}\`.
 
 ${body}"
     gh_output outcome pushed
+    notify_outcome pushed
     exit 0
   fi
 
@@ -602,6 +710,7 @@ ${body}"
 Opened ${pr_url}
 
 ${body}"
+  notify_outcome pr "${pr_url}"
 }
 
 # ----------------------------------------------------------------------------
@@ -616,6 +725,7 @@ main() {
     gate)    shift; cmd_gate ;;
     run)     shift; cmd_run ;;
     publish) shift; cmd_publish ;;
+    notify)  shift; cmd_notify "$@" ;;
     -h|--help|"") usage; [[ -n "${COMMAND}" ]] && exit 0 || exit 2 ;;
     *) err "Unknown command: ${COMMAND}"; usage; exit 2 ;;
   esac

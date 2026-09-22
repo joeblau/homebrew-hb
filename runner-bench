@@ -1,0 +1,1269 @@
+#!/usr/bin/env bash
+#
+# runner-bench — repeatable CI performance benchmarks and resource
+# measurements for GitHub Actions self-hosted runners on macOS.
+#
+# Usage:
+#   runner-bench run --cmd 'WORKLOAD' [--scenario cold|warm|edited] [--reps N]
+#       [--concurrency N] [--label NAME] [--workdir DIR] [--cache-dir DIR]
+#       [--edit-file PATH] [--queued-at EPOCH] [--interval SEC]
+#       [--results-dir DIR] [--toolchain DESC]
+#   runner-bench report [--results-dir DIR | --results FILE ...]
+#       [--label NAME] [--scenario NAME] [--baseline LABEL --candidate LABEL]
+#       [--json]
+#
+# run:    executes a pinned, representative workload REPS times under the
+#         chosen cache scenario and records one JSON record per workload
+#         instance (plus one host-wide record per repetition) to
+#         RESULTS_DIR/runner-bench.jsonl. While the workload runs, a sampler
+#         records host-wide CPU/RSS/swap/disk and per-job CPU/RSS (summed over
+#         each workload's process tree) every INTERVAL seconds; raw samples
+#         and workload logs are retained under RESULTS_DIR/.
+#
+#         Scenarios:
+#           cold   wipe the DISPOSABLE benchmark cache dir before each rep.
+#                  The cache dir must live inside the workdir; production
+#                  caches (~/Library/Caches, /opt, ...) are never purged.
+#           warm   run unchanged (incremental/build-cache reuse).
+#           edited append one small deterministic line to --edit-file before
+#                  each rep (simulates a small source edit).
+#         --concurrency N runs N identical workload copies in parallel in
+#         per-slot workdirs; per-job records (scope "job", one per slot) stay
+#         separate from host-wide records (scope "host").
+#
+#         The workload may emit phase timings and cache counters:
+#           printf 'RUNNER_BENCH_PHASE <name> <epoch_seconds>\n'   # phase end
+#           printf 'cache_hits=12\ncache_restore_s=2\n' >> "$RUNNER_BENCH_STATS_FILE"
+#         Phase durations are computed between consecutive markers (the first
+#         marker is measured from workload start). Recommended phase names:
+#         setup, checkout, restore, build, test, save, cleanup.
+#         Queue delay is recorded when --queued-at (or RUNNER_BENCH_QUEUED_AT)
+#         supplies the time the job entered the queue; on a real runner, take
+#         it from the GitHub API's run/job created_at. Measurements that
+#         cannot be collected (queue delay without --queued-at, disk I/O
+#         rates, cache counters the workload does not report, ...) are listed
+#         in each record's "unsupported" array instead of being invented.
+#
+#         A failed repetition (nonzero exit) is recorded with its exit code
+#         and the run continues; the final exit status is 1 if any repetition
+#         failed. Interrupting (Ctrl-C/SIGTERM) kills the whole workload
+#         process trees and the sampler — no orphan processes — and still
+#         writes "cancelled" records before exiting 130.
+#
+# report: reads the raw JSON-lines results, groups by (label, scenario,
+#         concurrency), and prints median/p95/min/max for full-job duration,
+#         queue delay, per-phase timings, CPU/RSS peaks, cache restore/save,
+#         cache growth, and host swap/disk growth, with the sample size
+#         stated (a warning when fewer than 5 repetitions). With --baseline
+#         and --candidate it prints measured deltas for matching groups and
+#         flags regressions in failures, cancellations, swap growth, and
+#         cache growth. It warns when host hardware or the workload command
+#         differ between compared groups. No speedup is claimed without
+#         recorded measurements on both sides.
+#
+# Everything runs as the invoking user: no sudo, no /opt, no launchd, and
+# production caches are never modified. bash 3.2 for orchestration; python3
+# (stdlib only) assembles result records and renders reports.
+
+set -euo pipefail
+
+# ----------------------------------------------------------------------------
+# Constants / globals
+# ----------------------------------------------------------------------------
+PROG_NAME="$(basename "$0")"
+BENCH_ROOT="${HOME}/.runner-bench"
+
+MODE=""                            # run | report
+SCENARIO="warm"                    # cold | warm | edited
+LABEL="run"                        # configuration label (baseline/candidate/...)
+REPS=5                             # repetitions per scenario
+CONCURRENCY=1                      # parallel workload copies per repetition
+CMD=""                             # pinned workload command (required for run)
+WORKDIR=""                         # default resolved after arg parse
+CACHE_DIR=""                       # default: WORKDIR/.bench-cache
+EDIT_FILE="BENCH_EDIT.txt"         # edited scenario: file to append to
+RESULTS_DIR=""                     # default resolved after arg parse
+RESULTS_FILE=""                    # run: JSON-lines output (derived)
+RESULTS_FILES=""                   # report: colon-separated explicit files
+INTERVAL=5                         # sampling interval, seconds
+QUEUED_AT=""                       # epoch the job was queued (empty = unknown)
+TOOLCHAIN=""                       # freeform pinned toolchain description
+BASELINE=""                        # report: comparison baseline label
+CANDIDATE=""                       # report: comparison candidate label
+LABEL_FILTER=""                    # report: only this label
+SCENARIO_FILTER=""                 # report: only this scenario
+LABEL_SET=0                        # --label passed explicitly
+SCENARIO_SET=0                     # --scenario passed explicitly
+JSON=0                             # report: JSON output on stdout
+
+HOST_LABEL=""
+NOW_EPOCH=""
+RUN_ID=""
+START_EPOCH=0
+END_EPOCH=0
+CANCELLED=0
+ANY_FAILURE=0
+SAMPLER_PID=""
+LAUNCH_PID=""
+SAMPLES_FILE=""
+SLOT_PIDS_FILE=""
+SLOTS_TSV=""
+META_FILE=""
+WORK_TMPDIR=""
+
+# ----------------------------------------------------------------------------
+# Output helpers — progress goes to stderr; stdout stays machine-readable.
+# ----------------------------------------------------------------------------
+log()  { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
+step() { printf '\033[1;32m  ->\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[1;33mWARN:\033[0m %s\n' "$*" >&2; }
+err()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; }
+
+usage() {
+  cat >&2 <<EOF
+${PROG_NAME} — repeatable CI benchmarks + resource measurements (macOS)
+
+USAGE:
+  ${PROG_NAME} run --cmd 'WORKLOAD' [--scenario cold|warm|edited] [--reps N]
+      [--concurrency N] [--label NAME] [--workdir DIR] [--cache-dir DIR]
+      [--edit-file PATH] [--queued-at EPOCH] [--interval SEC]
+      [--results-dir DIR] [--toolchain DESC]
+  ${PROG_NAME} report [--results-dir DIR | --results FILE ...]
+      [--label NAME] [--scenario NAME] [--baseline LABEL --candidate LABEL]
+      [--json]
+
+MODES:
+  run     Execute the pinned workload REPS times under the cache scenario,
+          sampling host-wide CPU/RSS/swap/disk and per-job (process-tree)
+          CPU/RSS every INTERVAL seconds. Appends one JSON record per
+          workload instance plus one host-wide record per repetition to
+          RESULTS_DIR/runner-bench.jsonl; raw samples and workload logs are
+          retained alongside. Exit 1 when any repetition failed; interrupting
+          kills all workload processes and records "cancelled" results.
+  report  Group raw results by (label, scenario, concurrency) and print
+          median/p95/min/max for duration, queue delay, phases, CPU/RSS
+          peaks, cache restore/save and growth, and host swap/disk growth —
+          sample sizes stated, warnings below 5 repetitions. --baseline and
+          --candidate add measured deltas and regression flags (failures,
+          cancellations, swap growth, cache growth). No speedup is claimed
+          without measurements on both sides.
+
+SCENARIOS (run):
+  cold    Wipe the DISPOSABLE benchmark cache dir before each repetition.
+          The cache dir must live inside the workdir; production caches are
+          never purged to obtain a cold baseline.
+  warm    Run unchanged (default): incremental/warm-cache measurement.
+  edited  Append one small deterministic line to --edit-file before each
+          repetition, simulating a small source edit.
+
+OPTIONS:
+  --cmd 'WORKLOAD'   Pinned workload command (required for run). Pin source
+                     revision, toolchain, and architecture inside it.
+  --scenario NAME    cold | warm | edited (default: ${SCENARIO})
+  --reps N           Repetitions per scenario (default: ${REPS}; >=5 recommended)
+  --concurrency N    Parallel workload copies per repetition (default: 1);
+                     each copy runs in WORKDIR/slot-N with RUNNER_BENCH_SLOT set
+  --label NAME       Configuration label, e.g. baseline / candidate
+                     (default: ${LABEL}); [A-Za-z0-9._-]
+  --workdir DIR      Benchmark workdir (default: ~/.runner-bench/work)
+  --cache-dir DIR    Disposable benchmark cache dir (default: WORKDIR/.bench-cache;
+                     must live inside the workdir for cold runs)
+  --edit-file PATH   File the edited scenario appends to; relative paths
+                     resolve inside each slot's workdir (default: ${EDIT_FILE})
+  --queued-at EPOCH  When the job entered the queue (queue delay = start -
+                     queued-at). Default: RUNNER_BENCH_QUEUED_AT env. Without
+                     it, queue_delay_s is null and listed as unsupported.
+  --interval SEC     Sampling interval (default: ${INTERVAL})
+  --results-dir DIR  Raw results/samples/logs root (default: ~/.runner-bench/results)
+  --results FILE     report: explicit results file (repeatable) instead of
+                     globbing --results-dir
+  --toolchain DESC   Freeform pinned toolchain note recorded with every record
+  --label NAME       report: restrict to one label
+  --scenario NAME    report: restrict to one scenario
+  --baseline LABEL   report: comparison baseline label (with --candidate)
+  --candidate LABEL  report: comparison candidate label (with --baseline)
+  --json             report: emit JSON on stdout instead of text
+  -h, --help         Show this help and exit
+
+WORKLOAD CONTRACT (run):
+  The workload runs via eval in each slot's workdir with these env vars:
+    RUNNER_BENCH_SLOT        slot index (0..concurrency-1)
+    RUNNER_BENCH_CACHE_DIR   disposable cache dir (wiped by cold runs)
+    RUNNER_BENCH_STATS_FILE  write 'key=value' lines here for cache counters
+    RUNNER_BENCH_SCENARIO    active scenario name
+  Phase timings: print 'RUNNER_BENCH_PHASE <name> <epoch_seconds>' on
+  stdout/stderr at the end of each phase (helper:
+  bench_phase() { printf 'RUNNER_BENCH_PHASE %s %s\n' "\$1" "\$(date +%s)"; }).
+  Recommended phase names: setup, checkout, restore, build, test, save,
+  cleanup. Recognized stats keys: cache_hits, cache_misses, cache_restore_s,
+  cache_save_s; any other keys are recorded under cache.stats.
+  Measurements that cannot be collected are named in each record's
+  "unsupported" array (disk I/O rates are never collected — only disk usage
+  growth).
+
+EXAMPLES:
+  # Cold vs warm, pinned source + toolchain, five repetitions each:
+  ${PROG_NAME} run --scenario cold --label baseline --reps 5 \\
+    --toolchain 'rustc 1.80.1, macOS 15, arm64' \\
+    --cmd 'mkdir -p "\$RUNNER_BENCH_CACHE_DIR"; echo benchmark-smoke'
+  # docs/runner-performance.md includes a repeatable C build workload that
+  # handles cold/warm caches and applies valid source edits after checkout.
+  ${PROG_NAME} run --scenario warm --label baseline --reps 5 --cmd '...'
+  # A small source edit, then concurrency scaling:
+  ${PROG_NAME} run --scenario edited --label baseline --reps 5 --cmd '...'
+  ${PROG_NAME} run --scenario warm --label baseline --reps 5 --concurrency 2 --cmd '...'
+  # Compare two configurations (same workload, host, and results dir):
+  ${PROG_NAME} report --baseline baseline --candidate candidate
+  ${PROG_NAME} report --json > bench-summary.json
+
+SAFETY:
+  Runs as the invoking user: no sudo, no /opt, no launchd. Cold runs wipe
+  only the disposable cache dir inside the workdir — never production caches
+  (~/Library/Caches, runner caches, Docker/BuildKit state). Interrupting
+  kills the full workload process trees, so cancelled runs leave no orphan
+  processes. See docs/runner-performance.md for the benchmark procedure.
+EOF
+}
+
+# ----------------------------------------------------------------------------
+# Cleanup / signal traps
+# ----------------------------------------------------------------------------
+cleanup() {
+  local code=$?
+  if [[ -n "${SLOT_PIDS_FILE}" && -f "${SLOT_PIDS_FILE}" ]]; then
+    local slot pid
+    while IFS=$'\t' read -r slot pid; do
+      kill "${pid}" 2>/dev/null || true
+      wait "${pid}" 2>/dev/null || true
+    done < "${SLOT_PIDS_FILE}"
+  fi
+  if [[ -n "${SAMPLER_PID}" ]]; then
+    kill "${SAMPLER_PID}" 2>/dev/null || true
+  fi
+  if [[ -n "${WORK_TMPDIR}" && -d "${WORK_TMPDIR}" ]]; then
+    rm -rf "${WORK_TMPDIR}" 2>/dev/null || true
+  fi
+  return "${code}"
+}
+
+global_interrupt() {
+  err "Interrupted."
+  exit 130
+}
+
+# First interrupt: cancel gracefully — kill every workload process tree and
+# let the current repetition finalize "cancelled" records. Second interrupt:
+# abort immediately (the EXIT trap still kills the sampler).
+on_interrupt() {
+  if [[ "${CANCELLED}" -eq 1 ]]; then
+    err "Interrupted again; aborting."
+    exit 130
+  fi
+  CANCELLED=1
+  warn "Interrupted — cancelling the workload (interrupt again to abort)..."
+  if [[ -f "${SLOT_PIDS_FILE}" ]]; then
+    local slot pid
+    while IFS=$'\t' read -r slot pid; do
+      [[ -n "${pid}" ]] || continue
+      kill "${pid}" 2>/dev/null || true
+    done < "${SLOT_PIDS_FILE}"
+  fi
+  return 0
+}
+
+trap cleanup EXIT
+trap global_interrupt INT TERM
+
+# ----------------------------------------------------------------------------
+# Argument parsing
+# ----------------------------------------------------------------------------
+parse_args() {
+  if [[ $# -gt 0 ]]; then
+    case "$1" in
+      run|report) MODE="$1"; shift ;;
+    esac
+  fi
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --cmd)
+        [[ $# -ge 2 ]] || { err "--cmd requires a value"; usage; exit 2; }
+        CMD="$2"; shift 2 ;;
+      --cmd=*)     CMD="${1#*=}"; shift ;;
+      --scenario)
+        [[ $# -ge 2 ]] || { err "--scenario requires a value"; usage; exit 2; }
+        SCENARIO="$2"; SCENARIO_SET=1; shift 2 ;;
+      --scenario=*) SCENARIO="${1#*=}"; SCENARIO_SET=1; shift ;;
+      --reps)
+        [[ $# -ge 2 ]] || { err "--reps requires a value"; usage; exit 2; }
+        REPS="$2"; shift 2 ;;
+      --reps=*)    REPS="${1#*=}"; shift ;;
+      --concurrency)
+        [[ $# -ge 2 ]] || { err "--concurrency requires a value"; usage; exit 2; }
+        CONCURRENCY="$2"; shift 2 ;;
+      --concurrency=*) CONCURRENCY="${1#*=}"; shift ;;
+      --label)
+        [[ $# -ge 2 ]] || { err "--label requires a value"; usage; exit 2; }
+        LABEL="$2"; LABEL_SET=1; shift 2 ;;
+      --label=*)   LABEL="${1#*=}"; LABEL_SET=1; shift ;;
+      --workdir)
+        [[ $# -ge 2 ]] || { err "--workdir requires a value"; usage; exit 2; }
+        WORKDIR="$2"; shift 2 ;;
+      --workdir=*) WORKDIR="${1#*=}"; shift ;;
+      --cache-dir)
+        [[ $# -ge 2 ]] || { err "--cache-dir requires a value"; usage; exit 2; }
+        CACHE_DIR="$2"; shift 2 ;;
+      --cache-dir=*) CACHE_DIR="${1#*=}"; shift ;;
+      --edit-file)
+        [[ $# -ge 2 ]] || { err "--edit-file requires a value"; usage; exit 2; }
+        EDIT_FILE="$2"; shift 2 ;;
+      --edit-file=*) EDIT_FILE="${1#*=}"; shift ;;
+      --queued-at)
+        [[ $# -ge 2 ]] || { err "--queued-at requires a value"; usage; exit 2; }
+        QUEUED_AT="$2"; shift 2 ;;
+      --queued-at=*) QUEUED_AT="${1#*=}"; shift ;;
+      --interval)
+        [[ $# -ge 2 ]] || { err "--interval requires a value"; usage; exit 2; }
+        INTERVAL="$2"; shift 2 ;;
+      --interval=*) INTERVAL="${1#*=}"; shift ;;
+      --results-dir)
+        [[ $# -ge 2 ]] || { err "--results-dir requires a value"; usage; exit 2; }
+        RESULTS_DIR="$2"; shift 2 ;;
+      --results-dir=*) RESULTS_DIR="${1#*=}"; shift ;;
+      --results)
+        [[ $# -ge 2 ]] || { err "--results requires a value"; usage; exit 2; }
+        if [[ -n "${RESULTS_FILES}" ]]; then RESULTS_FILES="${RESULTS_FILES}:$2"; else RESULTS_FILES="$2"; fi
+        shift 2 ;;
+      --results=*)
+        if [[ -n "${RESULTS_FILES}" ]]; then RESULTS_FILES="${RESULTS_FILES}:${1#*=}"; else RESULTS_FILES="${1#*=}"; fi
+        shift ;;
+      --toolchain)
+        [[ $# -ge 2 ]] || { err "--toolchain requires a value"; usage; exit 2; }
+        TOOLCHAIN="$2"; shift 2 ;;
+      --toolchain=*) TOOLCHAIN="${1#*=}"; shift ;;
+      --baseline)
+        [[ $# -ge 2 ]] || { err "--baseline requires a value"; usage; exit 2; }
+        BASELINE="$2"; shift 2 ;;
+      --baseline=*) BASELINE="${1#*=}"; shift ;;
+      --candidate)
+        [[ $# -ge 2 ]] || { err "--candidate requires a value"; usage; exit 2; }
+        CANDIDATE="$2"; shift 2 ;;
+      --candidate=*) CANDIDATE="${1#*=}"; shift ;;
+      --json)      JSON=1; shift ;;
+      -h|--help)   usage; exit 0 ;;
+      *)
+        err "Unknown argument: $1"
+        usage
+        exit 2 ;;
+    esac
+  done
+
+  if [[ -z "${MODE}" ]]; then
+    err "A mode is required: run or report."
+    usage
+    exit 2
+  fi
+
+  # --label/--scenario double as report filters when given explicitly.
+  if [[ "${MODE}" == "report" ]]; then
+    [[ "${LABEL_SET}" -eq 1 ]] && LABEL_FILTER="${LABEL}"
+    [[ "${SCENARIO_SET}" -eq 1 ]] && SCENARIO_FILTER="${SCENARIO}"
+  fi
+
+  case "${SCENARIO}" in
+    cold|warm|edited) ;;
+    *) err "--scenario must be cold, warm, or edited (got: '${SCENARIO}')"; exit 2 ;;
+  esac
+  if ! [[ "${REPS}" =~ ^[0-9]+$ ]] || [[ "${REPS}" -lt 1 ]]; then
+    err "--reps must be a positive integer (got: '${REPS}')"
+    exit 2
+  fi
+  if ! [[ "${CONCURRENCY}" =~ ^[0-9]+$ ]] || [[ "${CONCURRENCY}" -lt 1 ]]; then
+    err "--concurrency must be a positive integer (got: '${CONCURRENCY}')"
+    exit 2
+  fi
+  if ! [[ "${INTERVAL}" =~ ^[0-9]+$ ]] || [[ "${INTERVAL}" -lt 1 ]]; then
+    err "--interval must be a positive integer (got: '${INTERVAL}')"
+    exit 2
+  fi
+  if ! [[ "${LABEL}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    err "--label must match [A-Za-z0-9._-] (got: '${LABEL}')"
+    exit 2
+  fi
+  [[ -n "${QUEUED_AT}" ]] || QUEUED_AT="${RUNNER_BENCH_QUEUED_AT:-}"
+  if [[ -n "${QUEUED_AT}" && ! "${QUEUED_AT}" =~ ^[0-9]+$ ]]; then
+    err "--queued-at must be epoch seconds (got: '${QUEUED_AT}')"
+    exit 2
+  fi
+  if [[ "${MODE}" == "run" && -z "${CMD}" ]]; then
+    err "run requires --cmd 'WORKLOAD' (the pinned benchmark workload)."
+    exit 2
+  fi
+  if [[ -n "${BASELINE}" || -n "${CANDIDATE}" ]]; then
+    if [[ -z "${BASELINE}" || -z "${CANDIDATE}" ]]; then
+      err "--baseline and --candidate must be given together."
+      exit 2
+    fi
+    if [[ "${MODE}" != "report" ]]; then
+      err "--baseline/--candidate are report options."
+      exit 2
+    fi
+  fi
+
+  [[ -n "${WORKDIR}" ]] || WORKDIR="${BENCH_ROOT}/work"
+  [[ -n "${CACHE_DIR}" ]] || CACHE_DIR="${WORKDIR}/.bench-cache"
+  [[ -n "${RESULTS_DIR}" ]] || RESULTS_DIR="${BENCH_ROOT}/results"
+  RESULTS_FILE="${RESULTS_DIR}/runner-bench.jsonl"
+}
+
+# ----------------------------------------------------------------------------
+# Environment detection
+# ----------------------------------------------------------------------------
+detect_platform() {
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    err "This tool only supports macOS."
+    exit 1
+  fi
+}
+
+require_cmds() {
+  local missing=() c
+  local cmds="sed grep awk cut date uname mktemp tr mkdir rm sleep kill ps sysctl df du cat"
+  if [[ "${MODE}" == "run" || "${MODE}" == "report" ]]; then
+    cmds="${cmds} python3"
+  fi
+  for c in ${cmds}; do
+    command -v "${c}" >/dev/null 2>&1 || missing+=("${c}")
+  done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    err "Required command(s) not found: ${missing[*]}"
+    exit 1
+  fi
+}
+
+# Sanitized machine name, mirroring runner-setup's detect_host.
+detect_host() {
+  local h
+  h="$(scutil --get LocalHostName 2>/dev/null || true)"
+  [[ -n "${h}" ]] || h="$(hostname -s 2>/dev/null || true)"
+  [[ -n "${h}" ]] || h="$(uname -n 2>/dev/null | cut -d. -f1 || true)"
+  h="$(printf '%s' "${h}" | tr -c 'A-Za-z0-9' '-' | tr -s '-')"
+  h="${h#-}"; h="${h%-}"
+  HOST_LABEL="${h:-mac}"
+}
+
+now_epoch() { NOW_EPOCH="$(date -u '+%s')"; }
+iso_now() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
+
+# Escape a string for embedding in JSON (same rules as runner-logs).
+json_escape() {
+  printf '%s' "$1" | python3 -c 'import json, sys; print(json.dumps(sys.stdin.read())[1:-1], end="")'
+}
+
+# Hardware/OS configuration recorded alongside every result, so baseline and
+# candidate runs stay comparable (and mis-matched fleets are visible).
+host_info_json() {
+  local model ncpu mem arch osv
+  model="$(sysctl -n hw.model 2>/dev/null || true)"
+  ncpu="$(sysctl -n hw.ncpu 2>/dev/null || true)"
+  mem="$(sysctl -n hw.memsize 2>/dev/null || true)"
+  arch="$(uname -m 2>/dev/null || true)"
+  osv="$(sw_vers -productVersion 2>/dev/null || true)"
+  printf '{"label":"%s","model":"%s","cpu_count":%s,"mem_bytes":%s,"arch":"%s","macos":"%s"}' \
+    "$(json_escape "${HOST_LABEL}")" "$(json_escape "${model}")" \
+    "${ncpu:-null}" "${mem:-null}" \
+    "$(json_escape "${arch}")" "$(json_escape "${osv}")"
+}
+
+# Used swap in MB (float) from sysctl vm.swapusage, empty when unavailable.
+swap_used_mb() {
+  sysctl vm.swapusage 2>/dev/null \
+    | sed -n 's/.*used = \([0-9.]*\)M.*/\1/p' | head -n1 || true
+}
+
+# Directory size in KB (0 when missing).
+dir_kb() {
+  if [[ -d "$1" ]]; then
+    du -sk "$1" 2>/dev/null | awk '{print $1}' || printf '0'
+  else
+    printf '0'
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# Sampling — host-wide plus per-workload process tree, no sudo.
+# ----------------------------------------------------------------------------
+
+# Summed CPU % and RSS (MB) of $1 and all its descendants (ps tree-walk).
+tree_stats() {
+  local root="$1"
+  ps -axo pid=,ppid=,pcpu=,rss= 2>/dev/null | awk -v root="${root}" '
+    { parent[$1]=$2; cpu[$1]=$3; rss[$1]=$4 }
+    END {
+      tc=0; tr=0
+      for (p in parent) {
+        q=p; d=0
+        while (q != "" && q != 0 && d < 64) {
+          if (q == root) { tc+=cpu[p]; tr+=rss[p]; break }
+          q=parent[q]; d++
+        }
+      }
+      printf "%.1f %d", tc, int(tr/1024)
+    }'
+}
+
+# Best-effort tree cleanup utility. Workload supervision uses a dedicated
+# process group instead, since exited parents can lose their descendants.
+kill_tree() {
+  local root="$1" kids
+  [[ -n "${root}" ]] || return 0
+  kids="$(ps -axo pid=,ppid= 2>/dev/null | awk -v root="${root}" '
+    { parent[$1]=$2 }
+    END {
+      for (p in parent) {
+        q=p; d=0
+        while (q != "" && q != 0 && d < 64) {
+          if (q == root) { print p; break }
+          q=parent[q]; d++
+        }
+      }
+    }' || true)"
+  if [[ -n "${kids}" ]]; then
+    kill ${kids} 2>/dev/null || true
+  fi
+  kill "${root}" 2>/dev/null || true
+  sleep 1
+  if [[ -n "${kids}" ]]; then
+    kill -9 ${kids} 2>/dev/null || true
+  fi
+  kill -9 "${root}" 2>/dev/null || true
+  return 0
+}
+
+# Append one host-wide sample and one per-slot job sample to SAMPLES_FILE.
+sample_once() {
+  local ts host_stats cpu rss swap disk slot pid stats
+  ts="$(iso_now)"
+  host_stats="$(ps -axo pcpu=,rss= 2>/dev/null \
+    | awk '{cpu+=$1; rss+=$2} END {printf "%.1f %d", cpu+0, int(rss/1024)}' || true)"
+  [[ -n "${host_stats}" ]] || host_stats="0.0 0"
+  cpu="${host_stats%% *}"; rss="${host_stats##* }"
+  swap="$(swap_used_mb)"
+  disk="$(df -k "${WORKDIR}" 2>/dev/null | awk 'NR==2 {print $3}' || true)"
+  printf '{"ts":"%s","scope":"host","cpu_pct":%s,"rss_mb":%s,"swap_used_mb":%s,"disk_used_kb":%s}\n' \
+    "${ts}" "${cpu}" "${rss}" "${swap:-null}" "${disk:-null}" >> "${SAMPLES_FILE}" || true
+  if [[ -f "${SLOT_PIDS_FILE}" ]]; then
+    while IFS=$'\t' read -r slot pid; do
+      [[ -n "${slot}" && -n "${pid}" ]] || continue
+      stats="$(tree_stats "${pid}" || true)"
+      [[ -n "${stats}" ]] || continue
+      printf '{"ts":"%s","scope":"job","slot":%s,"cpu_pct":%s,"rss_mb":%s}\n' \
+        "${ts}" "${slot}" "${stats%% *}" "${stats##* }" >> "${SAMPLES_FILE}" || true
+    done < "${SLOT_PIDS_FILE}"
+  fi
+  return 0
+}
+
+run_sampler() {
+  while :; do
+    sample_once || true
+    sleep "${INTERVAL}"
+  done
+}
+
+# ----------------------------------------------------------------------------
+# RUN mode
+# ----------------------------------------------------------------------------
+
+# Cold runs wipe only this disposable cache dir, and only when it lives
+# inside the workdir — production caches are never purged for a baseline.
+check_cache_safety() {
+  [[ "${SCENARIO}" == "cold" ]] || return 0
+  mkdir -p "${WORKDIR}" "${CACHE_DIR}"
+  local wd cd
+  wd="$(cd "${WORKDIR}" && pwd -P)"
+  cd="$(cd "${CACHE_DIR}" && pwd -P)"
+  if [[ "${cd}" == "${wd}" ]]; then
+    err "--cache-dir must not BE the workdir (refusing to wipe '${cd}')."
+    exit 2
+  fi
+  case "${cd}/" in
+    "${wd}/"*) : ;;
+    *)
+      err "--cache-dir must live inside --workdir for cold runs (refusing to wipe '${cd}')."
+      err "Production caches are never purged; use a disposable directory inside the workdir."
+      exit 2 ;;
+  esac
+}
+
+prepare_scenario() {
+  local slot_dir="$1" cache_dir="$2" rep="$3"
+  case "${SCENARIO}" in
+    cold)
+      rm -rf "${cache_dir}"
+      mkdir -p "${cache_dir}"
+      step "cold: wiped disposable bench cache ${cache_dir}"
+      ;;
+    edited)
+      local ef="${EDIT_FILE}"
+      [[ "${ef}" == /* ]] || ef="${slot_dir}/${ef}"
+      printf 'benchmark edit: scenario=edited rep=%s\n' "${rep}" >> "${ef}"
+      step "edited: appended small source edit to ${ef}"
+      ;;
+    warm) : ;;
+  esac
+}
+
+# Launch one workload copy in its slot dir. Sets LAUNCH_PID (a command
+# substitution would make the job a child of the subshell, breaking wait).
+launch_slot() {
+  local slot="$1" slot_dir="$2" cache_dir="$3" logfile="$4" stats="$5"
+  RUNNER_BENCH_SLOT="${slot}" RUNNER_BENCH_CACHE_DIR="${cache_dir}" \
+  RUNNER_BENCH_STATS_FILE="${stats}" RUNNER_BENCH_SCENARIO="${SCENARIO}" \
+  python3 - "${slot_dir}" "${CMD}" "${stats}.timing" > "${logfile}" 2>&1 <<'PYSLOT' &
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+
+workdir, command, timing_path = sys.argv[1:]
+child = None
+cancelled = False
+
+def stop_group():
+    if child is not None:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+def cancel(signum, frame):
+    global cancelled
+    cancelled = True
+    stop_group()
+
+signal.signal(signal.SIGTERM, cancel)
+signal.signal(signal.SIGINT, cancel)
+started = time.time()
+clock_start = time.monotonic()
+rc = 130
+try:
+    if not cancelled:
+        child = subprocess.Popen(["/bin/bash", "-e", "-o", "pipefail", "-c", command],
+                                 cwd=workdir, start_new_session=True)
+        if cancelled:
+            stop_group()
+        rc = child.wait()
+finally:
+    finished = time.time()
+    duration = time.monotonic() - clock_start
+    # The process group survives a shell exiting and its children being reparented.
+    # Always clean it, including successful jobs which left background workers.
+    stop_group()
+    with open(timing_path, "w") as handle:
+        json.dump({"start_epoch": started, "end_epoch": finished,
+                   "duration_s": duration}, handle)
+sys.exit(130 if cancelled else (128 - rc if rc < 0 else rc))
+PYSLOT
+  LAUNCH_PID=$!
+}
+
+write_meta() {
+  local path="$1" rep="$2"
+  local queued="null"
+  [[ -z "${QUEUED_AT}" ]] || queued="${QUEUED_AT}"
+  printf '{"schema_version":1,"run_id":"%s","label":"%s","toolchain":"%s","scenario":"%s","concurrency":%s,"repetition":%s,"command":"%s","host":%s,"queued_at":%s,"started_at":"%s","finished_at":"%s","start_epoch":%s,"end_epoch":%s,"cancelled":%s}\n' \
+    "$(json_escape "${RUN_ID}")" "$(json_escape "${LABEL}")" "$(json_escape "${TOOLCHAIN}")" \
+    "${SCENARIO}" "${CONCURRENCY}" "${rep}" "$(json_escape "${CMD}")" "$(host_info_json)" \
+    "${queued}" \
+    "$(date -u -r "${START_EPOCH}" '+%Y-%m-%dT%H:%M:%SZ')" \
+    "$(date -u -r "${END_EPOCH}" '+%Y-%m-%dT%H:%M:%SZ')" \
+    "${START_EPOCH}" "${END_EPOCH}" \
+    "$([[ "${CANCELLED}" -eq 1 ]] && echo true || echo false)" > "${path}"
+}
+
+# Assemble the per-slot job records and the host record from the meta file,
+# the slots table, and the raw samples; append to the results file.
+finalize_rep() {
+  local rep="$1"
+  write_meta "${META_FILE}" "${rep}"
+  python3 - "${META_FILE}" "${SLOTS_TSV}.done" "${SAMPLES_FILE}" "${RESULTS_FILE}" <<'PYEOF'
+import datetime
+import json
+import os
+import re
+import sys
+
+meta_file, slots_tsv, samples_file, results_file = sys.argv[1:5]
+with open(meta_file) as handle:
+    meta = json.load(handle)
+
+samples = []
+if os.path.exists(samples_file):
+    with open(samples_file) as handle:
+        for line in handle:
+            try:
+                samples.append(json.loads(line))
+            except ValueError:
+                continue
+
+PHASE_RE = re.compile(r"RUNNER_BENCH_PHASE\s+(\S+)\s+(\d+)")
+
+
+def agg(rows):
+    cpus = [float(r["cpu_pct"]) for r in rows if r.get("cpu_pct") is not None]
+    rss = [float(r["rss_mb"]) for r in rows if r.get("rss_mb") is not None]
+    return {
+        "samples": len(rows),
+        "cpu_mean_pct": round(sum(cpus) / len(cpus), 1) if cpus else None,
+        "cpu_peak_pct": round(max(cpus), 1) if cpus else None,
+        "rss_peak_mb": int(max(rss)) if rss else None,
+    }
+
+
+def series(rows, key):
+    return [float(r[key]) for r in rows if r.get(key) is not None]
+
+
+host_rows = [s for s in samples if s.get("scope") == "host"]
+host_res = agg(host_rows)
+swap = series(host_rows, "swap_used_mb")
+disk = series(host_rows, "disk_used_kb")
+host_res["swap_used_mb_peak"] = max(swap) if swap else None
+host_res["swap_growth_mb"] = round(swap[-1] - swap[0], 2) if len(swap) >= 2 else None
+host_res["disk_used_delta_kb"] = int(disk[-1] - disk[0]) if len(disk) >= 2 else None
+
+duration = meta["end_epoch"] - meta["start_epoch"]
+queue_delay = None
+if meta.get("queued_at") is not None:
+    queue_delay = meta["start_epoch"] - meta["queued_at"]
+
+
+def parse_phases(log_path, start_epoch):
+    markers = []
+    try:
+        with open(log_path, errors="replace") as handle:
+            for line in handle:
+                match = PHASE_RE.search(line)
+                if match:
+                    markers.append((match.group(1), int(match.group(2))))
+    except OSError:
+        pass
+    phases = {}
+    previous = start_epoch
+    for name, epoch in markers:
+        phases[name] = max(0, epoch - previous)
+        previous = epoch
+    return phases
+
+
+def parse_stats(path):
+    stats = {}
+    try:
+        with open(path) as handle:
+            for line in handle:
+                line = line.strip()
+                if not line or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                try:
+                    value = int(value)
+                except ValueError:
+                    try:
+                        value = float(value)
+                    except ValueError:
+                        pass
+                stats[key.strip()] = value
+    except OSError:
+        pass
+    return stats
+
+
+def base_record():
+    return {
+        "schema_version": meta["schema_version"],
+        "ts": meta["finished_at"],
+        "run_id": meta["run_id"],
+        "label": meta["label"],
+        "toolchain": meta["toolchain"] or None,
+        "scenario": meta["scenario"],
+        "concurrency": meta["concurrency"],
+        "repetition": meta["repetition"],
+        "command": meta["command"],
+        "host": meta["host"],
+        "queued_at": meta.get("queued_at"),
+        "started_at": meta["started_at"],
+        "finished_at": meta["finished_at"],
+        "queue_delay_s": queue_delay,
+        "duration_s": duration,
+    }
+
+
+slots = []
+with open(slots_tsv) as handle:
+    for line in handle:
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) >= 8:
+            slots.append(parts)
+
+records = []
+overall = "success"
+for slot, rc, workdir, cache_dir, log_path, stats_path, before, after in slots:
+    rc = int(rc)
+    if meta["cancelled"]:
+        result = "cancelled"
+    elif rc == 0:
+        result = "success"
+    else:
+        result = "failed"
+    if result != "success":
+        overall = result
+
+    stats = parse_stats(stats_path)
+    job_rows = [s for s in samples
+                if s.get("scope") == "job" and str(s.get("slot")) == slot]
+    res = agg(job_rows)
+
+    unsupported = ["disk_io_rate"]
+    if queue_delay is None:
+        unsupported.append("queue_delay_s")
+    if not stats:
+        unsupported.append("cache_counters")
+    if res["samples"] == 0:
+        unsupported.append("job_resource_samples")
+
+    growth = None
+    try:
+        growth = int(after) - int(before)
+    except ValueError:
+        pass
+
+    with open(stats_path + ".timing") as handle:
+        timing = json.load(handle)
+    def iso(epoch):
+        return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).isoformat()
+    rec = base_record()
+    rec.update({
+        "ts": iso(timing["end_epoch"]),
+        "started_at": iso(timing["start_epoch"]),
+        "finished_at": iso(timing["end_epoch"]),
+        "duration_s": timing["duration_s"],
+        "queue_delay_s": (timing["start_epoch"] - meta["queued_at"]
+                          if meta.get("queued_at") is not None else None),
+        "queue_timing_source": "batch_supplied" if meta.get("queued_at") is not None else None,
+        "scope": "job",
+        "slot": int(slot),
+        "workdir": workdir,
+        "exit_code": rc,
+        "result": result,
+        "phases": parse_phases(log_path, timing["start_epoch"]),
+        "cache": {
+            "hits": stats.get("cache_hits"),
+            "misses": stats.get("cache_misses"),
+            "restore_s": stats.get("cache_restore_s"),
+            "save_s": stats.get("cache_save_s"),
+            "growth_kb": growth,
+            "stats": stats,
+        },
+        "resources": res,
+        "unsupported": unsupported,
+        "artifacts": {"samples": samples_file, "log": log_path},
+    })
+    records.append(rec)
+
+host_rec = base_record()
+host_unsupported = ["disk_io_rate"]
+if queue_delay is None:
+    host_unsupported.append("queue_delay_s")
+if host_res["swap_growth_mb"] is None:
+    host_unsupported.append("swap_growth_mb")
+if host_res["disk_used_delta_kb"] is None:
+    host_unsupported.append("disk_used_delta_kb")
+host_rec.update({
+    "scope": "host",
+    "result": "cancelled" if meta["cancelled"] else overall,
+    "resources": host_res,
+    "unsupported": host_unsupported,
+    "artifacts": {"samples": samples_file},
+})
+records.append(host_rec)
+
+with open(results_file, "a") as out:
+    for rec in records:
+        out.write(json.dumps(rec) + "\n")
+
+for rec in records:
+    if rec["scope"] == "job":
+        sys.stderr.write("  -> rep %d slot %d: result=%s duration=%ss exit=%d\n"
+                         % (rec["repetition"], rec["slot"], rec["result"],
+                            rec["duration_s"], rec["exit_code"]))
+    else:
+        sys.stderr.write("  -> rep %d host: result=%s swap_growth=%s disk_delta=%s\n"
+                         % (rec["repetition"], rec["result"],
+                            rec["resources"].get("swap_growth_mb"),
+                            rec["resources"].get("disk_used_delta_kb")))
+PYEOF
+}
+
+rep_run() {
+  local rep="$1"
+  RUN_ID="${LABEL}-${SCENARIO}-c${CONCURRENCY}-r${rep}-$(date -u '+%Y%m%d-%H%M%S')-$$"
+  SAMPLES_FILE="${RESULTS_DIR}/samples/${RUN_ID}.jsonl"
+  local log_dir="${RESULTS_DIR}/logs"
+  mkdir -p "${RESULTS_DIR}/samples" "${log_dir}"
+  : > "${SAMPLES_FILE}"
+  : > "${SLOT_PIDS_FILE}"
+  : > "${SLOTS_TSV}"
+  rm -f "${SLOTS_TSV}.done"
+
+  START_EPOCH=""
+  now_epoch
+  START_EPOCH="${NOW_EPOCH}"
+  sample_once
+  run_sampler &
+  SAMPLER_PID=$!
+  trap on_interrupt INT TERM
+
+  local slot slot_dir cache_dir logfile stats pid before
+  slot=0
+  while [[ "${slot}" -lt "${CONCURRENCY}" && "${CANCELLED}" -eq 0 ]]; do
+    if [[ "${CONCURRENCY}" -eq 1 ]]; then
+      slot_dir="${WORKDIR}"
+    else
+      slot_dir="${WORKDIR}/slot-${slot}"
+    fi
+    mkdir -p "${slot_dir}"
+    cache_dir="${CACHE_DIR}"
+    if [[ "${CONCURRENCY}" -gt 1 ]]; then
+      cache_dir="${slot_dir}/.bench-cache"
+    fi
+    logfile="${log_dir}/${RUN_ID}-slot${slot}.log"
+    stats="${WORK_TMPDIR}/stats-${rep}-slot${slot}.txt"
+    prepare_scenario "${slot_dir}" "${cache_dir}" "${rep}"
+    before="$(dir_kb "${cache_dir}")"
+    launch_slot "${slot}" "${slot_dir}" "${cache_dir}" "${logfile}" "${stats}"
+    pid="${LAUNCH_PID}"
+    printf '%s\t%s\n' "${slot}" "${pid}" >> "${SLOT_PIDS_FILE}"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "${slot}" "${pid}" "${slot_dir}" "${cache_dir}" "${logfile}" "${stats}" "${before}" \
+      >> "${SLOTS_TSV}"
+    slot=$((slot + 1))
+  done
+
+  # A synchronous sample right after launch guarantees per-slot coverage even
+  # for workloads shorter than one sampling interval.
+  sample_once
+
+  local rc
+  while IFS=$'\t' read -r slot pid slot_dir cache_dir logfile stats before; do
+    rc=0
+    wait "${pid}" || rc=$?
+    # A trapped signal interrupts wait before the supervisor writes timing.
+    if [[ "${CANCELLED}" -eq 1 ]]; then
+      wait "${pid}" 2>/dev/null || true
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "${slot}" "${rc}" "${slot_dir}" "${cache_dir}" "${logfile}" "${stats}" "${before}" \
+      "$(dir_kb "${cache_dir}")" >> "${SLOTS_TSV}.done"
+  done < "${SLOTS_TSV}"
+  : > "${SLOT_PIDS_FILE}"
+
+  trap global_interrupt INT TERM
+  kill "${SAMPLER_PID}" 2>/dev/null || true
+  wait "${SAMPLER_PID}" 2>/dev/null || true
+  SAMPLER_PID=""
+  sample_once
+  now_epoch
+  END_EPOCH="${NOW_EPOCH}"
+
+  finalize_rep "${rep}"
+
+  local bad
+  bad="$(cut -f2 "${SLOTS_TSV}.done" | awk '$1 != 0 {print; exit}' || true)"
+  [[ -z "${bad}" ]] || ANY_FAILURE=1
+  return 0
+}
+
+run_run() {
+  mkdir -p "${WORKDIR}" "${RESULTS_DIR}"
+  check_cache_safety
+  WORK_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/runner-bench.XXXXXX")"
+  SLOT_PIDS_FILE="${WORK_TMPDIR}/slot-pids.tsv"
+  SLOTS_TSV="${WORK_TMPDIR}/slots.tsv"
+  META_FILE="${WORK_TMPDIR}/meta.json"
+
+  log "Benchmark: label=${LABEL} scenario=${SCENARIO} reps=${REPS} concurrency=${CONCURRENCY} interval=${INTERVAL}s"
+  step "Results: ${RESULTS_FILE}"
+  if [[ -z "${QUEUED_AT}" ]]; then
+    step "No --queued-at: queue_delay_s will be null (reported as unsupported)."
+  fi
+  local rep=1
+  while [[ "${rep}" -le "${REPS}" ]]; do
+    log "Repetition ${rep}/${REPS} (${SCENARIO})"
+    rep_run "${rep}"
+    if [[ "${CANCELLED}" -eq 1 ]]; then
+      err "Cancelled — partial results retained under ${RESULTS_DIR}."
+      exit 130
+    fi
+    rep=$((rep + 1))
+  done
+  if [[ "${ANY_FAILURE}" -eq 1 ]]; then
+    err "One or more repetitions failed; results (with exit codes) are in ${RESULTS_FILE}."
+    return 1
+  fi
+  log "Benchmark complete: ${REPS} repetition(s) recorded."
+}
+
+# ----------------------------------------------------------------------------
+# REPORT mode — median/p95 summaries per (label, scenario, concurrency) and
+# baseline-vs-candidate comparisons. Never claims a speedup without data.
+# ----------------------------------------------------------------------------
+run_report() {
+  python3 - "${RESULTS_DIR}" "${RESULTS_FILES}" "${LABEL_FILTER}" \
+    "${SCENARIO_FILTER}" "${BASELINE}" "${CANDIDATE}" "${JSON}" <<'PYEOF'
+import glob
+import json
+import math
+import os
+import statistics
+import sys
+
+results_dir, spec, label_f, scenario_f, baseline, candidate, as_json = sys.argv[1:8]
+as_json = as_json == "1"
+
+if spec:
+    paths = [p for p in spec.split(":") if p]
+else:
+    paths = sorted(glob.glob(os.path.join(results_dir, "*.jsonl")))
+
+records = []
+for path in paths:
+    try:
+        with open(path) as handle:
+            for line in handle:
+                try:
+                    records.append(json.loads(line))
+                except ValueError:
+                    continue
+    except OSError:
+        sys.stderr.write("WARN: unreadable results file: %s\n" % path)
+
+if label_f:
+    records = [r for r in records if r.get("label") == label_f]
+if scenario_f:
+    records = [r for r in records if r.get("scenario") == scenario_f]
+
+if not records:
+    sys.stderr.write("ERROR: no benchmark records found (looked in %s).\n"
+                     % (spec or os.path.join(results_dir, "*.jsonl")))
+    sys.exit(1)
+
+groups = {}
+for rec in records:
+    key = (rec.get("label", ""), rec.get("scenario", ""),
+           rec.get("concurrency", 1))
+    bucket = groups.setdefault(key, {"job": [], "host": []})
+    bucket["host" if rec.get("scope") == "host" else "job"].append(rec)
+
+
+def vals(rows, get):
+    out = []
+    for row in rows:
+        try:
+            value = get(row)
+        except (KeyError, TypeError):
+            continue
+        if value is not None:
+            out.append(float(value))
+    return out
+
+
+def pctile(values, p):
+    ordered = sorted(values)
+    return ordered[max(0, int(math.ceil(p / 100.0 * len(ordered))) - 1)]
+
+
+def summ(values):
+    if not values:
+        return None
+    return {"n": len(values), "median": statistics.median(values),
+            "p95": pctile(values, 95), "min": min(values), "max": max(values)}
+
+
+def fmt(value):
+    return "n/a" if value is None else "%g" % value
+
+
+def res_val(field):
+    return lambda r: (r.get("resources") or {}).get(field)
+
+
+def cache_val(field):
+    return lambda r: (r.get("cache") or {}).get(field)
+
+
+summaries = {}
+for key in sorted(groups):
+    bucket = groups[key]
+    jobs, hosts = bucket["job"], bucket["host"]
+    phases = {}
+    for rec in jobs:
+        for name, value in (rec.get("phases") or {}).items():
+            phases.setdefault(name, []).append(float(value))
+    latest = (jobs or hosts)[-1]
+    summaries[key] = {
+        "label": key[0], "scenario": key[1], "concurrency": key[2],
+        "runs": len({(r.get("run_id"), r.get("repetition")) for r in (hosts or jobs)}),
+        "job_samples": len(jobs),
+        "failures": sum(1 for r in jobs if r.get("result") == "failed"),
+        "cancelled": sum(1 for r in jobs if r.get("result") == "cancelled"),
+        "command": latest.get("command"),
+        "toolchain": latest.get("toolchain"),
+        "host": latest.get("host"),
+        "duration_s": summ(vals(jobs, lambda r: r.get("duration_s"))),
+        "queue_delay_s": summ(vals(jobs, lambda r: r.get("queue_delay_s"))),
+        "phases": {name: summ(values) for name, values in sorted(phases.items())},
+        "cpu_peak_pct": summ(vals(jobs, res_val("cpu_peak_pct"))),
+        "rss_peak_mb": summ(vals(jobs, res_val("rss_peak_mb"))),
+        "cache_hits": summ(vals(jobs, cache_val("hits"))),
+        "cache_misses": summ(vals(jobs, cache_val("misses"))),
+        "cache_restore_s": summ(vals(jobs, cache_val("restore_s"))),
+        "cache_save_s": summ(vals(jobs, cache_val("save_s"))),
+        "cache_growth_kb": summ(vals(jobs, cache_val("growth_kb"))),
+        "swap_growth_mb": summ(vals(hosts, res_val("swap_growth_mb"))),
+        "host_disk_used_delta_kb": summ(vals(hosts, res_val("disk_used_delta_kb"))),
+    }
+
+comparisons = []
+if baseline and candidate:
+    for key in sorted(summaries):
+        if key[0] != candidate:
+            continue
+        bkey = (baseline, key[1], key[2])
+        if bkey not in summaries:
+            continue
+        base, cand = summaries[bkey], summaries[key]
+        comp = {"scenario": key[1], "concurrency": key[2],
+                "baseline_n": base["runs"], "candidate_n": cand["runs"],
+                "deltas": {}, "regressions": [], "warnings": []}
+        if base.get("command") != cand.get("command"):
+            comp["warnings"].append(
+                "workload command differs between baseline and candidate")
+        if base.get("host") != cand.get("host"):
+            comp["warnings"].append(
+                "host hardware/OS differs between baseline and candidate")
+        for metric in ("duration_s", "queue_delay_s", "rss_peak_mb",
+                       "cpu_peak_pct", "cache_restore_s", "cache_save_s",
+                       "cache_growth_kb", "swap_growth_mb"):
+            sb, sc = base[metric], cand[metric]
+            if not sb or not sc:
+                continue
+            delta = {"baseline_median": sb["median"], "candidate_median": sc["median"],
+                     "baseline_p95": sb["p95"], "candidate_p95": sc["p95"]}
+            if sb["median"]:
+                delta["median_change_pct"] = round(
+                    (sc["median"] - sb["median"]) / sb["median"] * 100, 1)
+            comp["deltas"][metric] = delta
+        if cand["failures"] > base["failures"]:
+            comp["regressions"].append("failures increased %d -> %d"
+                                       % (base["failures"], cand["failures"]))
+        if cand["cancelled"] > base["cancelled"]:
+            comp["regressions"].append("cancellations increased %d -> %d"
+                                       % (base["cancelled"], cand["cancelled"]))
+        for metric, label in (("swap_growth_mb", "swap growth"),
+                              ("cache_growth_kb", "cache growth")):
+            sb, sc = base[metric], cand[metric]
+            if sb and sc and sc["median"] > sb["median"]:
+                comp["regressions"].append("%s median increased %s -> %s"
+                                           % (label, fmt(sb["median"]), fmt(sc["median"])))
+        if base["runs"] < 5 or cand["runs"] < 5:
+            comp["warnings"].append(
+                "fewer than 5 repetitions on one side; do not draw conclusions")
+        comparisons.append(comp)
+
+if as_json:
+    print(json.dumps({"groups": [summaries[k] for k in sorted(summaries)],
+                      "comparisons": comparisons}, indent=2))
+    sys.exit(0)
+
+for key in sorted(summaries):
+    gs = summaries[key]
+    print("== label=%s scenario=%s concurrency=%s ==" % key)
+    note = ""
+    if gs["runs"] < 5:
+        note = "  WARNING: fewer than 5 repetitions; medians/tails are unreliable"
+    print("  samples: %d repetitions, n=%d job run(s)%s" % (gs["runs"], gs["job_samples"], note))
+    print("  results: %d succeeded, %d failed, %d cancelled"
+          % (gs["job_samples"] - gs["failures"] - gs["cancelled"],
+             gs["failures"], gs["cancelled"]))
+    host = gs["host"] or {}
+    mem_gb = None
+    if host.get("mem_bytes"):
+        mem_gb = round(host["mem_bytes"] / float(2 ** 30))
+    print("  host: %s (%s CPUs, %s GB, %s, macOS %s, label %s)"
+          % (host.get("model", "?"), host.get("cpu_count", "?"),
+             mem_gb if mem_gb is not None else "?",
+             host.get("arch", "?"), host.get("macos", "?"),
+             host.get("label", "?")))
+    if gs["toolchain"]:
+        print("  toolchain: %s" % gs["toolchain"])
+    for metric in ("duration_s", "queue_delay_s", "cpu_peak_pct", "rss_peak_mb",
+                   "cache_hits", "cache_misses", "cache_restore_s",
+                   "cache_save_s", "cache_growth_kb", "swap_growth_mb",
+                   "host_disk_used_delta_kb"):
+        s = gs[metric]
+        if s is None:
+            print("  %s: unavailable (not recorded — see 'unsupported' in raw records)"
+                  % metric)
+        else:
+            print("  %s: median %s  p95 %s  (min %s, max %s, n=%d)"
+                  % (metric, fmt(s["median"]), fmt(s["p95"]),
+                     fmt(s["min"]), fmt(s["max"]), s["n"]))
+    if gs["phases"]:
+        print("  phases:")
+        for name, s in gs["phases"].items():
+            print("    %-16s median %ss  p95 %ss  (n=%d)"
+                  % (name, fmt(s["median"]), fmt(s["p95"]), s["n"]))
+    print("")
+
+for comp in comparisons:
+    print("== compare baseline '%s' -> candidate '%s' scenario=%s concurrency=%s (n=%d vs n=%d) =="
+          % (baseline, candidate, comp["scenario"], comp["concurrency"],
+             comp["baseline_n"], comp["candidate_n"]))
+    for metric in sorted(comp["deltas"]):
+        d = comp["deltas"][metric]
+        change = ""
+        if "median_change_pct" in d:
+            change = "  (%+.1f%%)" % d["median_change_pct"]
+        print("  %-18s median %s -> %s%s   p95 %s -> %s"
+              % (metric, fmt(d["baseline_median"]), fmt(d["candidate_median"]),
+                 change, fmt(d["baseline_p95"]), fmt(d["candidate_p95"])))
+    for regression in comp["regressions"]:
+        print("  REGRESSION: %s" % regression)
+    for warning in comp["warnings"]:
+        print("  WARNING: %s" % warning)
+    print("")
+
+if baseline and candidate:
+    print("Note: deltas above are measured from the recorded runs; no speedup is")
+    print("claimed where either side lacks measurements.")
+PYEOF
+}
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+main() {
+  parse_args "$@"
+  detect_platform
+  require_cmds
+  detect_host
+  case "${MODE}" in
+    run)    run_run ;;
+    report) run_report ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi

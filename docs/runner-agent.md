@@ -14,7 +14,8 @@ service cannot see. No new service, no GitHub App, no inbound ports.
 
 Every run ends with a comment on the originating PR, issue, or commit
 containing the agent's root cause, change, verification, and runner notes,
-plus cost and turn count.
+plus cost and turn count — and, when a Slack webhook is configured, a compact
+outcome notification (see [Slack notifications](#slack-notifications)).
 
 ## Setup
 
@@ -68,6 +69,42 @@ The caller passes these under `with:` to
 Secrets: `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` (one required), and
 optionally `AGENT_GITHUB_TOKEN` (see below). Outputs: `outcome`
 (`skipped`, `comment`, `pushed`, `pr`) and `pr-url`.
+
+## Slack notifications
+
+The agent posts best-effort, compact outcome messages to a Slack incoming
+webhook: a `@runner-agent` mention is acknowledged at `gate`, and `publish`
+reports the outcome — fix PR opened, fix pushed to the PR branch, or the run
+diagnosed with no code change. Messages carry repo/run/PR identifiers and one
+link only; no secrets, no log contents, no agent summary. A missing or
+unreachable webhook is logged and never fails the job.
+
+Setup:
+
+1. In Slack, create an incoming webhook (api.slack.com/apps → your app →
+   Incoming Webhooks → Add New Webhook to Workspace) and copy the URL.
+2. On each runner Mac, as the runner service user, store it in a 0600 file:
+
+   ```sh
+   install -m 600 /dev/null ~/.runner-agent/slack-webhook
+   printf '%s\n' 'https://hooks.slack.com/services/T…/B…/…' > ~/.runner-agent/slack-webhook
+   ```
+
+   `SLACK_WEBHOOK_URL` in the environment takes precedence over the file, and
+   `RUNNER_AGENT_SLACK_WEBHOOK_FILE` overrides the file path. The reusable
+   workflow does not forward a `SLACK_WEBHOOK_URL` secret today, so the
+   per-host file is the way to wire it up; if you call the workflow from your
+   own fork that sets the env var on the job, that works too.
+3. The webhook URL is handed to curl through a temporary 0600 `-K` config
+   file (`url = "..."`), so it never appears on a command line where `ps`
+   could expose it — the same idiom `runner-logs` uses for its bearer token.
+
+Operators and other workflows can emit their own events with
+`runner-agent notify <text> [url]` (exit 2 without a message).
+
+Out of scope, unchanged: cross-repository changes and a hosted queue (see
+[runner-performance.md](runner-performance.md)). The Slack surface is
+notification-only — nothing is triggered from Slack.
 
 ## How a job runs
 

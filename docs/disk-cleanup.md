@@ -2,7 +2,10 @@
 
 `runner-prune` removes checkout/build output from one runner after its job.
 It preserves `_work/_tool`, `_work/_actions`, `_work/_temp`,
-`_work/_PipelineMapping`, and shared package caches by default. A job finishing
+`_work/_PipelineMapping`, the persistent per-runner tool cache
+(`runner-N/_toolcache`, the default `AGENT_TOOLSDIRECTORY` — see
+[ephemeral-runners.md](ephemeral-runners.md#persistent-tool-cache)), and
+shared package caches by default. A job finishing
 on runner-1 must never delete runner-2's active checkout or shared compiler
 and package caches.
 
@@ -72,10 +75,17 @@ assume the job is already immune to failure at this point.
 
 Measure cache growth and use tool-specific size/age limits where supported.
 `--purge-caches` is an explicit cold-cache reset for Homebrew, npm, Yarn, pip,
-SwiftPM, Gradle, and Maven. It removes whole caches only during the acknowledged
-maintenance window. Repeated eviction after every job defeats their benefit.
-Docker pruning removes unused data on the currently selected Docker daemon;
-remote BuildKit cache retention needs its own policy on the builder host.
+SwiftPM, Gradle, and Maven, and also evicts every per-runner persistent tool
+cache (`runner-N/_toolcache`). It removes whole caches only during the
+acknowledged maintenance window — bounded, offline-only eviction; runner tool
+caches are never touched from a job hook, so one runner cannot remove a
+cache another runner is actively using. Operator-chosen shared
+`--tool-cache-dir` locations outside the fleet root are not discovered; evict
+those manually during the same window. Repeated eviction after every job
+defeats their benefit. `runner-cleanup` deletes a runner's `_toolcache`
+together with the runner directory. Docker pruning removes unused data on
+the currently selected Docker daemon; remote BuildKit cache retention needs
+its own policy on the builder host.
 
 The script refuses symlinked runner/work roots and verifies that a hook's
 selected directory matches `RUNNER_TEMP`. Runner user directories still share
