@@ -46,6 +46,8 @@ elif name == "colima":
         save()
     elif args[:1] == ["ssh"]:
         (root / "vm_stdin.txt").write_text(sys.stdin.read())
+        if "qemu-x86_64" in " ".join(args):
+            print(state.get("vm_x86", "rosetta"))
     else:
         sys.exit(99)
 elif name == "docker":
@@ -239,6 +241,49 @@ class BuilderTests(unittest.TestCase):
         result = self.run_helper("setup-colima", "--cpu", "12")
         self.assertIn("keeping its current resource allocation", result.stderr)
         self.assertFalse(any(c[:2] == ["colima", "start"] for c in self.calls()))
+
+    def rosetta_ssh(self):
+        return [c for c in self.calls() if c[:1] == ["colima"] and "qemu-x86_64" in " ".join(c)]
+
+    def test_new_arm_vm_uses_rosetta_and_strips_qemu(self):
+        self.run_helper("setup-colima")
+        start = next(c for c in self.calls() if c[:2] == ["colima", "start"])
+        self.assertIn("--vz-rosetta", start)
+        self.assertIn("--binfmt=false", start)
+        [ssh] = self.rosetta_ssh()
+        self.assertEqual(ssh[1:6], ["ssh", "--", "sudo", "sh", "-c"])
+
+    def test_existing_vz_profile_is_switched_to_rosetta(self):
+        profile = self.root / ".colima/default/colima.yaml"
+        profile.parent.mkdir(parents=True)
+        profile.write_text("cpu: 2\nvmType: vz\nrosetta: false\nbinfmt: true\n")
+        self.run_helper("setup-colima")
+        self.assertEqual(profile.read_text(), "cpu: 2\nvmType: vz\nrosetta: true\nbinfmt: false\n")
+        start = next(c for c in self.calls() if c[:2] == ["colima", "start"])
+        self.assertNotIn("--vm-type", start)
+
+    def test_running_vz_vm_gets_rosetta_config_without_restart(self):
+        profile = self.root / ".colima/default/colima.yaml"
+        profile.parent.mkdir(parents=True)
+        profile.write_text("vmType: vz\n")
+        self.write_state({"colima_running": True, "vm_x86": "none"})
+        result = self.run_helper("setup-colima")
+        self.assertEqual(profile.read_text(), "vmType: vz\nrosetta: true\nbinfmt: false\n")
+        self.assertIn("takes effect when Colima next starts", result.stderr)
+        self.assertIn("Rosetta is not active", result.stderr)
+        self.assertFalse(any(c[:2] == ["colima", "start"] for c in self.calls()))
+
+    def test_allow_qemu_leaves_vm_emulation_alone(self):
+        self.env["RUNNER_ALLOW_QEMU"] = "1"
+        self.run_helper("setup-colima")
+        start = next(c for c in self.calls() if c[:2] == ["colima", "start"])
+        self.assertNotIn("--vz-rosetta", start)
+        self.assertEqual(self.rosetta_ssh(), [])
+
+    def test_intel_host_skips_rosetta(self):
+        self.write_state({"arch": "x86_64"})
+        self.run_helper("setup-colima")
+        self.assertEqual(self.rosetta_ssh(), [])
 
     def test_colima_rejects_builder_pointing_at_desktop(self):
         self.write_state({"colima_running": True, "builders": {"runner-colima": {"driver": "docker-container", "endpoint": "desktop-linux"}}})

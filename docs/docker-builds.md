@@ -51,6 +51,41 @@ profiles on macOS 13+ use Apple's VZ framework and VirtioFS mounts. Existing
 profiles keep their VM and mount type. See
 [Colima configuration](https://colima.run/docs/configuration/).
 
+### linux/amd64 runs through Rosetta, never QEMU
+
+On Apple Silicon, `linux/amd64` images run under emulation inside the VM.
+Colima's default (`binfmt: true`) registers QEMU user-mode handlers, and gcc
+under QEMU segfaults on large C builds. A typical failure is
+`internal compiler error: Segmentation fault signal terminated program cc1`
+while building `aws-lc-sys`, then `exit status: 4`. Rosetta for Linux runs
+the same builds reliably and much faster.
+
+`setup-colima` therefore:
+
+- creates new VZ profiles with `--vz-rosetta --binfmt=false`;
+- rewrites an existing VZ profile's `colima.yaml` to `rosetta: true` and
+  `binfmt: false` (a running VM picks this up on its next start);
+- removes the live `qemu-x86_64`/`qemu-i386` handlers from the running VM.
+
+`wait-colima`, which gates every runner started by `runner-setup --colima`,
+repeats the removal on every runner start. The runner stays offline if QEMU
+can't be removed or Rosetta isn't active, so an amd64 job never falls back to
+QEMU. It also stays offline on a non-VZ (QEMU-engine) profile, which cannot
+use Rosetta. To move an existing runner host to Rosetta, drain its jobs, then:
+
+```sh
+runner-docker-builder setup-colima                        # writes colima.yaml
+sudo launchctl kickstart -k system/com.github.runner-colima   # restart the VM
+colima ssh -- ls /proc/sys/fs/binfmt_misc                 # rosetta, no qemu-*
+```
+
+Jobs that run `docker/setup-qemu-action` or `tonistiigi/binfmt --install`
+re-register QEMU until the next runner start; remove those steps from Mac
+workflows. `RUNNER_ALLOW_QEMU=1` in the environment of setup and the runner
+services opts a host out. Apple has said full Rosetta support ends after
+macOS 27; for a durable fix, cross-compile to x86_64 on a native arm64 build
+stage instead of emulating.
+
 An already running VM keeps its current CPU/memory/disk allocation. To resize,
 stop Colima between jobs and rerun setup with the desired resource flags.
 Leave enough host RAM and CPU for concurrent native macOS jobs. Colima disk
