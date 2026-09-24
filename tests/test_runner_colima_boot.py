@@ -35,8 +35,20 @@ if os.environ.get('HANG'):
 sys.exit(0 if count >= int(os.environ.get('READY_AT','1')) else 1)
 ''')
         docker.chmod(0o755)
+        # Never reach a real VM: the gate strips QEMU handlers through colima ssh.
+        colima = self.root / 'colima'
+        colima.write_text(f'#!{sys.executable}\n' + '''
+import json, os, pathlib, sys
+root = pathlib.Path(os.environ['TEST_ROOT'])
+with (root/'colima-calls').open('a') as f:
+    f.write(json.dumps({'args':sys.argv[1:], 'profile':os.environ.get('COLIMA_PROFILE')}) + '\\n')
+print(os.environ.get('COLIMA_STATE', 'rosetta'))
+sys.exit(int(os.environ.get('COLIMA_RC', '0')))
+''')
+        colima.chmod(0o755)
         self.env = dict(os.environ, TEST_ROOT=str(self.root), PATH=f'{self.root}:' + os.environ['PATH'],
                         DOCKER_CONTEXT='desktop-linux', DOCKER_HOST='tcp://wrong.invalid:2375')
+        self.env.pop('RUNNER_ALLOW_QEMU', None)
         self.command = [str(BUILDER), 'wait-colima', '--timeout', '5', '--', sys.executable, '-c',
                         'import os,pathlib; pathlib.Path(os.environ["TEST_ROOT"],"started").write_text(os.environ["DOCKER_CONTEXT"])']
 
@@ -79,6 +91,35 @@ sys.exit(0 if count >= int(os.environ.get('READY_AT','1')) else 1)
         result = subprocess.run(command, env=self.env, text=True, capture_output=True, timeout=5)
         self.assertEqual(result.returncode, 7, result.stderr)
 
+    def colima_calls(self):
+        path = self.root/'colima-calls'
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    @unittest.skipUnless(os.uname().machine == 'arm64', 'Rosetta gate applies to Apple Silicon only')
+    def test_gate_strips_qemu_and_requires_rosetta_before_starting(self):
+        result = subprocess.run(self.command, env=self.env, text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.root/'started').exists())
+        [call] = self.colima_calls()
+        self.assertEqual(call['args'][:5], ['ssh','--','sudo','sh','-c'])
+        self.assertIn('qemu-x86_64', call['args'][5])
+        self.assertIn('rosetta', call['args'][5])
+        self.assertEqual(call['profile'], 'default')
+
+    @unittest.skipUnless(os.uname().machine == 'arm64', 'Rosetta gate applies to Apple Silicon only')
+    def test_missing_rosetta_or_failed_removal_keeps_runner_offline(self):
+        for extra in ({'COLIMA_STATE':'none'}, {'COLIMA_RC':'3'}):
+            result = subprocess.run(self.command, env=dict(self.env, **extra), text=True, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn('runner remains offline', result.stderr)
+            self.assertFalse((self.root/'started').exists())
+
+    def test_allow_qemu_opt_out_skips_vm_changes(self):
+        result = subprocess.run(self.command, env=dict(self.env, RUNNER_ALLOW_QEMU='1', COLIMA_RC='3'),
+                                text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.colima_calls(), [])
+
     def test_invalid_timeout_and_missing_service_rejected(self):
         for args in (['--timeout','0','--','true'], ['--timeout','no','--','true'], ['--']):
             result = subprocess.run([str(BUILDER),'wait-colima',*args], env=self.env, capture_output=True)
@@ -95,6 +136,7 @@ class BootProvisioningTests(unittest.TestCase):
     CONFIG = '''
 COLIMA=1; DOCKER_HELPER=/fixture/runner-docker-builder
 COLIMA_DOCKER_CONFIG="$TEST_ROOT/docker-config"; DOCKER_TIMEOUT=120
+COLIMA_CONFIG_HOME="$TEST_ROOT/colima-home"
 '''
 
     def read_plist(self, name='com.github.runner-1'):
@@ -117,6 +159,7 @@ configure_runner 2 || exit 92
             self.assertEqual(config['KeepAlive'], {'SuccessfulExit':False})
             self.assertEqual(config['UserName'],'fixture')
             self.assertEqual(config['EnvironmentVariables']['DOCKER_CONFIG'],str(self.root/'docker-config'))
+            self.assertEqual(config['EnvironmentVariables']['COLIMA_HOME'],str(self.root/'colima-home'))
             if index == 1:
                 self.assertEqual(args[5:], [str(self.runner_root/'runner-1/bin/runsvc.sh')])
             else:

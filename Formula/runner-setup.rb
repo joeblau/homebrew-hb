@@ -4,8 +4,8 @@
 class RunnerSetup < Formula
   desc "Provision and tear down GitHub Actions self-hosted runners on macOS"
   homepage "https://github.com/joeblau/homebrew-hb"
-  url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/v1.12.0.tar.gz"
-  sha256 "cf6c9d19121fefed56368a5fa3f1011d8ffd1514b2895532828c4983012f9eb2"
+  url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/v1.13.0.tar.gz"
+  sha256 "712883eddbe388ee0c2a017c34af52f9ba9944c49b0db79e1ef53e163703a8d8"
   license "MIT"
 
   depends_on "docker"
@@ -64,6 +64,11 @@ class RunnerSetup < Formula
         runner-setup --org ORG_NAME --runners N --colima
       Existing same-scope runners need no new registration token. Enable this
       between jobs; preserve your existing scope and runner count.
+
+      On Apple Silicon, linux/amd64 containers run through Rosetta, never QEMU.
+      Runners stay offline until Rosetta is active. After upgrading, drain jobs:
+        runner-docker-builder setup-colima
+        sudo launchctl kickstart -k system/com.github.runner-colima
 
       Remove runners later (use a *removal* token to also deregister on GitHub):
         runner-cleanup --all --token REMOVE_TOKEN

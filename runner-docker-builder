@@ -65,6 +65,18 @@ MIRROR_CONTEXT=""      # registry-mirror --context
 MIRROR_TARGET_KIND=""  # resolved: colima | desktop | remote | other
 MIRROR_REMOVE_DATA=0   # registry-mirror teardown --remove-data
 
+# Apple Silicon Colima runs linux/amd64 through Rosetta, never QEMU: gcc under
+# qemu-user segfaults on large C builds (aws-lc-sys "internal compiler error").
+# Runs as root inside the VM; prints whether Rosetta handles x86_64 binaries.
+# RUNNER_ALLOW_QEMU=1 opts a host out.
+# shellcheck disable=SC2016 # expanded by the VM's shell
+ROSETTA_ONLY_SCRIPT='d=/proc/sys/fs/binfmt_misc
+for n in qemu-x86_64 qemu-i386; do
+  if [ -e "$d/$n" ]; then echo -1 > "$d/$n" || exit 3; fi
+  if [ -e "$d/$n" ]; then exit 3; fi
+done
+if [ -e "$d/rosetta" ] && [ "$(head -n 1 "$d/rosetta")" = enabled ]; then echo rosetta; else echo none; fi'
+
 # ----------------------------------------------------------------------------
 # Output helpers — progress goes to stderr.
 # ----------------------------------------------------------------------------
@@ -100,6 +112,8 @@ COMMANDS:
                    (builder name: ${COLIMA_BUILDER_NAME}, docker-container driver).
   wait-colima      Wait for the default Colima Docker daemon, then exec COMMAND.
                    Used by runner-setup --colima at boot; default timeout 300s.
+                   On Apple Silicon it also removes QEMU x86 emulation from the
+                   VM and requires Rosetta (RUNNER_ALLOW_QEMU=1 opts out).
                    Failure never launches COMMAND. Does not start another VM.
   use-desktop      Revert the default builder to Docker Desktop (desktop-linux).
   status           Show the active docker context and buildx builders.
@@ -538,6 +552,47 @@ setup_remote() {
 # ----------------------------------------------------------------------------
 # setup-colima — local lightweight Linux VM via colima
 # ----------------------------------------------------------------------------
+rosetta_wanted() {
+  [[ "$(uname -m)" == arm64 && "${RUNNER_ALLOW_QEMU:-0}" != 1 ]]
+}
+
+# Persist rosetta: true / binfmt: false so every VM boot skips QEMU
+# registration. Succeeds only when it changed the file.
+colima_rosetta_config() {
+  local cfg="${COLIMA_HOME:-${HOME}/.colima}/default/colima.yaml" tmp
+  rosetta_wanted && [[ -f "${cfg}" ]] || return 1
+  if ! grep -Eq '^vmType:[[:space:]]*vz[[:space:]]*$' "${cfg}"; then
+    warn "Colima profile is not a VZ VM, so Rosetta is unavailable; linux/amd64 containers will not run."
+    return 1
+  fi
+  if grep -Eq '^rosetta:[[:space:]]*true[[:space:]]*$' "${cfg}" \
+    && grep -Eq '^binfmt:[[:space:]]*false[[:space:]]*$' "${cfg}"; then
+    return 1
+  fi
+  tmp="$(mktemp "${cfg}.XXXXXX")" || return 1
+  sed -E -e 's/^rosetta:.*/rosetta: true/' -e 's/^binfmt:.*/binfmt: false/' "${cfg}" > "${tmp}" || { rm -f "${tmp}"; return 1; }
+  grep -Eq '^rosetta:' "${tmp}" || printf 'rosetta: true\n' >> "${tmp}"
+  grep -Eq '^binfmt:' "${tmp}" || printf 'binfmt: false\n' >> "${tmp}"
+  mv "${tmp}" "${cfg}"
+  step "Set rosetta: true and binfmt: false in ${cfg}"
+}
+
+# Remove live QEMU x86 handlers and require Rosetta in the running VM.
+colima_rosetta_only() {
+  rosetta_wanted || return 0
+  local state
+  if ! state="$(colima ssh -- sudo sh -c "${ROSETTA_ONLY_SCRIPT}" </dev/null)"; then
+    err "Could not remove QEMU x86 emulation from the Colima VM."
+    return 1
+  fi
+  if [[ "${state}" == rosetta ]]; then
+    step "linux/amd64 containers run through Rosetta; QEMU x86 emulation removed"
+  else
+    warn "QEMU x86 emulation removed but Rosetta is not active: linux/amd64 containers fail with 'exec format error' until Colima restarts with Rosetta."
+    warn "Stop Colima between jobs and rerun setup-colima; runner startup stays blocked until then."
+  fi
+}
+
 setup_colima() {
   if ! command -v brew >/dev/null 2>&1; then
     err "Homebrew is required for setup-colima (brew install colima docker docker-buildx)."
@@ -554,6 +609,9 @@ setup_colima() {
   if colima status default >/dev/null 2>&1; then
     step "colima default VM already running; keeping its current resource allocation"
     warn "To apply --cpu/--mem/--disk changes, stop Colima between jobs and rerun setup."
+    if colima_rosetta_config; then
+      warn "Rosetta was enabled in colima.yaml; it takes effect when Colima next starts."
+    fi
   else
     local -a start_args=(start default --runtime docker --cpus "${COLIMA_CPU}" --memory "${COLIMA_MEM}" --disk "${COLIMA_DISK}")
     # VM/mount types are immutable. Optimize newly created Apple Silicon VMs
@@ -561,6 +619,9 @@ setup_colima() {
     if [[ ! -f "${COLIMA_HOME:-${HOME}/.colima}/default/colima.yaml" ]] \
       && [[ "$(uname -m)" == arm64 ]] && [[ "$(uname -r | cut -d. -f1)" -ge 22 ]]; then
       start_args+=(--vm-type vz --mount-type virtiofs)
+      [[ "${RUNNER_ALLOW_QEMU:-0}" == 1 ]] || start_args+=(--vz-rosetta --binfmt=false)
+    else
+      colima_rosetta_config || true
     fi
     log "Starting colima default VM"
     colima "${start_args[@]}"
@@ -568,6 +629,7 @@ setup_colima() {
 
   # An explicit endpoint is essential when Desktop or DOCKER_CONTEXT is active.
   docker --context colima info >/dev/null
+  colima_rosetta_only || exit 1
   ensure_container_builder "${COLIMA_BUILDER_NAME}" colima
   log "Done. Selected '${COLIMA_BUILDER_NAME}' for docker buildx build."
   log "Use --builder ${COLIMA_BUILDER_NAME} explicitly in CI; see docs/docker-builds.md."
@@ -1203,7 +1265,7 @@ wait_colima() {
   shift
   command -v python3 >/dev/null || { err "python3 is required for readiness checks"; return 1; }
   # Replace this shell with the gate, and the gate with the actual service.
-  exec python3 - "${timeout}" "$@" <<'PYGATE'
+  exec python3 - "${timeout}" "${ROSETTA_ONLY_SCRIPT}" "$@" <<'PYGATE'
 import os
 import signal
 import subprocess
@@ -1211,7 +1273,8 @@ import sys
 import time
 
 timeout = int(sys.argv[1])
-command = sys.argv[2:]
+rosetta_only = sys.argv[2]
+command = sys.argv[3:]
 env = dict(os.environ, DOCKER_CONTEXT="colima")
 for key in ("DOCKER_HOST", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH"):
     env.pop(key, None)
@@ -1228,6 +1291,28 @@ def stop_probe():
 def interrupted(signum, frame):
     stop_probe()
     raise SystemExit(128 + signum)
+
+def rosetta_ready():
+    """Remove QEMU x86 handlers each start; x86 jobs must run through Rosetta."""
+    if os.uname().machine != "arm64" or os.environ.get("RUNNER_ALLOW_QEMU") == "1":
+        return True
+    try:
+        result = subprocess.run(["colima", "ssh", "--", "sudo", "sh", "-c", rosetta_only],
+                                env=dict(env, COLIMA_PROFILE="default"), stdin=subprocess.DEVNULL,
+                                capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"Cannot check Colima x86 emulation: {exc}; runner remains offline.", file=sys.stderr)
+        return False
+    if result.returncode != 0:
+        print("Could not remove QEMU x86 emulation from Colima; runner remains offline.", file=sys.stderr)
+        return False
+    if result.stdout.strip() != "rosetta":
+        print("Rosetta is not active in Colima, so linux/amd64 jobs cannot run; runner remains offline. "
+              "Set rosetta: true and binfmt: false in colima.yaml (runner-docker-builder setup-colima), "
+              "then restart Colima between jobs. RUNNER_ALLOW_QEMU=1 opts out.", file=sys.stderr)
+        return False
+    print("QEMU x86 emulation removed; linux/amd64 runs through Rosetta.", file=sys.stderr, flush=True)
+    return True
 
 signal.signal(signal.SIGTERM, interrupted)
 signal.signal(signal.SIGINT, interrupted)
@@ -1250,6 +1335,8 @@ while time.monotonic() < deadline:
     finally:
         probe = None
     if rc == 0:
+        if not rosetta_ready():
+            sys.exit(1)
         print("Colima Docker is ready; starting runner.", file=sys.stderr, flush=True)
         # Restore defaults before exec; the service installs its own handlers.
         signal.signal(signal.SIGTERM, signal.SIG_DFL)

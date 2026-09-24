@@ -775,9 +775,9 @@ PYDAEMON
 # Wrap a known runner service without changing its registration or supervisor
 # options. plistlib handles XML quoting for paths and retained operator values.
 gate_colima_plist() {
-  python3 - "$1" "$2" "$3" "${DOCKER_HELPER}" "${DOCKER_TIMEOUT}"     "${REAL_USER}" "${COLIMA_DOCKER_CONFIG}" <<'PYPLIST'
+  python3 - "$1" "$2" "$3" "${DOCKER_HELPER}" "${DOCKER_TIMEOUT}"     "${REAL_USER}" "${COLIMA_DOCKER_CONFIG}" "${COLIMA_CONFIG_HOME}" <<'PYPLIST'
 import pathlib, plistlib, sys
-source, target, directory, helper, timeout, user, docker_config = sys.argv[1:]
+source, target, directory, helper, timeout, user, docker_config, colima_home = sys.argv[1:]
 with open(source, "rb") as f:
     config = plistlib.load(f)
 args = config.get("ProgramArguments", [])
@@ -796,6 +796,7 @@ config["ProgramArguments"] = [helper, "wait-colima", "--timeout", timeout, "--"]
 if "Program" in config:
     config["Program"] = helper
 config.setdefault("EnvironmentVariables", {})["DOCKER_CONFIG"] = docker_config
+config["EnvironmentVariables"]["COLIMA_HOME"] = colima_home
 config["RunAtLoad"] = True
 config["KeepAlive"] = {"SuccessfulExit": False}
 with open(target, "wb") as f:
