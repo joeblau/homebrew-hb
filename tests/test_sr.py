@@ -16,7 +16,7 @@ MAGICK = shutil.which("magick")
 
 class SrCliTests(unittest.TestCase):
     def test_help_and_version_need_no_dependencies(self):
-        for option, expected in (("--help", "super-resolution"), ("--version", "sr 0.1.0")):
+        for option, expected in (("--help", "super-resolution"), ("--version", "sr 0.2.0")):
             result = subprocess.run(
                 [sys.executable, str(REPO / "sr"), option],
                 env={**os.environ, "PATH": ""}, capture_output=True, text=True,
@@ -32,6 +32,15 @@ class SrCliTests(unittest.TestCase):
             (["image.png", "--tile-size", "no"], "invalid tile_size"),
             (["image.png", "--gpu", "-1"], "nonnegative"),
             (["image.png", "a.png", "-o", "b.png"], "not both"),
+            (["image.png", "--sharpen=-1"], "between 0 and 2"),
+            (["image.png", "--sharpen=3"], "between 0 and 2"),
+            (["image.png", "--sharpen=nan"], "between 0 and 2"),
+            (["image.png", "--sharpen=inf"], "between 0 and 2"),
+            (["image.png", "--ai-strength=-1"], "between 0 and 1"),
+            (["image.png", "--ai-strength=2"], "between 0 and 1"),
+            (["image.png", "--ai-strength=nan"], "between 0 and 1"),
+            (["image.png", "--ai-strength=inf"], "between 0 and 1"),
+            (["image.png", "--ai-passes", "2"], "only supported for scales 8 and 16"),
         ):
             with self.subTest(args=args):
                 result = subprocess.run(
@@ -68,21 +77,29 @@ import sys
 
 args = sys.argv[1:]
 Path(os.environ["SR_TEST_LOG"]).write_text(json.dumps(args))
+source = args[args.index("-i") + 1]
+size = subprocess.check_output([os.environ["SR_TEST_MAGICK"], "identify", "-format", "%wx%h", source], text=True)
+history = Path(os.environ["SR_TEST_LOG"] + ".jsonl")
+pass_number = len(history.read_text().splitlines()) + 1 if history.exists() else 1
+with history.open("a") as stream:
+    stream.write(json.dumps({"args": args, "input_size": size}) + "\n")
 target = args[args.index("-o") + 1]
 if os.environ.get("SR_TEST_RACE"):
     Path(os.environ["SR_TEST_RACE"]).write_text("created by another process")
-if os.environ.get("SR_TEST_FAIL"):
+if os.environ.get("SR_TEST_FAIL") or str(pass_number) == os.environ.get("SR_TEST_FAIL_ON_PASS"):
     Path(target).write_text("partial output")
     print("simulated GPU failure", file=sys.stderr)
     sys.exit(7)
 if os.environ.get("SR_TEST_CORRUPT"):
     Path(target).write_text("invalid image")
     sys.exit(0)
-source = args[args.index("-i") + 1]
 scale = args[args.index("-s") + 1]
 if os.environ.get("SR_TEST_WRONG_SIZE"):
     scale = "2"
-subprocess.run([os.environ["SR_TEST_MAGICK"], source, "-resize", str(int(scale) * 100) + "%", target], check=True)
+command = [os.environ["SR_TEST_MAGICK"], source, "-resize", str(int(scale) * 100) + "%"]
+if os.environ.get("SR_TEST_TINT"):
+    command += ["-channel", "RGB", "-evaluate", "set", "75%", "+channel"]
+subprocess.run([*command, target], check=True)
 ''')
         self.backend.chmod(0o755)
         self.env = {
@@ -139,6 +156,97 @@ subprocess.run([os.environ["SR_TEST_MAGICK"], source, "-resize", str(int(scale) 
         for flag, value in (("-n", "realesrgan-x4plus-anime"), ("-g", "0"), ("-t", "32")):
             self.assertEqual(args[args.index(flag) + 1], value)
         self.assertIn("-x", args)
+
+    def test_large_scales_run_two_ai_passes(self):
+        for scale in (8, 16):
+            with self.subTest(scale=scale):
+                output = self.root / f"large-{scale}.png"
+                result = self.sr(self.source, output, "--scale", scale, "--ai-passes", "2", "--model", "anime",
+                                 "--gpu", "0", "--tile-size", "32", "--tta", "--sharpen")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.size(output), f"{8 * scale}x{6 * scale}")
+                history = [json.loads(line) for line in Path(str(self.log) + ".jsonl").read_text().splitlines()]
+                first, second = history[-2:]
+                self.assertEqual(first["input_size"], "8x6")
+                self.assertEqual(second["input_size"], "16x12" if scale == 8 else "32x24")
+                for call in (first, second):
+                    args = call["args"]
+                    for flag, expected in (("-s", "4"), ("-n", "realesrgan-x4plus-anime"), ("-g", "0"), ("-t", "32")):
+                        self.assertEqual(args[args.index(flag) + 1], expected)
+                    self.assertIn("-x", args)
+                self.assertIn("AI pass 2/2", result.stderr)
+                self.assertEqual(float(self.magick(output, "-format", f"%[fx:p{{{8 * scale - 1},0}}.a]", "info:")), 0)
+
+    def test_second_pass_failure_preserves_existing_output(self):
+        self.output.write_bytes(b"keep me")
+        result = self.sr(self.source, self.output, "--scale", "8", "--ai-passes", "2", "--force", SR_TEST_FAIL_ON_PASS="2")
+        self.assert_error(result, "AI pass 2/2")
+        self.assertIn("simulated GPU failure", result.stderr)
+        self.assertEqual(self.output.read_bytes(), b"keep me")
+
+    def test_large_scales_default_to_one_ai_pass(self):
+        for scale in (8, 16):
+            with self.subTest(scale=scale):
+                output = self.root / f"single-pass-{scale}.png"
+                result = self.sr(self.source, output, "--scale", scale)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.size(output), f"{8 * scale}x{6 * scale}")
+                self.assertIn("AI pass 1/1", result.stderr)
+                self.assertNotIn("AI pass 2", result.stderr)
+        history = Path(str(self.log) + ".jsonl").read_text().splitlines()
+        self.assertEqual(len(history), 2)
+
+    def test_zero_strength_does_not_require_or_run_ai(self):
+        result = self.sr(self.source, "--scale", "2", "--ai-strength", "0",
+                         SR_BACKEND=str(self.root / "missing"), SR_MODEL_DIR=str(self.root / "no-models"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = self.root / "my image-sr2x.png"
+        self.assertEqual(self.size(output), "16x12")
+        self.assertFalse(self.log.exists())
+        self.assertNotIn("AI pass", result.stderr)
+
+    def test_ai_strength_blends_pixels_and_preserves_alpha(self):
+        baseline = self.root / "baseline.png"
+        mixed = self.root / "mixed.png"
+        for output, strength in ((baseline, "1"), (mixed, "0.5")):
+            result = self.sr(self.source, output, "--ai-strength", strength, SR_TEST_TINT="1")
+            self.assertEqual(result.returncode, 0, result.stderr)
+        values = self.magick(mixed, "-format", "%[fx:p{2,12}.r] %[fx:p{2,12}.g] %[fx:p{2,12}.b]", "info:")
+        for actual, expected in zip(map(float, values.split()), (0.875, 0.375, 0.375)):
+            self.assertAlmostEqual(actual, expected, delta=0.01)
+        for image, name in ((baseline, "alpha-before.png"), (mixed, "alpha-after.png")):
+            self.magick(image, "-alpha", "extract", self.root / name)
+        self.assertEqual(self.magick(self.root / "alpha-before.png", self.root / "alpha-after.png",
+                                     "-compose", "difference", "-composite", "-format", "%[fx:mean]", "info:"), "0")
+
+    def test_sharpening_increases_edge_contrast(self):
+        source = self.root / "soft-edge.png"
+        self.magick("-size", "8x6", "xc:gray25", "-fill", "gray75", "-draw", "rectangle 4,0 7,5", source)
+        baseline = self.root / "baseline.png"
+        sharpened = self.root / "sharpened.png"
+        self.assertEqual(self.sr(source, baseline).returncode, 0)
+        self.assertEqual(self.sr(source, sharpened, "--sharpen").returncode, 0)
+        contrast = "%[fx:p{18,12}.r-p{13,12}.r]"
+        before = float(self.magick(baseline, "-format", contrast, "info:"))
+        after = float(self.magick(sharpened, "-format", contrast, "info:"))
+        self.assertGreater(after, before)
+        self.assertEqual(self.size(sharpened), self.size(baseline))
+
+    def test_sharpening_strength_and_alpha(self):
+        baseline = self.root / "baseline.png"
+        disabled = self.root / "disabled.png"
+        sharpened = self.root / "sharpened.png"
+        for output, options in ((baseline, ()), (disabled, ("--sharpen", "0")), (sharpened, ("--sharpen", "0.5"))):
+            result = self.sr(self.source, output, *options)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.magick(baseline, disabled, "-compose", "difference", "-composite",
+                                     "-format", "%[fx:mean]", "info:"), "0")
+        before_alpha = self.root / "alpha-before.png"
+        after_alpha = self.root / "alpha-after.png"
+        self.magick(baseline, "-alpha", "extract", before_alpha)
+        self.magick(sharpened, "-alpha", "extract", after_alpha)
+        self.assertEqual(self.magick(before_alpha, after_alpha, "-compose", "difference", "-composite",
+                                     "-format", "%[fx:mean]", "info:"), "0")
 
     def test_tiff_input_and_jpeg_output(self):
         source = self.root / "scan.tiff"

@@ -2,6 +2,7 @@
 """Local image super-resolution using Real-ESRGAN and ImageMagick."""
 
 import argparse
+import math
 import os
 from pathlib import Path
 import shutil
@@ -10,7 +11,7 @@ import sys
 import tempfile
 
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 MODELS = {"photo": "realesrgan-x4plus", "anime": "realesrgan-x4plus-anime"}
 OUTPUT_FORMATS = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp", ".heic", ".avif"}
 
@@ -26,6 +27,20 @@ def tile_size(value):
     return size
 
 
+def sharpening_amount(value):
+    amount = float(value)
+    if not math.isfinite(amount) or not 0 <= amount <= 2:
+        raise argparse.ArgumentTypeError("sharpening amount must be between 0 and 2")
+    return amount
+
+
+def ai_strength(value):
+    strength = float(value)
+    if not math.isfinite(strength) or not 0 <= strength <= 1:
+        raise argparse.ArgumentTypeError("AI strength must be between 0 and 1")
+    return strength
+
+
 def parser():
     cli = argparse.ArgumentParser(
         description="Apply local AI super-resolution to an image (4x by default).",
@@ -34,7 +49,13 @@ def parser():
     cli.add_argument("input", type=Path, help="image to upscale")
     cli.add_argument("output", type=Path, nargs="?", help="output path (default: INPUT-sr4x.png)")
     cli.add_argument("-o", "--output", type=Path, dest="output_option", metavar="OUTPUT", help="output path")
-    cli.add_argument("-s", "--scale", type=int, choices=(2, 3, 4), default=4, help="output scale (default: 4)")
+    cli.add_argument("-s", "--scale", type=int, choices=(2, 3, 4, 8, 16), default=4, help="output scale; scales above 4 resize the AI result (default: 4)")
+    cli.add_argument("--ai-passes", type=int, choices=(1, 2), default=1,
+                     help="AI passes for 8x/16x; 2 can amplify artifacts (default: 1)")
+    cli.add_argument("--ai-strength", type=ai_strength, default=1.0, metavar="AMOUNT",
+                     help="blend AI with a normal resize: 0=resize only, 1=full AI (default: 1)")
+    cli.add_argument("--sharpen", type=sharpening_amount, nargs="?", const=1.0, default=0.0,
+                     metavar="AMOUNT", help="apply final unsharp masking; 0–2 (default when enabled: 1)")
     cli.add_argument("-m", "--model", choices=MODELS, default="photo", help="photo or anime (default: photo)")
     cli.add_argument("-t", "--tile-size", type=tile_size, default=0, help="GPU tile size; 0=auto, smaller uses less memory")
     cli.add_argument("-g", "--gpu", type=int, help="GPU index (default: auto)")
@@ -84,27 +105,27 @@ def upscale(args):
     magick = shutil.which("magick")
     if not magick:
         raise SrError("ImageMagick is missing. Install it with: brew install imagemagick")
-    bundled = Path(__file__).resolve().parent / "realesrgan"
-    backend_setting = os.environ.get("SR_BACKEND")
-    backend = (
-        shutil.which(backend_setting) if backend_setting else
-        str(bundled / "realesrgan-ncnn-vulkan") if (bundled / "realesrgan-ncnn-vulkan").is_file() else
-        shutil.which("realesrgan-ncnn-vulkan")
-    )
-    if not backend or not os.access(backend, os.X_OK):
-        raise SrError("Real-ESRGAN is missing or not executable. Install sr with Homebrew or set SR_BACKEND (see README).")
-    model_dir = Path(os.environ.get("SR_MODEL_DIR", str(Path(backend).resolve().parent / "models"))).expanduser().resolve()
     model = MODELS[args.model]
-    for extension in (".param", ".bin"):
-        if not (model_dir / f"{model}{extension}").is_file():
-            raise SrError(f"Model file is missing: {model_dir / (model + extension)} (set SR_MODEL_DIR to the models folder)")
+    if args.ai_strength:
+        bundled = Path(__file__).resolve().parent / "realesrgan"
+        backend_setting = os.environ.get("SR_BACKEND")
+        backend = (
+            shutil.which(backend_setting) if backend_setting else
+            str(bundled / "realesrgan-ncnn-vulkan") if (bundled / "realesrgan-ncnn-vulkan").is_file() else
+            shutil.which("realesrgan-ncnn-vulkan")
+        )
+        if not backend or not os.access(backend, os.X_OK):
+            raise SrError("Real-ESRGAN is missing or not executable. Install sr with Homebrew or set SR_BACKEND (see README).")
+        model_dir = Path(os.environ.get("SR_MODEL_DIR", str(Path(backend).resolve().parent / "models"))).expanduser().resolve()
+        for extension in (".param", ".bin"):
+            if not (model_dir / f"{model}{extension}").is_file():
+                raise SrError(f"Model file is missing: {model_dir / (model + extension)} (set SR_MODEL_DIR to the models folder)")
 
     print(f"Upscaling {source.name} ({args.scale}x, {args.model})…", file=sys.stderr)
     # Stage on the destination filesystem so publication is atomic.
     with tempfile.TemporaryDirectory(prefix=".sr-", dir=output.parent) as temporary:
         work = Path(temporary)
         normalized = work / "input.png"
-        enhanced = work / "enhanced.png"
         encoded = work / f"output{output.suffix.lower()}"
         run([
             magick, f"{source}[0]", "-auto-orient", "-colorspace", "sRGB", "-depth", "8",
@@ -113,20 +134,55 @@ def upscale(args):
         width, height = dimensions(magick, normalized)
         # These models are natively 4x. Requesting 2x/3x from them directly can
         # produce incorrect buffers in ncnn; resize the actual 4x result instead.
-        command = [
-            backend, "-i", str(normalized), "-o", str(enhanced), "-m", str(model_dir),
-            "-n", model, "-s", "4", "-t", str(args.tile_size),
-        ]
-        if args.gpu is not None:
-            command += ["-g", str(args.gpu)]
-        if args.tta:
-            command.append("-x")
-        run(command, "AI super-resolution (requires a Vulkan/Metal-capable GPU)")
-        if dimensions(magick, enhanced) != (width * 4, height * 4):
-            raise SrError("Real-ESRGAN returned unexpected image dimensions")
-        command = [magick, str(enhanced)]
-        if args.scale != 4:
+        current = normalized
+        current_scale = 1
+        passes = args.ai_passes if args.ai_strength else 0
+        for index in range(passes):
+            if index == 1 and args.scale == 8:
+                # Feed a 2x intermediate to the second 4x pass, avoiding a
+                # wasteful 16x image that would then be reduced to 8x.
+                intermediate = work / "intermediate.png"
+                run([
+                    magick, str(current), "-filter", "Lanczos", "-resize",
+                    f"{width * 2}x{height * 2}!", f"PNG32:{intermediate}",
+                ], "Preparing second AI pass")
+                current = intermediate
+                current_scale = 2
+            enhanced = work / f"enhanced-{index + 1}.png"
+            command = [
+                backend, "-i", str(current), "-o", str(enhanced), "-m", str(model_dir),
+                "-n", model, "-s", "4", "-t", str(args.tile_size),
+            ]
+            if args.gpu is not None:
+                command += ["-g", str(args.gpu)]
+            if args.tta:
+                command.append("-x")
+            print(f"AI pass {index + 1}/{passes}…", file=sys.stderr)
+            run(command, f"AI pass {index + 1}/{passes} (requires a Vulkan/Metal-capable GPU)")
+            current_scale *= 4
+            if dimensions(magick, enhanced) != (width * current_scale, height * current_scale):
+                raise SrError("Real-ESRGAN returned unexpected image dimensions")
+            current = enhanced
+        if 0 < args.ai_strength < 1:
+            baseline = work / "baseline.png"
+            run([
+                magick, str(normalized), "-filter", "Lanczos", "-resize",
+                f"{width * current_scale}x{height * current_scale}!", f"PNG32:{baseline}",
+            ], "Preparing original-detail blend")
+            blended = work / "blended.png"
+            run([
+                magick, str(current), str(baseline), "-colorspace", "sRGB", "-type", "TrueColorAlpha",
+                "-channel", "RGB", "-compose", "Blend",
+                "-define", f"compose:args={100 * (1 - args.ai_strength):g},{100 * args.ai_strength:g}",
+                "-composite", "+channel", f"PNG32:{blended}",
+            ], "Blending AI restoration with original detail")
+            current = blended
+        command = [magick, str(current)]
+        if args.scale != current_scale:
             command += ["-filter", "Lanczos", "-resize", f"{width * args.scale}x{height * args.scale}!"]
+        if args.sharpen:
+            # Sharpen color channels only; keep transparency unchanged.
+            command += ["-channel", "RGB", "-unsharp", f"0x1+{args.sharpen:g}+0.02", "+channel"]
         if output.suffix.lower() in (".jpg", ".jpeg", ".bmp"):
             command += ["-background", "white", "-alpha", "remove", "-alpha", "off"]
         command.append(str(encoded))
@@ -151,6 +207,8 @@ def main():
         cli.error("specify output either as a positional argument or with --output, not both")
     if args.gpu is not None and args.gpu < 0:
         cli.error("GPU index must be nonnegative")
+    if args.ai_passes == 2 and args.scale <= 4:
+        cli.error("two AI passes are only supported for scales 8 and 16")
     try:
         upscale(args)
     except (SrError, OSError) as exc:

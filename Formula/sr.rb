@@ -8,8 +8,10 @@ class Sr < Formula
 
   desc "Local AI image super-resolution with Real-ESRGAN"
   homepage "https://github.com/joeblau/homebrew-hb"
+  url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/sr-v0.2.0.tar.gz"
+  version "0.2.0"
+  sha256 "15fe33e3ae18f2eaf811d210c0cc558b39269dd469258778b13f4ec89cd3aeed"
   license "MIT"
-  # Use HEAD until the first release containing sr is tagged.
   head "https://github.com/joeblau/homebrew-hb.git", branch: "main"
 
   depends_on "imagemagick"
@@ -36,6 +38,7 @@ class Sr < Formula
       Upscale an image locally (4x by default):
         sr image.jpg
         sr image.heic -s 2 -o enhanced.png
+        sr image.jpg -s 8 --sharpen
 
       A Vulkan/Metal-capable GPU is required. Models are bundled; processing
       needs no network access. Use --model anime for illustrations.
@@ -43,12 +46,15 @@ class Sr < Formula
   end
 
   test do
+    assert_match "sr 0.2.0", shell_output("#{bin}/sr --version")
     assert_match "super-resolution", shell_output("#{bin}/sr --help")
     assert_match "Input image does not exist", shell_output("#{bin}/sr missing.png 2>&1", 2)
 
     system formula_opt_bin("imagemagick")/"magick", "-size", "8x6", "gradient:", "input.png"
-    system bin/"sr", "input.png", "--tile-size", "32"
-    size = shell_output("#{formula_opt_bin("imagemagick")}/magick identify -format '%wx%h' input-sr4x.png")
-    assert_equal "32x24", size
+    [4, 8, 16].each do |scale|
+      system bin/"sr", "input.png", "--scale", scale.to_s, "--sharpen", "0.5", "--tile-size", "32"
+      size = shell_output("#{formula_opt_bin("imagemagick")}/magick identify -format '%wx%h' input-sr#{scale}x.png")
+      assert_equal "#{8 * scale}x#{6 * scale}", size
+    end
   end
 end
