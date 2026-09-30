@@ -8,21 +8,52 @@ a Vulkan/Metal-capable GPU; there is no CPU fallback.
 
 ## Install and use
 
-Install the HEAD formula (the first tagged release containing `sr` has not been
-published yet):
+Install the versioned formula:
 
 ```sh
-brew install --HEAD joeblau/hb/sr
+brew install joeblau/hb/sr
 sr photo.jpg
 sr photo.jpg enhanced.jpg --scale 2
 sr scan.tiff -o enhanced.png --scale 3
 sr drawing.png --model anime --tta
+sr photo.jpg --scale 8 --sharpen
+sr photo.jpg --scale 16 --sharpen 0.5 -o large.png
+sr photo.jpg --scale 2 --ai-strength 0.5 -o gentle.png
 ```
 
+For future stable releases, run `brew update` followed by
+`brew upgrade joeblau/hb/sr`. Check the installed version with `sr --version`.
+The optional `--HEAD` installation tracks unreleased changes on `main`.
+
 The default output is `<input-stem>-sr<scale>x.png` beside the input. Supported
-scales are 2, 3, and 4; both models run AI inference at their native 4x scale,
-then 2x/3x outputs are downsampled with Lanczos. The default `photo` model is
+scales are 2, 3, 4, 8, and 16. Both models run AI inference at their native 4x
+scale, then outputs at other scales are resized with Lanczos. By default,
+8x/16x enlarge the single 4x AI result; this adds pixels, not another level of
+AI-generated detail. Use `--ai-passes 2` to opt into repeated AI restoration:
+for 8x, the first AI result is downsampled to 2x before a second 4x AI pass;
+for 16x, two 4x AI passes run consecutively. The 8x path avoids allocating an
+unnecessary 16x image. The default `photo` model is
 `realesrgan-x4plus`; `anime` uses `realesrgan-x4plus-anime`.
+
+AI restoration already adds detail. `--sharpen` optionally applies
+[unsharp masking](https://imagemagick.org/command-line-options/#unsharp) to the
+final color channels after resizing, preserving alpha. This finishing filter
+is conventional image processing; Real-ESRGAN provides the AI enhancement.
+The default strength when the flag is enabled is 1; `--sharpen 0.5` is gentler,
+`--sharpen 2` is stronger, and `--sharpen 0` disables it. Sharpening is off unless
+requested.
+
+Larger scales take more time and disk space: 8x has 64 times the input's pixel
+count, and 16x has 256 times. Additional AI passes can amplify artifacts or
+invent textures; larger output does not guarantee more accurate detail.
+
+If a result looks waxy, overprocessed, or has invented texture, try 2x/4x
+without sharpening first. `--ai-strength 0.5` blends the AI result with a
+Lanczos resize of the original before the final resize and sharpening. This
+is an output blend, not a model denoising parameter. Strength 1 (the default)
+keeps the full AI result; 0 skips AI entirely and needs only ImageMagick.
+For text, logos, or pixel art, compare against `--ai-strength 0` before using
+AI restoration. Strong sharpening can add halos around edges.
 
 Output formats are PNG, JPEG, WebP, TIFF, BMP, HEIC, and AVIF, selected by the
 output extension. Codec availability follows the installed ImageMagick build.

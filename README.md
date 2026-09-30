@@ -9,15 +9,20 @@ brew tap joeblau/hb
 Upscale images locally with Real-ESRGAN on Apple Silicon or Intel Macs:
 
 ```sh
-brew install --HEAD joeblau/hb/sr
+brew install joeblau/hb/sr
 sr photo.jpg                         # writes photo-sr4x.png
 sr image.heic --scale 2 -o bigger.png
+sr photo.jpg --scale 8 --sharpen      # AI restoration, then resize and sharpen
+sr photo.jpg --scale 2 --ai-strength 0.5  # gentler restoration
 sr illustration.png result.webp --model anime
 ```
 
 Models are bundled and processing runs offline on a Vulkan/Metal-capable GPU.
 Inputs can use any format ImageMagick can decode, including HEIC, TIFF, and BMP.
 Use `--force` to replace an existing output; the original is always preserved.
+Scales above 4× resize a single AI result by default. `--ai-passes 2` enables
+repeated AI restoration; `--ai-strength` reduces its effect, and `--sharpen`
+adds optional edge sharpening.
 See [usage, format details, and running from a checkout](docs/super-resolution.md).
 
 ## Runner tooling (`runner-setup` formula)
