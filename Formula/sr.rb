@@ -8,8 +8,10 @@ class Sr < Formula
 
   desc "Local AI image super-resolution with Real-ESRGAN"
   homepage "https://github.com/joeblau/homebrew-hb"
+  url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/sr-v0.2.0.tar.gz"
+  version "0.2.0"
+  sha256 "15fe33e3ae18f2eaf811d210c0cc558b39269dd469258778b13f4ec89cd3aeed"
   license "MIT"
-  # Use HEAD until the first release containing sr is tagged.
   head "https://github.com/joeblau/homebrew-hb.git", branch: "main"
 
   depends_on "imagemagick"
