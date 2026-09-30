@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""Local image super-resolution using Real-ESRGAN and ImageMagick."""
+
+import argparse
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+VERSION = "0.1.0"
+MODELS = {"photo": "realesrgan-x4plus", "anime": "realesrgan-x4plus-anime"}
+OUTPUT_FORMATS = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp", ".heic", ".avif"}
+
+
+class SrError(Exception):
+    """An actionable CLI error."""
+
+
+def tile_size(value):
+    size = int(value)
+    if size != 0 and size < 32:
+        raise argparse.ArgumentTypeError("tile size must be 0 (auto) or at least 32")
+    return size
+
+
+def parser():
+    cli = argparse.ArgumentParser(
+        description="Apply local AI super-resolution to an image (4x by default).",
+        epilog="Inputs: formats supported by ImageMagick; animated/multipage inputs use the first frame.",
+    )
+    cli.add_argument("input", type=Path, help="image to upscale")
+    cli.add_argument("output", type=Path, nargs="?", help="output path (default: INPUT-sr4x.png)")
+    cli.add_argument("-o", "--output", type=Path, dest="output_option", metavar="OUTPUT", help="output path")
+    cli.add_argument("-s", "--scale", type=int, choices=(2, 3, 4), default=4, help="output scale (default: 4)")
+    cli.add_argument("-m", "--model", choices=MODELS, default="photo", help="photo or anime (default: photo)")
+    cli.add_argument("-t", "--tile-size", type=tile_size, default=0, help="GPU tile size; 0=auto, smaller uses less memory")
+    cli.add_argument("-g", "--gpu", type=int, help="GPU index (default: auto)")
+    cli.add_argument("--tta", action="store_true", help="enable slower test-time augmentation")
+    cli.add_argument("-f", "--force", action="store_true", help="replace an existing output file")
+    cli.add_argument("--version", action="version", version=f"sr {VERSION}")
+    return cli
+
+
+def run(command, stage):
+    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode:
+        detail = (result.stderr.strip() or result.stdout.strip())[-4000:]
+        raise SrError(f"{stage} failed (exit {result.returncode})" + (f":\n{detail}" if detail else ""))
+    return result.stdout.strip()
+
+
+def dimensions(magick, image):
+    try:
+        width, height = map(int, run([magick, "identify", "-format", "%w %h", str(image)], "Reading image dimensions").split())
+    except ValueError as exc:
+        raise SrError("Could not read image dimensions") from exc
+    if width < 1 or height < 1:
+        raise SrError("Image dimensions must be positive")
+    return width, height
+
+
+def upscale(args):
+    source = args.input.expanduser().resolve()
+    if not source.is_file():
+        raise SrError(f"Input image does not exist or is not a file: {source}")
+    output = args.output_option or args.output or source.with_name(f"{source.stem}-sr{args.scale}x.png")
+    # Keep the final component unresolved: --force replaces a symlink, not its target.
+    output = Path(os.path.abspath(output.expanduser()))
+    if output.resolve() == source or (output.exists() and os.path.samefile(source, output)):
+        raise SrError("Input and output must be different files; the original image is always preserved")
+    if output.exists() or output.is_symlink():
+        if not args.force:
+            raise SrError(f"Output already exists: {output} (use --force to replace it)")
+        if output.is_dir():
+            raise SrError(f"Output is a directory: {output}")
+    if not output.parent.is_dir():
+        raise SrError(f"Output directory does not exist: {output.parent}")
+    if output.suffix.lower() not in OUTPUT_FORMATS:
+        raise SrError("Output extension must be png, jpg, jpeg, webp, tif, tiff, bmp, heic, or avif")
+
+    magick = shutil.which("magick")
+    if not magick:
+        raise SrError("ImageMagick is missing. Install it with: brew install imagemagick")
+    bundled = Path(__file__).resolve().parent / "realesrgan"
+    backend_setting = os.environ.get("SR_BACKEND")
+    backend = (
+        shutil.which(backend_setting) if backend_setting else
+        str(bundled / "realesrgan-ncnn-vulkan") if (bundled / "realesrgan-ncnn-vulkan").is_file() else
+        shutil.which("realesrgan-ncnn-vulkan")
+    )
+    if not backend or not os.access(backend, os.X_OK):
+        raise SrError("Real-ESRGAN is missing or not executable. Install sr with Homebrew or set SR_BACKEND (see README).")
+    model_dir = Path(os.environ.get("SR_MODEL_DIR", str(Path(backend).resolve().parent / "models"))).expanduser().resolve()
+    model = MODELS[args.model]
+    for extension in (".param", ".bin"):
+        if not (model_dir / f"{model}{extension}").is_file():
+            raise SrError(f"Model file is missing: {model_dir / (model + extension)} (set SR_MODEL_DIR to the models folder)")
+
+    print(f"Upscaling {source.name} ({args.scale}x, {args.model})…", file=sys.stderr)
+    # Stage on the destination filesystem so publication is atomic.
+    with tempfile.TemporaryDirectory(prefix=".sr-", dir=output.parent) as temporary:
+        work = Path(temporary)
+        normalized = work / "input.png"
+        enhanced = work / "enhanced.png"
+        encoded = work / f"output{output.suffix.lower()}"
+        run([
+            magick, f"{source}[0]", "-auto-orient", "-colorspace", "sRGB", "-depth", "8",
+            f"PNG32:{normalized}",
+        ], "Decoding input image")
+        width, height = dimensions(magick, normalized)
+        # These models are natively 4x. Requesting 2x/3x from them directly can
+        # produce incorrect buffers in ncnn; resize the actual 4x result instead.
+        command = [
+            backend, "-i", str(normalized), "-o", str(enhanced), "-m", str(model_dir),
+            "-n", model, "-s", "4", "-t", str(args.tile_size),
+        ]
+        if args.gpu is not None:
+            command += ["-g", str(args.gpu)]
+        if args.tta:
+            command.append("-x")
+        run(command, "AI super-resolution (requires a Vulkan/Metal-capable GPU)")
+        if dimensions(magick, enhanced) != (width * 4, height * 4):
+            raise SrError("Real-ESRGAN returned unexpected image dimensions")
+        command = [magick, str(enhanced)]
+        if args.scale != 4:
+            command += ["-filter", "Lanczos", "-resize", f"{width * args.scale}x{height * args.scale}!"]
+        if output.suffix.lower() in (".jpg", ".jpeg", ".bmp"):
+            command += ["-background", "white", "-alpha", "remove", "-alpha", "off"]
+        command.append(str(encoded))
+        run(command, "Encoding output image")
+        if dimensions(magick, encoded) != (width * args.scale, height * args.scale):
+            raise SrError("Encoded output has unexpected image dimensions")
+        if args.force:
+            os.replace(encoded, output)
+        else:
+            # Unlike rename, link fails if another process created the output.
+            try:
+                os.link(encoded, output)
+            except FileExistsError as exc:
+                raise SrError(f"Output already exists: {output} (use --force to replace it)") from exc
+    print(output)
+
+
+def main():
+    cli = parser()
+    args = cli.parse_args()
+    if args.output and args.output_option:
+        cli.error("specify output either as a positional argument or with --output, not both")
+    if args.gpu is not None and args.gpu < 0:
+        cli.error("GPU index must be nonnegative")
+    try:
+        upscale(args)
+    except (SrError, OSError) as exc:
+        print(f"sr: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("sr: interrupted", file=sys.stderr)
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

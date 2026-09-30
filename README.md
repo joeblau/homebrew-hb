@@ -4,6 +4,22 @@
 brew tap joeblau/hb
 ```
 
+## Image super-resolution (`sr` formula)
+
+Upscale images locally with Real-ESRGAN on Apple Silicon or Intel Macs:
+
+```sh
+brew install --HEAD joeblau/hb/sr
+sr photo.jpg                         # writes photo-sr4x.png
+sr image.heic --scale 2 -o bigger.png
+sr illustration.png result.webp --model anime
+```
+
+Models are bundled and processing runs offline on a Vulkan/Metal-capable GPU.
+Inputs can use any format ImageMagick can decode, including HEIC, TIFF, and BMP.
+Use `--force` to replace an existing output; the original is always preserved.
+See [usage, format details, and running from a checkout](docs/super-resolution.md).
+
 ## Runner tooling (`runner-setup` formula)
 
 Provision and operate GitHub Actions self-hosted runners on macOS:
