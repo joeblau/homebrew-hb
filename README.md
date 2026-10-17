@@ -36,8 +36,18 @@ On Apple Silicon, Colima setup also installs missing Rosetta 2 for `linux/amd64`
 Runner setup also enables restart after power failure and disables system sleep,
 disk sleep and Power Nap where supported. Use `--skip-power-config` to retain
 existing settings. It upgrades itself through Homebrew, turns off FileVault so
-restarts need no login (`--keep-filevault` opts out), and finishes only when
-every runner is listening for jobs. See [power settings and boot verification](docs/boot-startup.md).
+restarts need no login (`--keep-filevault` opts out), enables Remote Login,
+runs tailscaled as a boot-time system service (`--skip-remote-login` /
+`--skip-tailscale` opt out), supervises the Colima VM so it never keeps
+running without Rosetta, and finishes only when every runner is listening for
+jobs. See [power settings and boot verification](docs/boot-startup.md).
+
+Bootstrap a fresh Mini with the tap's [Brewfile](Brewfile):
+
+```sh
+brew tap joeblau/hb
+brew bundle --file="$(brew --repository joeblau/hb)/Brewfile"
+```
 Runner services restart after any exit. Re-running setup repairs existing
 startup settings; explicit `--colima` setup transfers the idle VM to system
 launchd so it runs independently of the owner's GUI session.

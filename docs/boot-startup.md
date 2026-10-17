@@ -10,6 +10,8 @@ supports them, then reads them back with `pmset -g custom`:
 | `sleep` | `0` | Disable automatic system sleep |
 | `disksleep` | `0` | Disable automatic disk sleep |
 | `powernap` | `0` | Disable Power Nap |
+| `womp` | `1` | Wake on LAN (magic packet) |
+| `tcpkeepalive` | `1` | Keep network sessions alive |
 
 Unsupported settings are reported and skipped. A failed write or verification
 stops setup before it provisions runners or Colima. Display sleep and screen
@@ -19,7 +21,7 @@ power settings, for example on a shared development Mac.
 Inspect the resulting policy on each Mini:
 
 ```sh
-pmset -g custom | grep -E 'autorestart|sleep|disksleep|powernap'
+pmset -g custom | grep -E 'autorestart|sleep|disksleep|powernap|womp|tcpkeepalive'
 ```
 
 These settings persist across reboots; they do not need a separate LaunchDaemon.
@@ -44,6 +46,18 @@ Each run of `runner-setup` also:
   including reruns that inherit Colima, because the runners refuse to listen
   without it. A Colima VM that started before Rosetta was installed is
   restarted between jobs so it comes back with Rosetta.
+- **Turns on Remote Login (SSH)** so the fleet can be administered without a
+  keyboard. macOS lets a terminal change this only with Full Disk Access
+  (System Settings → Privacy & Security → Full Disk Access); without it setup
+  prints the manual path and continues. After the first SSH connection, grant
+  Full Disk Access to `sshd-keygen-wrapper` if remote sessions need protected
+  directories. `--skip-remote-login` opts out.
+- **Runs tailscaled as a system service.** The Tailscale menu-bar app only
+  connects after GUI login, so a rebooted, logged-out Mini vanishes from the
+  tailnet. Setup installs the Tailscale CLI and starts its Homebrew system
+  service, which is reachable at the login window; `sudo tailscale up` runs
+  once interactively. Quit the menu-bar app afterwards — two tailscaled
+  processes fight over the tunnel. `--skip-tailscale` opts out.
 - **Starts every runner and waits until it listens for jobs.** Runners left in
   maintenance by an interrupted upgrade, and runners crash-looping on a
   readiness gate, are restarted. Setup fails if any runner does not come
@@ -51,6 +65,24 @@ Each run of `runner-setup` also:
 
 GitHub's runner updates its own binary when a new release is required, so a
 running fleet needs no scheduled upgrade job.
+
+## The Rosetta boot race, and the boot-colima supervisor
+
+Right after power-on, macOS can briefly report Rosetta as unavailable even
+though it is installed. Observed on a Mini: 30 seconds after boot, Colima
+logged `Unable to enable Rosetta: Rosetta2 is not installed` and silently
+started its VM without Rosetta, while `arch -x86_64 /usr/bin/true` succeeded
+minutes later. Every runner readiness gate then stays closed — `runs` climbs
+in `launchctl print` with `last exit code = 1` — until the VM restarts.
+
+The Colima boot daemon therefore runs `runner-docker-builder boot-colima`
+instead of launching `colima start --foreground` directly. The supervisor
+waits up to 180 s for host Rosetta, starts the VM, verifies
+`/proc/sys/fs/binfmt_misc/rosetta` inside it, and on a mismatch stops the VM
+and exits so launchd starts a fresh, correct one. Three failed attempts
+(persisted in `~/Library/Logs/runner-colima/rosetta-restarts`) cap the loop;
+the counter clears on the first healthy start. Setup reruns migrate older
+direct-`colima` daemons to the supervisor between jobs.
 
 `autorestart=1` covers a power failure while the Mac was running. It does not
 guarantee startup after a deliberate shutdown followed by reconnecting AC power.
@@ -103,6 +135,13 @@ runner-setup --org ORG_NAME --runners 2 --colima
 ```
 
 Use the existing organization or repository and runner count for that machine.
+For a brand-new Mini, install everything first with the tap's Brewfile:
+
+```sh
+brew tap joeblau/hb
+brew bundle --file="$(brew --repository joeblau/hb)/Brewfile"
+```
+
 Existing same-scope Colima runners need no new registration token. Setup
 upgrades the tools, repairs the services, resumes held runners and returns
 only after every runner is listening for jobs. Deleted GitHub registrations

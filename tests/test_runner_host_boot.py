@@ -18,6 +18,17 @@ esac''',
 [[ -f "$TEST_ROOT/install-fails" ]] || touch "$TEST_ROOT/rosetta"''',
     'colima': 'cat "$TEST_ROOT/vm-rosetta" 2>/dev/null',
     'upgrade': 'echo "$*" >> "$TEST_ROOT/upgrade-calls"',
+    'systemsetup': '''echo "$*" >> "$TEST_ROOT/systemsetup-calls"
+[[ ! -f "$TEST_ROOT/fda-denied" ]] || { echo "requires Full Disk Access" >&2; exit 1; }
+case "$1" in
+  -getremotelogin) [[ -f "$TEST_ROOT/remotelogin" ]] && echo "Remote Login: On" || echo "Remote Login: Off" ;;
+  -setremotelogin) [[ "$2" != on ]] || touch "$TEST_ROOT/remotelogin" ;;
+esac''',
+    'tailscale': '''echo "$*" >> "$TEST_ROOT/tailscale-calls"
+case "$1" in
+  status) [[ -f "$TEST_ROOT/ts-connected" ]] ;;
+  up) touch "$TEST_ROOT/ts-connected" ;;
+esac''',
 }
 
 
@@ -115,6 +126,59 @@ class HostBootTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('Active runner job', result.stderr)
         self.assertFalse(any('kickstart' in call for call in self.lines('sudo-calls')))
+
+    def test_remote_login_is_enabled_and_verified(self):
+        result = self.shell('configure_remote_access')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Enabled Remote Login', result.stderr)
+        self.assertEqual(self.lines('systemsetup-calls'),
+                         ['-getremotelogin', '-setremotelogin on', '-getremotelogin'])
+
+    def test_remote_login_already_on_is_left_alone(self):
+        (self.root/'remotelogin').touch()
+        result = self.shell('configure_remote_access')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.lines('systemsetup-calls'), ['-getremotelogin'])
+
+    def test_remote_login_without_full_disk_access_warns_and_continues(self):
+        (self.root/'fda-denied').touch()
+        result = self.shell('configure_remote_access; echo continued')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Full Disk Access', result.stderr)
+        self.assertIn('continued', result.stdout)
+
+    def test_skip_remote_login_makes_no_queries(self):
+        result = self.shell('parse_args --org acme --token x --skip-remote-login; configure_remote_access')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.lines('systemsetup-calls'), [])
+
+    TAILSCALE_BREW = 'brew() { echo "$*" >> "$TEST_ROOT/brew-calls"; }\n'
+
+    def test_tailscale_service_is_started_and_login_warned_without_a_tty(self):
+        result = self.shell(self.TAILSCALE_BREW + 'configure_tailscale')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('services start tailscale', self.lines('brew-calls'))
+        self.assertIn("run 'sudo tailscale up' once", result.stderr)
+        self.assertEqual(self.lines('tailscale-calls'), ['status'])
+
+    def test_connected_tailscale_with_loaded_service_is_left_alone(self):
+        (self.root/'ts-connected').touch()
+        (self.root/'loaded-homebrew.mxcl.tailscale').touch()
+        result = self.shell(self.TAILSCALE_BREW + 'configure_tailscale')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Tailscale is connected', result.stderr)
+        self.assertEqual(self.lines('brew-calls'), [])
+
+    def test_running_menu_bar_app_is_called_out(self):
+        result = self.shell(self.TAILSCALE_BREW + 'pgrep() { [[ "$2" == Tailscale ]]; }\nconfigure_tailscale')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('menu-bar app is running', result.stderr)
+
+    def test_skip_tailscale_does_nothing(self):
+        result = self.shell(self.TAILSCALE_BREW + 'parse_args --org acme --token x --skip-tailscale; configure_tailscale')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.lines('brew-calls'), [])
+        self.assertEqual(self.lines('tailscale-calls'), [])
 
     def test_setup_finishes_by_starting_and_verifying_every_runner(self):
         result = self.shell('UPGRADE_BIN="$TEST_ROOT/bin/upgrade"; RUNNERS=2; DOCKER_TIMEOUT=120; start_runners')

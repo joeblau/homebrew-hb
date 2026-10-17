@@ -49,6 +49,8 @@ COLIMA_CONFIG_HOME=""
 COLIMA_DOCKER_CONFIG=""
 CONFIGURE_POWER=1    # persistent host power settings for always-on runners
 KEEP_FILEVAULT=0     # --keep-filevault: leave FileVault on (restarts then need a login)
+CONFIGURE_REMOTE_LOGIN=1  # enable Remote Login (SSH) for remote administration
+CONFIGURE_TAILSCALE=1     # install tailscaled as a system service for boot-time access
 SELF_UPGRADE=1       # upgrade the Homebrew tools and re-run as the new release
 declare -a ORIGINAL_ARGS=()
 EPHEMERAL=0           # 1 => LaunchDaemon runs runner-ephemeral, not runsvc.sh
@@ -146,6 +148,16 @@ OPTIONS:
   --skip-self-upgrade   Do not upgrade the Homebrew tools first. By default, a
                         Homebrew-installed setup upgrades joeblau/hb/runner-setup
                         and re-runs itself as the new release.
+  --skip-remote-login   Keep Remote Login (SSH) as it is. By default, setup
+                        turns it on so the fleet can be administered without a
+                        keyboard. macOS only allows this for a terminal with
+                        Full Disk Access; without it, setup prints what to
+                        enable and continues.
+  --skip-tailscale      Keep Tailscale as it is. By default, setup installs the
+                        Tailscale CLI and runs tailscaled as a system service,
+                        so the Mac stays reachable at the login window; the
+                        one-time 'sudo tailscale up' login runs only in an
+                        interactive setup.
   --ephemeral           Make each runner ephemeral: instead of pointing the
                         LaunchDaemon at bin/runsvc.sh directly, point it at the
                         runner-ephemeral supervisor, which re-registers the
@@ -271,6 +283,8 @@ parse_args() {
       --skip-power-config) CONFIGURE_POWER=0; shift ;;
       --keep-filevault) KEEP_FILEVAULT=1; shift ;;
       --skip-self-upgrade) SELF_UPGRADE=0; shift ;;
+      --skip-remote-login) CONFIGURE_REMOTE_LOGIN=0; shift ;;
+      --skip-tailscale) CONFIGURE_TAILSCALE=0; shift ;;
       --docker-timeout)
         [[ $# -ge 2 ]] || { err "--docker-timeout requires a value"; exit 2; }
         DOCKER_TIMEOUT="$2"; shift 2 ;;
@@ -508,10 +522,12 @@ configure_power() {
     err "Could not read supported host power settings."
     return 1
   fi
-  for key in autorestart sleep disksleep powernap; do
+  for key in autorestart sleep disksleep powernap womp tcpkeepalive; do
     if printf '%s\n' "${capabilities}" | grep -Eq "^[[:space:]]*${key}[[:space:]]*$"; then
-      desired=0
-      [[ "${key}" != autorestart ]] || desired=1
+      case "${key}" in
+        autorestart|womp|tcpkeepalive) desired=1 ;;
+        *) desired=0 ;;
+      esac
       power_args+=("${key}" "${desired}")
     else
       step "Skipping ${key}: not supported by this Mac"
@@ -569,6 +585,73 @@ configure_filevault() {
     return 1
   fi
   step "FileVault decryption started; it continues in the background"
+}
+
+# Remote Login lets the fleet be administered over SSH, including at the login
+# window after an unattended restart. systemsetup requires Full Disk Access
+# for the invoking terminal; failing that is reported, never fatal.
+configure_remote_access() {
+  if [[ "${CONFIGURE_REMOTE_LOGIN}" -eq 0 ]]; then
+    step "Keeping Remote Login settings (--skip-remote-login)"
+    return 0
+  fi
+  command -v systemsetup >/dev/null 2>&1 || return 0
+  local state=""
+  state="$(sudo systemsetup -getremotelogin 2>/dev/null)" || state=""
+  if [[ "${state}" == *": On"* ]]; then
+    step "Remote Login (SSH) is on"
+    return 0
+  fi
+  sudo systemsetup -setremotelogin on >/dev/null 2>&1 || true
+  state="$(sudo systemsetup -getremotelogin 2>/dev/null)" || state=""
+  if [[ "${state}" == *": On"* ]]; then
+    step "Enabled Remote Login (SSH) for remote administration"
+    return 0
+  fi
+  warn "Could not enable Remote Login (SSH). macOS requires Full Disk Access for"
+  warn "the terminal running setup: System Settings > Privacy & Security >"
+  warn "Full Disk Access. Or enable it in System Settings > General > Sharing."
+  return 0
+}
+
+# The Tailscale menu-bar app only connects after GUI login, so a rebooted Mini
+# disappears from the tailnet until someone types a password. tailscaled as a
+# root system service keeps the Mac reachable at the login window. Failures
+# here cost remote access, not CI, so they warn instead of stopping setup.
+configure_tailscale() {
+  if [[ "${CONFIGURE_TAILSCALE}" -eq 0 ]]; then
+    step "Keeping Tailscale settings (--skip-tailscale)"
+    return 0
+  fi
+  local brew_bin
+  brew_bin="$(command -v brew)" || { warn "Homebrew not found; skipping Tailscale."; return 0; }
+  if ! command -v tailscale >/dev/null 2>&1; then
+    log "Installing Tailscale (CLI + tailscaled) for boot-time remote access"
+    as_user "${brew_bin}" install tailscale \
+      || { warn "Tailscale install failed; continuing without it."; return 0; }
+  fi
+  if command -v pgrep >/dev/null 2>&1 && pgrep -qx Tailscale 2>/dev/null; then
+    warn "The Tailscale menu-bar app is running. It only connects after GUI login"
+    warn "and conflicts with the boot service. Quit it and remove its Login Item."
+  fi
+  if sudo launchctl print system/homebrew.mxcl.tailscale >/dev/null 2>&1; then
+    step "Tailscale system service is already loaded"
+  else
+    log "Starting tailscaled as a system service (reachable at the login window)"
+    sudo "${brew_bin}" services start tailscale \
+      || { warn "Could not start the Tailscale system service."; return 0; }
+  fi
+  if tailscale status >/dev/null 2>&1; then
+    step "Tailscale is connected"
+    return 0
+  fi
+  if [[ -t 0 ]]; then
+    log "Authenticating Tailscale (follow the login URL it prints)"
+    sudo tailscale up || warn "Tailscale login failed; run 'sudo tailscale up' once."
+  else
+    warn "Tailscale is installed but not logged in; run 'sudo tailscale up' once."
+  fi
+  return 0
 }
 
 # An installer receipt can outlive Rosetta across macOS upgrades, so check that
@@ -902,11 +985,38 @@ PYINHERIT
     COLIMA_CONFIG_HOME="$(printf '%s' "${settings}" | jq -r .COLIMA_HOME)"
     COLIMA_DOCKER_CONFIG="$(printf '%s' "${settings}" | jq -r .DOCKER_CONFIG)"
     DOCKER_TIMEOUT="$(printf '%s' "${settings}" | jq -r .RUNNER_DOCKER_TIMEOUT)"
+    # Reconcile the daemon command: older installs launched colima directly,
+    # which can keep a Rosetta-less VM after an early-boot race. boot-colima
+    # waits for host Rosetta and verifies the VM on every daemon start.
+    staged="${WORK_TMPDIR}/${label}.plist"
+    python3 - "${plist}" "${staged}" "${DOCKER_HELPER}" <<'PYMIGRATE'
+import plistlib, sys
+source, target, helper = sys.argv[1:]
+with open(source, "rb") as f:
+    config = plistlib.load(f)
+config["ProgramArguments"] = [helper, "boot-colima"]
+config.pop("Program", None)
+with open(target, "wb") as f:
+    plistlib.dump(config, f)
+PYMIGRATE
+    [[ $? -eq 0 ]] || return 1
+    plutil -lint "${staged}" >/dev/null || return 1
+    local colima_restarted=0
+    if ! cmp -s "${staged}" "${plist}"; then
+      refuse_active_jobs "updating the Colima boot service" || return 1
+      step "Moving the Colima boot service onto the boot-colima supervisor"
+      bootout_system "${label}" || return 1
+      { sudo cp "${staged}" "${plist}" && sudo chown root:wheel "${plist}" \
+        && sudo chmod 644 "${plist}"; } || return 1
+      colima_restarted=1
+    fi
     sudo launchctl enable "system/${label}" || return 1
     if ! sudo launchctl print "system/${label}" >/dev/null 2>&1; then
       sudo launchctl bootstrap system "${plist}" || return 1
+      colima_restarted=1
     fi
-    restart_colima_without_rosetta
+    # A VM the supervisor just (re)started verifies Rosetta itself.
+    [[ "${colima_restarted}" -eq 1 ]] || restart_colima_without_rosetta
     return
   fi
   # Do not transition service ownership while any local CI worker is active.
@@ -935,14 +1045,14 @@ PYCHECK
   colima_bin="$(command -v colima)" || return 1
   staged="${WORK_TMPDIR}/${label}.plist"
   as_user mkdir -p "${REAL_HOME}/Library/Logs/runner-colima" || return 1
-  python3 - "${staged}" "${REAL_USER}" "${REAL_HOME}" "${colima_bin}"       "${COLIMA_CONFIG_HOME}" "${COLIMA_DOCKER_CONFIG}" "${DOCKER_TIMEOUT}" <<'PYDAEMON'
+  python3 - "${staged}" "${REAL_USER}" "${REAL_HOME}" "${DOCKER_HELPER}"       "${COLIMA_CONFIG_HOME}" "${COLIMA_DOCKER_CONFIG}" "${DOCKER_TIMEOUT}" <<'PYDAEMON'
 import pathlib, plistlib, sys
-path, user, home, binary, colima_home, docker_config, timeout = sys.argv[1:]
+path, user, home, helper, colima_home, docker_config, timeout = sys.argv[1:]
 logs = str(pathlib.Path(home) / "Library/Logs/runner-colima")
 with open(path, "wb") as f:
     plistlib.dump({
         "Label": "com.github.runner-colima", "UserName": user,
-        "ProgramArguments": [binary, "start", "default", "--foreground"],
+        "ProgramArguments": [helper, "boot-colima"],
         "WorkingDirectory": home,
         "EnvironmentVariables": {
             "HOME": home, "USER": user, "LOGNAME": user,
@@ -1466,6 +1576,8 @@ main() {
   ensure_sudo
   configure_power || return 1
   configure_filevault || return 1
+  configure_remote_access
+  configure_tailscale
   ensure_host_rosetta || return 1
   local staging_root="${TMPDIR:-/tmp}"
   [[ "${EUID}" -ne 0 ]] || staging_root=/tmp

@@ -94,6 +94,7 @@ USAGE:
   ${PROG_NAME} setup-remote --host ssh://user@linux-builder [options]
   ${PROG_NAME} setup-colima [options]
   ${PROG_NAME} wait-colima [--timeout SECONDS] -- COMMAND [ARG ...]
+  ${PROG_NAME} boot-colima
   ${PROG_NAME} use-desktop
   ${PROG_NAME} status [--json]
   ${PROG_NAME} gc status [--builder NAME] [--verbose]
@@ -112,6 +113,9 @@ COMMANDS:
                    Homebrew, start a lightweight Lima VM, and wire buildx to it
                    (builder name: ${COLIMA_BUILDER_NAME}, docker-container driver).
   wait-colima      Wait for the default Colima Docker daemon, then exec COMMAND.
+  boot-colima      launchd entrypoint: wait for host Rosetta, run `colima start
+                   --foreground`, and restart the VM when it started without
+                   Rosetta although the host has it.
                    Used by runner-setup --colima at boot; default timeout 300s.
                    On Apple Silicon it also removes QEMU x86 emulation from the
                    VM and requires Rosetta (RUNNER_ALLOW_QEMU=1 opts out).
@@ -1383,12 +1387,155 @@ PYGATE
 }
 
 # ----------------------------------------------------------------------------
+# boot-colima — launchd entrypoint supervising `colima start --foreground`.
+#
+# Right after power-on, macOS can report Rosetta as unavailable for a short
+# window even though it is installed; a VM created in that window silently
+# runs without Rosetta and every runner readiness gate stays closed until the
+# VM restarts (observed on a Mac mini: colima logged "Rosetta2 is not
+# installed" 30 seconds after boot while `arch -x86_64` succeeded minutes
+# later). So: wait for host Rosetta before starting the VM, verify Rosetta
+# inside the VM afterwards, and exit nonzero when it is missing so launchd
+# restarts the daemon and the fresh start picks Rosetta up. A persisted
+# counter caps those restarts, so a host that can never activate Rosetta
+# still ends up with a running (but runner-gated) VM.
+# ----------------------------------------------------------------------------
+boot_colima() {
+  [[ $# -eq 0 ]] || { err "USAGE: ${PROG_NAME} boot-colima"; return 2; }
+  command -v python3 >/dev/null || { err "python3 is required for boot-colima"; return 1; }
+  command -v colima  >/dev/null || { err "colima not found on PATH"; return 1; }
+  exec python3 - <<'PYBOOT'
+import os
+import pathlib
+import signal
+import subprocess
+import sys
+import time
+
+env = dict(os.environ)
+wanted = os.uname().machine == "arm64" and env.get("RUNNER_ALLOW_QEMU") != "1"
+host_wait = int(env.get("RUNNER_BOOT_ROSETTA_WAIT", "180"))
+verify_wait = int(env.get("RUNNER_BOOT_VERIFY_WAIT", "300"))
+recheck = float(env.get("RUNNER_BOOT_RECHECK", "10"))
+marker = pathlib.Path(env.get("HOME", os.path.expanduser("~"))) \
+    / "Library/Logs/runner-colima/rosetta-restarts"
+
+def log(message):
+    print(message, file=sys.stderr, flush=True)
+
+def host_rosetta():
+    """True when x86_64 code actually runs, not merely when a receipt exists."""
+    try:
+        return subprocess.run(["arch", "-x86_64", "/usr/bin/true"], env=env,
+                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=15).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+host_ready = False
+if wanted:
+    log(f"Waiting up to {host_wait}s for host Rosetta before starting the Colima VM...")
+    deadline = time.monotonic() + host_wait
+    while True:
+        if host_rosetta():
+            host_ready = True
+            break
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(min(3, max(0.1, deadline - time.monotonic())))
+    if not host_ready:
+        log("Host Rosetta is not available; starting the VM anyway. "
+            "Runner readiness gates stay closed until Rosetta is active.")
+
+child = subprocess.Popen(
+    ["colima", "start", env.get("COLIMA_PROFILE", "default"), "--foreground"], env=env)
+
+def forward(signum, frame):
+    try:
+        child.send_signal(signum)   # colima stops the VM gracefully on TERM
+    except ProcessLookupError:
+        pass
+
+signal.signal(signal.SIGTERM, forward)
+signal.signal(signal.SIGINT, forward)
+
+PROBE = ('r=/proc/sys/fs/binfmt_misc/rosetta; '
+         'if [ -e "$r" ] && [ "$(head -n 1 "$r")" = enabled ]; '
+         'then echo enabled; else echo missing; fi')
+
+def vm_rosetta():
+    """None while the VM is unreachable; True/False once it answers."""
+    try:
+        result = subprocess.run(["colima", "ssh", "--", "sh", "-c", PROBE], env=env,
+                                stdin=subprocess.DEVNULL, capture_output=True,
+                                text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    lines = result.stdout.strip().splitlines()
+    verdict = lines[-1] if lines else ""
+    if verdict == "enabled":
+        return True
+    if verdict == "missing":
+        return False
+    return None
+
+if wanted and host_ready:
+    misses = 0
+    deadline = time.monotonic() + verify_wait
+    while time.monotonic() < deadline and child.poll() is None:
+        state = vm_rosetta()
+        if state is True:
+            log("Colima VM is running with Rosetta.")
+            try:
+                marker.unlink()
+            except OSError:
+                pass
+            break
+        # Two consecutive 'missing' readings: binfmt registration can lag the
+        # first successful ssh by a moment on a genuinely healthy boot.
+        misses = misses + 1 if state is False else 0
+        if misses >= 2:
+            break
+        time.sleep(recheck if state is False else 5)
+    if misses >= 2:
+        restarts = 0
+        try:
+            restarts = int(marker.read_text())
+        except (OSError, ValueError):
+            pass
+        if restarts < 3:
+            try:
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text(str(restarts + 1))
+            except OSError:
+                pass
+            log("Colima VM started without Rosetta although the host has it; "
+                f"restarting the VM (attempt {restarts + 1} of 3).")
+            child.terminate()
+            child.wait()
+            sys.exit(1)   # launchd restarts the daemon; the fresh start re-detects Rosetta
+        log("Colima VM still lacks Rosetta after 3 restarts; leaving it running. "
+            "Runner readiness gates stay closed.")
+
+rc = child.wait()
+sys.exit(rc if rc >= 0 else 128 - rc)
+PYBOOT
+}
+
+# ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
 main() {
   if [[ "${1:-}" == wait-colima ]]; then
     shift
     wait_colima "$@"
+    return $?
+  fi
+  if [[ "${1:-}" == boot-colima ]]; then
+    shift
+    boot_colima "$@"
     return $?
   fi
   parse_args "$@"

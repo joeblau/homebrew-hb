@@ -89,6 +89,17 @@ class PowerTests(unittest.TestCase):
         self.assertEqual(state['profiles']['AC Power']['womp'], 1)
         self.assertEqual(len([call for call in self.calls() if call[0] == 'sudo']), 1)
 
+    def test_wake_and_keepalive_are_enabled_where_supported(self):
+        self.state['capabilities'] += ['womp', 'tcpkeepalive']
+        for profile in self.state['profiles'].values():
+            profile.update({'womp': 0, 'tcpkeepalive': 0})
+        result = self.shell()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = json.loads((self.root/'state.json').read_text())
+        for profile in state['profiles'].values():
+            self.assertEqual(profile['womp'], 1)
+            self.assertEqual(profile['tcpkeepalive'], 1)
+
     def test_unsupported_settings_are_skipped(self):
         self.state['capabilities'] = ['sleep', 'disksleep']
         result = self.shell()

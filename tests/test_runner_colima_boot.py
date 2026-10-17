@@ -374,7 +374,9 @@ prepare_colima_boot || exit 92
         bootstrap=calls.index(f'launchctl bootstrap system {plist}')
         self.assertLess(calls.index(f'chown root:wheel {plist}'),bootstrap)
         self.assertLess(calls.index(f'chmod 644 {plist}'),bootstrap)
-        self.assertEqual(config['ProgramArguments'],[str(colima),'start','default','--foreground'])
+        args = config['ProgramArguments']
+        self.assertEqual(Path(args[0]).name, 'runner-docker-builder')
+        self.assertEqual(args[1:], ['boot-colima'])
         self.assertTrue(config['RunAtLoad']);self.assertTrue(config['KeepAlive'])
         self.assertEqual(config['EnvironmentVariables']['HOME'],str(self.root/'home'))
         self.assertEqual((self.root/'colima-setup').read_text(),'setup\n')
@@ -453,6 +455,7 @@ detect_platform() { :; }; require_cmds() { :; }; detect_user() { :; }
 detect_arch() { :; }; detect_host() { :; }; ensure_sudo() { :; }
 configure_power() { :; }  # host power configuration is isolated in test_runner_power
 configure_filevault() { :; }; ensure_host_rosetta() { :; }; self_upgrade() { :; }
+configure_remote_access() { :; }; configure_tailscale() { :; }
 start_runners() { echo "started $RUNNERS"; }
 prepare_runner_archive() { :; }; prepare_root_dir() { :; }
 prepare_colima_boot() {
@@ -485,6 +488,203 @@ main --org acme --colima --runners 2
         self.assertNotEqual(result.returncode,0)
         self.assertIn('Active runner job',result.stderr)
         self.assertFalse((self.plists/'com.github.runner-colima.plist').exists())
+
+
+class BootDaemonMigrationTests(unittest.TestCase):
+    setUp = setup_fixture.SetupToolCacheTests.setUp
+    HARNESS = setup_fixture.SetupToolCacheTests.HARNESS
+    shell = setup_fixture.SetupToolCacheTests.shell
+
+    def write_daemon(self, args):
+        config = {'Label': 'com.github.runner-colima', 'UserName': 'fixture',
+                  'RunAtLoad': True, 'KeepAlive': True, 'SessionCreate': True,
+                  'WorkingDirectory': str(self.root/'home'),
+                  'EnvironmentVariables': {'HOME': str(self.root/'home'), 'OPERATOR': 'keep',
+                                           'COLIMA_HOME': str(self.root/'colima-home'),
+                                           'DOCKER_CONFIG': str(self.root/'docker-config'),
+                                           'RUNNER_DOCKER_TIMEOUT': '120'},
+                  'ProgramArguments': args}
+        path = self.plists/'com.github.runner-colima.plist'
+        path.write_bytes(plistlib.dumps(config))
+        return path
+
+    BODY = """
+COLIMA=1; COLIMA_INHERITED=1
+ps() { cat "$TEST_ROOT/ps" 2>/dev/null || echo /sbin/launchd; }
+restart_colima_without_rosetta() { echo probed >> "$TEST_ROOT/rosetta-probes"; }
+prepare_colima_boot
+"""
+
+    def test_direct_colima_daemon_is_migrated_to_the_boot_supervisor(self):
+        path = self.write_daemon(['/opt/homebrew/bin/colima', 'start', 'default', '--foreground'])
+        (self.root/'loaded-com.github.runner-colima').touch()
+        result = self.shell(self.BODY)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = plistlib.loads(path.read_bytes())
+        args = config['ProgramArguments']
+        self.assertEqual(Path(args[0]).name, 'runner-docker-builder')
+        self.assertEqual(args[1:], ['boot-colima'])
+        self.assertEqual(config['EnvironmentVariables']['OPERATOR'], 'keep')
+        calls = (self.root/'sudo-calls').read_text().splitlines()
+        self.assertIn('launchctl bootout system/com.github.runner-colima', calls)
+        self.assertTrue((self.root/'loaded-com.github.runner-colima').exists())
+        # The freshly restarted supervisor verifies Rosetta itself.
+        self.assertFalse((self.root/'rosetta-probes').exists())
+
+    def test_supervisor_daemon_migration_is_idempotent(self):
+        self.write_daemon(['/opt/homebrew/bin/colima', 'start', 'default', '--foreground'])
+        (self.root/'loaded-com.github.runner-colima').touch()
+        first = self.shell(self.BODY)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        (self.root/'sudo-calls').unlink()
+        second = self.shell(self.BODY)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        calls = (self.root/'sudo-calls').read_text().splitlines()
+        self.assertNotIn('launchctl bootout system/com.github.runner-colima', calls)
+        self.assertEqual((self.root/'rosetta-probes').read_text(), 'probed\n')
+
+    def test_active_job_blocks_daemon_migration(self):
+        path = self.write_daemon(['/opt/homebrew/bin/colima', 'start', 'default', '--foreground'])
+        before = path.read_bytes()
+        (self.root/'loaded-com.github.runner-colima').touch()
+        (self.root/'ps').write_text('/opt/github-runners/runner-1/bin/Runner.Worker\n')
+        result = self.shell(self.BODY)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Active runner job', result.stderr)
+        self.assertEqual(path.read_bytes(), before)
+
+
+class BootSupervisorTests(unittest.TestCase):
+    """Drive `runner-docker-builder boot-colima` against a fake colima and arch."""
+
+    COLIMA = """
+import json, os, pathlib, signal, sys, time
+root = pathlib.Path(os.environ['TEST_ROOT'])
+args = sys.argv[1:]
+with (root/'colima-calls.jsonl').open('a') as handle:
+    handle.write(json.dumps(args) + chr(10))
+if args and args[0] == 'start':
+    running = root/'vm-running'
+    running.write_text(str(os.getpid()))
+    def stop(signum, frame):
+        running.unlink()
+        (root/'vm-stopped').write_text('stopped')
+        sys.exit(143)
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    for _ in range(2400):
+        time.sleep(0.05)
+    sys.exit(0)
+if args and args[0] == 'ssh':
+    if not (root/'vm-running').exists():
+        sys.exit(1)
+    state = root/'vm-rosetta'
+    print(state.read_text().strip() if state.exists() else 'missing')
+sys.exit(0)
+"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name).resolve()
+        bin_dir = self.root/'bin'
+        bin_dir.mkdir()
+        (self.root/'home').mkdir()
+        colima = bin_dir/'colima'
+        colima.write_text(f'#!{sys.executable}\n' + self.COLIMA)
+        colima.chmod(0o755)
+        arch = bin_dir/'arch'
+        arch.write_text('#!/bin/bash\n[[ -f "$TEST_ROOT/host-rosetta" ]]\n')
+        arch.chmod(0o755)
+
+    def boot(self, **env):
+        self.log = open(self.root/'boot.log', 'w')
+        self.addCleanup(self.log.close)
+        process = subprocess.Popen(
+            [str(BUILDER), 'boot-colima'],
+            env=dict(os.environ, TEST_ROOT=str(self.root), HOME=str(self.root/'home'),
+                     PATH=f'{self.root/"bin"}:{os.environ["PATH"]}',
+                     RUNNER_BOOT_ROSETTA_WAIT='1', RUNNER_BOOT_VERIFY_WAIT='6',
+                     RUNNER_BOOT_RECHECK='0.1', **env),
+            text=True, stderr=self.log)
+        self.addCleanup(self.reap, process)
+        return process
+
+    def reap(self, process):
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+
+    def wait_for(self, condition, timeout=15):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if condition():
+                return True
+            time.sleep(0.05)
+        return False
+
+    def boot_log(self):
+        return (self.root/'boot.log').read_text()
+
+    def ssh_calls(self):
+        path = self.root/'colima-calls.jsonl'
+        if not path.exists():
+            return []
+        return [call for call in map(json.loads, path.read_text().splitlines())
+                if call[:1] == ['ssh']]
+
+    def marker(self):
+        return self.root/'home/Library/Logs/runner-colima/rosetta-restarts'
+
+    def test_vm_with_rosetta_keeps_running_and_clears_the_restart_counter(self):
+        (self.root/'host-rosetta').touch()
+        (self.root/'vm-rosetta').write_text('enabled')
+        self.marker().parent.mkdir(parents=True)
+        self.marker().write_text('2')
+        process = self.boot()
+        self.assertTrue(self.wait_for(lambda: not self.marker().exists()), self.boot_log())
+        self.assertIsNone(process.poll())
+        process.terminate()
+        process.wait(timeout=15)
+        self.assertTrue(self.wait_for(lambda: (self.root/'vm-stopped').exists()))
+
+    def test_vm_without_rosetta_is_stopped_and_the_daemon_exits_for_a_retry(self):
+        (self.root/'host-rosetta').touch()
+        process = self.boot()
+        self.assertEqual(process.wait(timeout=30), 1, self.boot_log())
+        self.assertTrue((self.root/'vm-stopped').exists())
+        self.assertEqual(self.marker().read_text(), '1')
+        self.assertIn('restarting the VM (attempt 1 of 3)', self.boot_log())
+
+    def test_restart_cap_leaves_the_vm_running_after_three_attempts(self):
+        (self.root/'host-rosetta').touch()
+        self.marker().parent.mkdir(parents=True)
+        self.marker().write_text('3')
+        process = self.boot()
+        self.assertTrue(self.wait_for(
+            lambda: 'still lacks Rosetta after 3 restarts' in self.boot_log()))
+        self.assertIsNone(process.poll())
+        self.assertTrue((self.root/'vm-running').exists())
+        process.terminate()
+        process.wait(timeout=15)
+
+    def test_qemu_opt_out_starts_the_vm_without_any_rosetta_checks(self):
+        process = self.boot(RUNNER_ALLOW_QEMU='1')
+        self.assertTrue(self.wait_for(lambda: (self.root/'vm-running').exists()))
+        time.sleep(0.5)
+        self.assertIsNone(process.poll())
+        self.assertEqual(self.ssh_calls(), [])
+        process.terminate()
+        process.wait(timeout=15)
+
+    def test_missing_host_rosetta_still_starts_the_gated_vm_after_the_wait(self):
+        process = self.boot()
+        self.assertTrue(self.wait_for(lambda: (self.root/'vm-running').exists()))
+        self.assertIn('Host Rosetta is not available', self.boot_log())
+        self.assertIsNone(process.poll())
+        self.assertEqual(self.ssh_calls(), [])
+        process.terminate()
+        process.wait(timeout=15)
 
 
 if __name__ == '__main__':

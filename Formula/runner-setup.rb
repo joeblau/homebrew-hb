@@ -69,6 +69,12 @@ class RunnerSetup < Formula
       password screen; use --keep-filevault to keep it. It upgrades itself
       through Homebrew first (--skip-self-upgrade to skip), resumes runners
       left in maintenance, and finishes only when every runner is listening.
+      It also enables Remote Login (needs Full Disk Access for the terminal)
+      and runs tailscaled as a system service so the Mac stays reachable at
+      the login window (--skip-remote-login / --skip-tailscale opt out). The
+      Colima boot daemon supervises the VM and restarts it if macOS raced it
+      past Rosetta at boot. Bootstrap a fresh Mac with the tap's Brewfile:
+        brew bundle --file="$(brew --repository joeblau/hb)/Brewfile"
 
       Services run as system LaunchDaemons with a non-root service user.
       Runners restart after any exit, including a clean exit. Setup reruns
