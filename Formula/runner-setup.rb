@@ -4,8 +4,8 @@
 class RunnerSetup < Formula
   desc "Provision and tear down GitHub Actions self-hosted runners on macOS"
   homepage "https://github.com/joeblau/homebrew-hb"
-  url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/v1.13.1.tar.gz"
-  sha256 "1941c914a2730b76b36ac856bc020727d1cd2fcfe5e71a8b884266c1b3f26476"
+  url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/v1.13.2.tar.gz"
+  sha256 "bec387157ec2a4048f6b6ad17c6ba872d06d9678beedaac226306f4670d374b7"
   license "MIT"
 
   depends_on "docker"
@@ -59,6 +59,18 @@ class RunnerSetup < Formula
 
       Runners register as <machine-name>-runner-N by default, so several Macs
       can join one scope without name clashes. Override with --name-prefix.
+
+      Setup configures persistent host power settings where supported:
+        autorestart 1, sleep 0, disksleep 0, powernap 0
+      Use --skip-power-config to keep existing or MDM-managed settings.
+      Verify with: pmset -g custom
+
+      Services run as system LaunchDaemons with a non-root service user.
+      A loaded service is not proof that a runner is ready. Verify startup:
+        runner-health --once --dry-run
+      Test a canary reboot before GUI or SSH login; confirm runners are online
+      in GitHub. Boot verification guide:
+        https://github.com/joeblau/homebrew-hb/blob/main/docs/boot-startup.md
 
       Enable Colima at boot and wait for Docker before accepting jobs:
         runner-setup --org ORG_NAME --runners N --colima
