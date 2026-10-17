@@ -193,6 +193,62 @@ class HostBootTests(unittest.TestCase):
         self.assertEqual(self.lines('brew-calls'), [])
         self.assertEqual(self.lines('tailscale-calls'), [])
 
+    # configure_tailscale_guard resolves the guard next to runner-setup via
+    # BASH_SOURCE, which in these sourced-definition tests is the bash binary's
+    # directory; give it an explicit PATH hit instead.
+    GUARD_ENV = ('plists_dir="$LAUNCH_DAEMON_DIR"; mkdir -p "$plists_dir"\n'
+                 'export RUNNER_TS_GUARD_LOGS="$TEST_ROOT/guard-logs"\n')
+
+    def guard_plist(self):
+        import plistlib
+        path = self.root / 'plists/com.github.runner-tailscale-guard.plist'
+        self.assertTrue(path.exists())
+        with open(path, 'rb') as f:
+            return plistlib.load(f)
+
+    def test_tailscale_guard_daemon_is_installed_and_loaded(self):
+        guard = self.root / 'bin/runner-tailscale-guard'
+        guard.write_text('#!/bin/bash\n')
+        guard.chmod(0o755)
+        result = self.shell(self.GUARD_ENV + 'configure_tailscale_guard')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Tailscale panic guard installed', result.stderr)
+        config = self.guard_plist()
+        self.assertEqual(config['ProgramArguments'], [str(guard), 'check'])
+        self.assertTrue(config['RunAtLoad'])
+        self.assertEqual(config['StartInterval'], 1800)
+        self.assertNotIn('UserName', config)  # reboots need root
+        self.assertTrue((self.root / 'loaded-com.github.runner-tailscale-guard').exists())
+
+    def test_tailscale_guard_rerun_leaves_a_loaded_daemon_alone(self):
+        guard = self.root / 'bin/runner-tailscale-guard'
+        guard.write_text('#!/bin/bash\n')
+        guard.chmod(0o755)
+        first = self.shell(self.GUARD_ENV + 'configure_tailscale_guard')
+        self.assertEqual(first.returncode, 0, first.stderr)
+        plist = self.root / 'plists/com.github.runner-tailscale-guard.plist'
+        before = plist.read_bytes()
+        (self.root / 'sudo-calls').unlink()
+        rerun = self.shell(self.GUARD_ENV + 'configure_tailscale_guard')
+        self.assertEqual(rerun.returncode, 0, rerun.stderr)
+        self.assertEqual(plist.read_bytes(), before)
+        # An unchanged plist must not bounce the daemon.
+        self.assertNotIn('bootout system/com.github.runner-tailscale-guard',
+                         '\n'.join(self.lines('sudo-calls')))
+
+    def test_skip_tailscale_skips_the_guard_too(self):
+        result = self.shell(self.GUARD_ENV
+                            + 'parse_args --org acme --token x --skip-tailscale; configure_tailscale_guard')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.root / 'plists/com.github.runner-tailscale-guard.plist').exists())
+
+    def test_missing_guard_binary_warns_and_continues(self):
+        result = self.shell(self.GUARD_ENV
+                            + 'PATH="/usr/bin:/bin:/usr/sbin"; configure_tailscale_guard; echo continued')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('skipping the panic guard', result.stderr)
+        self.assertIn('continued', result.stdout)
+
     def test_setup_finishes_by_starting_and_verifying_every_runner(self):
         result = self.shell('UPGRADE_BIN="$TEST_ROOT/bin/upgrade"; RUNNERS=2; DOCKER_TIMEOUT=120; start_runners')
         self.assertEqual(result.returncode, 0, result.stderr)

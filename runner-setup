@@ -616,9 +616,12 @@ configure_remote_access() {
 }
 
 # The Tailscale menu-bar app only connects after GUI login, so a rebooted Mini
-# disappears from the tailnet until someone types a password. tailscaled as a
-# root system service keeps the Mac reachable at the login window. Failures
-# here cost remote access, not CI, so they warn instead of stopping setup.
+# disappears from the tailnet until someone types a password — and current
+# releases don't even persist their "Launch Tailscale at Login" setting across
+# restarts (tailscale/tailscale#18042), so logging in doesn't reliably bring it
+# back either. tailscaled as a root system service keeps the Mac reachable at
+# the login window and depends on neither. Failures here cost remote access,
+# not CI, so they warn instead of stopping setup.
 configure_tailscale() {
   if [[ "${CONFIGURE_TAILSCALE}" -eq 0 ]]; then
     step "Keeping Tailscale settings (--skip-tailscale)"
@@ -679,6 +682,61 @@ configure_tailscale() {
     warn "Tailscale boot service is not logged in; run: sudo tailscale --socket=${ts_socket} up"
   fi
   return 0
+}
+
+# macOS leaks a kernel ifnet reference per UDP packet tailscaled sends; the
+# 32-bit refcount wraps at 2^32 and the kernel PANICS, taking every runner
+# down mid-job (tailscale/tailscale#18953 — confirmed on Apple Silicon minis
+# with the Homebrew tailscaled this fleet runs). Restarting tailscaled does
+# not reset the kernel count; only a reboot does. Install runner-tailscale-guard
+# as a root LaunchDaemon that tracks the daemon's send counters and reboots the
+# host — idle-first — long before the wrap. Like configure_tailscale, failures
+# here warn instead of stopping setup.
+configure_tailscale_guard() {
+  if [[ "${CONFIGURE_TAILSCALE}" -eq 0 ]]; then
+    step "Keeping Tailscale guard settings (--skip-tailscale)"
+    return 0
+  fi
+  local self_dir guard_bin label="com.github.runner-tailscale-guard" plist staged
+  self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  guard_bin="${self_dir}/runner-tailscale-guard"
+  [[ -x "${guard_bin}" ]] || guard_bin="$(command -v runner-tailscale-guard)" \
+    || { warn "runner-tailscale-guard not found; skipping the panic guard."; return 0; }
+  local log_dir="${RUNNER_TS_GUARD_LOGS:-/Library/Logs/runner-tailscale-guard}"
+  plist="${LAUNCH_DAEMON_DIR}/${label}.plist"
+  staged="$(mktemp "${TMPDIR:-/tmp}/${label}.XXXXXX")" || return 0
+  sudo mkdir -p "${log_dir}" 2>/dev/null || true
+  python3 - "${staged}" "${guard_bin}" "${log_dir}" <<'PYGUARD'
+import plistlib, sys
+path, guard, logs = sys.argv[1:]
+with open(path, "wb") as f:
+    plistlib.dump({
+        "Label": "com.github.runner-tailscale-guard",
+        "ProgramArguments": [guard, "check"],
+        "EnvironmentVariables": {
+            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        },
+        "RunAtLoad": True, "StartInterval": 1800,
+        "StandardOutPath": logs + "/stdout.log",
+        "StandardErrorPath": logs + "/stderr.log",
+    }, f)
+PYGUARD
+  [[ $? -eq 0 ]] || { rm -f "${staged}"; warn "Could not stage the Tailscale guard plist."; return 0; }
+  plutil -lint "${staged}" >/dev/null \
+    || { rm -f "${staged}"; warn "Staged Tailscale guard plist failed lint."; return 0; }
+  if ! cmp -s "${staged}" "${plist}"; then
+    bootout_system "${label}" || true
+    { sudo cp "${staged}" "${plist}" && sudo chown root:wheel "${plist}" \
+      && sudo chmod 644 "${plist}"; } \
+      || { rm -f "${staged}"; warn "Could not install the Tailscale guard plist."; return 0; }
+  fi
+  rm -f "${staged}"
+  sudo launchctl enable "system/${label}" 2>/dev/null || true
+  if ! sudo launchctl print "system/${label}" >/dev/null 2>&1; then
+    sudo launchctl bootstrap system "${plist}" \
+      || { warn "Could not start the Tailscale guard daemon."; return 0; }
+  fi
+  step "Tailscale panic guard installed (reboots before tailscale/tailscale#18953 wraps)"
 }
 
 # An installer receipt can outlive Rosetta across macOS upgrades, so check that
@@ -1605,6 +1663,7 @@ main() {
   configure_filevault || return 1
   configure_remote_access
   configure_tailscale
+  configure_tailscale_guard
   ensure_host_rosetta || return 1
   local staging_root="${TMPDIR:-/tmp}"
   [[ "${EUID}" -ne 0 ]] || staging_root=/tmp

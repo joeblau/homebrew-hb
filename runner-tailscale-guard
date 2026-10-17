@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+#
+# runner-tailscale-guard — reboot the host before tailscaled panics the kernel
+#
+# Usage:
+#   runner-tailscale-guard check [--dry-run]    # one pass (launchd entrypoint)
+#   runner-tailscale-guard status [--json]      # report the estimate; no action
+#
+# macOS leaks one kernel ifnet reference for roughly every UDP packet
+# tailscaled sends through its utun interface. The 32-bit refcount wraps at
+# 2^32 and the kernel panics (`dlil_if_ref: wraparound refcnt`), taking every
+# runner on the host down mid-job. Confirmed on Apple Silicon Mac minis with
+# the Homebrew tailscaled this fleet runs for boot-time access, across macOS
+# 26/27 and current Tailscale releases: tailscale/tailscale#18953.
+#
+# Restarting tailscaled does NOT help — the leaked references stay on the utun
+# ifnet until the machine reboots. So this guard estimates the leak from
+# tailscaled's own `magicsock_send_udp*` counters and reboots the host while
+# that is still a clean, scheduled event instead of a panic:
+#
+#   - The daemon counters reset when tailscaled restarts, but the kernel
+#     refcount does not, so the estimate is accumulated across daemon restarts
+#     in a state file keyed by the kernel boot session UUID. A new boot UUID
+#     resets the estimate; a counter that went backwards means the daemon
+#     restarted and the previous value is folded into the base.
+#   - Past --soft-limit (default 2.0e9, half the wrap), reboot as soon as no
+#     runner is mid-job (no Runner.Worker process).
+#   - Past --hard-limit (default 3.8e9), reboot even mid-job: a lost job beats
+#     a kernel panic, which loses the job anyway and corrupts nothing-flushed
+#     state with it.
+#
+# The estimate is deliberately conservative: it only ever overcounts restarts
+# (folding in a base twice is impossible, but metrics missed between passes
+# undercount, which the soft limit's 2x margin absorbs).
+#
+# Queries are pinned to the BOOT daemon's socket (/var/run/tailscaled.socket),
+# like runner-setup, so a logged-in menu-bar app can never answer for it.
+# `check` needs root to reboot (it is installed as a root LaunchDaemon by
+# runner-setup); `status` works for anyone who can read the socket.
+
+set -euo pipefail
+
+# ----------------------------------------------------------------------------
+# Constants / globals
+# ----------------------------------------------------------------------------
+PROG_NAME="$(basename "$0")"
+TS_SOCKET="${RUNNER_TS_GUARD_SOCKET:-/var/run/tailscaled.socket}"
+STATE_DIR="${RUNNER_TS_GUARD_DIR:-/var/db/runner-tailscale-guard}"
+STATE_FILE="${STATE_DIR}/state"
+
+SOFT_LIMIT=2000000000   # reboot when idle
+HARD_LIMIT=3800000000   # reboot even mid-job; the wrap is at 4294967296
+DRY_RUN=0
+JSON=0
+
+# ----------------------------------------------------------------------------
+# Output helpers — progress goes to stderr; status --json prints one JSON
+# document on stdout.
+# ----------------------------------------------------------------------------
+log()  { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
+step() { printf '\033[1;32m  ->\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[1;33mWARN:\033[0m %s\n' "$*" >&2; }
+err()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; }
+
+usage() {
+  cat >&2 <<EOF
+${PROG_NAME} — reboot the host before tailscaled's kernel refcount leak wraps
+
+USAGE:
+  ${PROG_NAME} check [--dry-run] [--soft-limit N] [--hard-limit N]
+  ${PROG_NAME} status [--json]
+
+COMMANDS:
+  check     One guard pass (the launchd entrypoint). Reads the boot daemon's
+            magicsock_send_udp* counters, accumulates them across tailscaled
+            restarts for the current kernel boot session, and reboots the
+            host once the estimate crosses a limit:
+              --soft-limit N   Reboot when no runner is mid-job (default
+                               ${SOFT_LIMIT}).
+              --hard-limit N   Reboot even mid-job (default ${HARD_LIMIT};
+                               the kernel panics at 4294967296).
+              --dry-run        Report what would happen; never reboot.
+  status    Print the current estimate and limits; never reboots.
+              --json           One JSON document on stdout.
+
+WHY: macOS leaks ~1 kernel ifnet reference per UDP packet tailscaled sends;
+at 2^32 the kernel panics (tailscale/tailscale#18953). Only a reboot resets
+the count, so the guard turns an eventual panic into a scheduled reboot.
+The fleet is provisioned to come back with runners online and tailscaled
+connected after an unattended reboot, so a guard reboot is self-healing.
+
+STATE: ${STATE_FILE} (override dir: RUNNER_TS_GUARD_DIR)
+EOF
+}
+
+# ----------------------------------------------------------------------------
+# Measurement
+# ----------------------------------------------------------------------------
+
+# Sum every magicsock_send_udp* counter from the boot daemon. Prints the sum;
+# fails if the daemon is unreachable.
+read_send_counter() {
+  local ts_bin metrics
+  ts_bin="$(command -v tailscale)" || return 1
+  # -e, not -S: the tailscale call itself validates the endpoint, and tests
+  # stand in a plain file for the socket.
+  [[ -e "${TS_SOCKET}" ]] || return 1
+  metrics="$("${ts_bin}" --socket="${TS_SOCKET}" debug metrics 2>/dev/null)" || return 1
+  awk '/^magicsock_send_udp/ { total += $2 } END { printf "%d\n", total }' <<<"${metrics}"
+}
+
+current_boot_uuid() {
+  sysctl -n kern.bootsessionuuid 2>/dev/null || echo unknown-boot
+}
+
+# Load state written by a previous pass. Sets STATE_BOOT / STATE_BASE /
+# STATE_LAST; all empty-safe defaults.
+STATE_BOOT=""
+STATE_BASE=0
+STATE_LAST=0
+load_state() {
+  [[ -f "${STATE_FILE}" ]] || return 0
+  local key value
+  while IFS='=' read -r key value; do
+    case "${key}" in
+      boot) STATE_BOOT="${value}" ;;
+      base) [[ "${value}" =~ ^[0-9]+$ ]] && STATE_BASE="${value}" ;;
+      last) [[ "${value}" =~ ^[0-9]+$ ]] && STATE_LAST="${value}" ;;
+    esac
+  done < "${STATE_FILE}"
+}
+
+save_state() {
+  local boot="$1" base="$2" last="$3" staged
+  mkdir -p "${STATE_DIR}"
+  staged="${STATE_FILE}.tmp.$$"
+  printf 'boot=%s\nbase=%s\nlast=%s\n' "${boot}" "${base}" "${last}" > "${staged}"
+  mv -f "${staged}" "${STATE_FILE}"
+}
+
+# Compute the boot-session estimate from the live counter + persisted state.
+# Sets ESTIMATE / BOOT_UUID / NEW_BASE / COUNTER; fails if the daemon is
+# unreachable.
+ESTIMATE=0
+BOOT_UUID=""
+NEW_BASE=0
+COUNTER=0
+measure() {
+  COUNTER="$(read_send_counter)" || return 1
+  BOOT_UUID="$(current_boot_uuid)"
+  load_state
+  NEW_BASE=0
+  if [[ "${STATE_BOOT}" == "${BOOT_UUID}" ]]; then
+    NEW_BASE="${STATE_BASE}"
+    # The daemon counter went backwards: tailscaled restarted since the last
+    # pass. The kernel kept the leaked references, so keep the old total.
+    if [[ "${COUNTER}" -lt "${STATE_LAST}" ]]; then
+      NEW_BASE=$(( STATE_BASE + STATE_LAST ))
+    fi
+  fi
+  ESTIMATE=$(( NEW_BASE + COUNTER ))
+}
+
+# A runner mid-job runs a Runner.Worker process; idle listeners do not.
+host_is_idle() {
+  ! pgrep -f 'Runner\.Worker' >/dev/null 2>&1
+}
+
+# ----------------------------------------------------------------------------
+# Commands
+# ----------------------------------------------------------------------------
+
+cmd_check() {
+  if ! measure; then
+    step "Tailscale boot daemon is not reachable; nothing to guard."
+    return 0
+  fi
+  save_state "${BOOT_UUID}" "${NEW_BASE}" "${COUNTER}"
+
+  if [[ "${ESTIMATE}" -lt "${SOFT_LIMIT}" ]]; then
+    step "Leak estimate ${ESTIMATE} is below the soft limit ${SOFT_LIMIT}."
+    return 0
+  fi
+
+  local why=""
+  if [[ "${ESTIMATE}" -ge "${HARD_LIMIT}" ]]; then
+    why="estimate ${ESTIMATE} crossed the hard limit ${HARD_LIMIT}"
+  elif host_is_idle; then
+    why="estimate ${ESTIMATE} crossed the soft limit ${SOFT_LIMIT} and no job is running"
+  else
+    warn "Leak estimate ${ESTIMATE} crossed the soft limit ${SOFT_LIMIT}, but a"
+    warn "job is running; deferring the reboot until the host is idle (hard"
+    warn "limit ${HARD_LIMIT})."
+    return 0
+  fi
+
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log "Would reboot: ${why} (--dry-run)"
+    return 0
+  fi
+  if [[ "$(id -u)" -ne 0 ]]; then
+    err "Reboot needed (${why}) but ${PROG_NAME} is not root."
+    err "Run: sudo shutdown -r now"
+    return 1
+  fi
+  log "Rebooting before the kernel refcount wraps: ${why}"
+  log "(tailscale/tailscale#18953; the fleet reconnects after unattended boots)"
+  shutdown -r now "runner-tailscale-guard: ${why}"
+}
+
+cmd_status() {
+  local reachable=true
+  if ! measure; then
+    reachable=false
+    ESTIMATE=0
+    COUNTER=0
+    BOOT_UUID="$(current_boot_uuid)"
+  fi
+  if [[ "${JSON}" -eq 1 ]]; then
+    printf '{"reachable":%s,"boot":"%s","counter":%s,"estimate":%s,"soft_limit":%s,"hard_limit":%s}\n' \
+      "${reachable}" "${BOOT_UUID}" "${COUNTER}" "${ESTIMATE}" "${SOFT_LIMIT}" "${HARD_LIMIT}"
+    return 0
+  fi
+  if [[ "${reachable}" == false ]]; then
+    step "Tailscale boot daemon is not reachable; nothing to guard."
+    return 0
+  fi
+  step "Boot session:   ${BOOT_UUID}"
+  step "Daemon counter: ${COUNTER}"
+  step "Leak estimate:  ${ESTIMATE} of 4294967296 (soft ${SOFT_LIMIT}, hard ${HARD_LIMIT})"
+}
+
+# ----------------------------------------------------------------------------
+# Argument parsing
+# ----------------------------------------------------------------------------
+main() {
+  [[ $# -ge 1 ]] || { usage; exit 2; }
+  local cmd="$1"; shift
+  case "${cmd}" in
+    -h|--help|help) usage; exit 0 ;;
+    check|status) ;;
+    *) err "Unknown command: ${cmd}"; usage; exit 2 ;;
+  esac
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) DRY_RUN=1; shift ;;
+      --json) JSON=1; shift ;;
+      --soft-limit) SOFT_LIMIT="${2:?--soft-limit needs a value}"; shift 2 ;;
+      --hard-limit) HARD_LIMIT="${2:?--hard-limit needs a value}"; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      *) err "Unknown argument: $1"; usage; exit 2 ;;
+    esac
+  done
+  [[ "${SOFT_LIMIT}" =~ ^[0-9]+$ && "${HARD_LIMIT}" =~ ^[0-9]+$ ]] \
+    || { err "Limits must be integers."; exit 2; }
+  [[ "${SOFT_LIMIT}" -le "${HARD_LIMIT}" ]] \
+    || { err "--soft-limit must not exceed --hard-limit."; exit 2; }
+  case "${cmd}" in
+    check) cmd_check ;;
+    status) cmd_status ;;
+  esac
+}
+
+main "$@"

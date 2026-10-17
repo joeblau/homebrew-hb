@@ -32,6 +32,7 @@ class RunnerSetup < Formula
       runner-bazel-cache
       runner-sccache
       runner-git-mirror
+      runner-tailscale-guard
       runner-mcp
       runner-agent
     ]
@@ -71,8 +72,12 @@ class RunnerSetup < Formula
       left in maintenance, and finishes only when every runner is listening.
       It also enables Remote Login (needs Full Disk Access for the terminal)
       and runs tailscaled as a system service so the Mac stays reachable at
-      the login window (--skip-remote-login / --skip-tailscale opt out). The
-      Colima boot daemon supervises the VM and restarts it if macOS raced it
+      the login window (--skip-remote-login / --skip-tailscale opt out).
+      macOS leaks a kernel reference per tailscaled UDP packet and panics
+      when the count wraps (tailscale/tailscale#18953), so setup also installs
+      runner-tailscale-guard, a root LaunchDaemon that reboots the host —
+      idle-first — before the wrap. Inspect it: runner-tailscale-guard status
+      The Colima boot daemon supervises the VM and restarts it if macOS raced it
       past Rosetta at boot. Bootstrap a fresh Mac with the tap's Brewfile:
         brew bundle --file="$(brew --repository joeblau/hb)/Brewfile"
 
@@ -136,6 +141,7 @@ class RunnerSetup < Formula
       runner-bazel-cache
       runner-sccache
       runner-git-mirror
+      runner-tailscale-guard
       runner-mcp
       runner-agent
     ].each do |tool|

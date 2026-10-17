@@ -54,7 +54,13 @@ Each run of `runner-setup` also:
   directories. `--skip-remote-login` opts out.
 - **Runs tailscaled as a system service.** The Tailscale menu-bar app only
   connects after GUI login, so a rebooted, logged-out Mini vanishes from the
-  tailnet. Setup installs the Tailscale CLI and starts its Homebrew system
+  tailnet. Worse, current app releases do not persist their "Launch Tailscale
+  at Login" setting across restarts
+  ([tailscale/tailscale#18042](https://github.com/tailscale/tailscale/issues/18042)
+  — the checkbox silently resets to disabled), so even a GUI login does not
+  reliably reconnect the Mac; the issue's own workaround is the
+  `TailscaleStartOnLogin` MDM key. The system service needs neither the app
+  nor a login. Setup installs the Tailscale CLI and starts its Homebrew system
   service, which is reachable at the login window. The menu-bar app's login
   does not carry over — it can even answer `tailscale status` for the
   logged-in user and mask a logged-out boot daemon — so setup authenticates
@@ -64,6 +70,16 @@ Each run of `runner-setup` also:
   the menu-bar app's old node in the Tailscale admin console, and quit the
   app itself — two tailscaled processes fight over the tunnel.
   `--skip-tailscale` opts out.
+- **Installs the Tailscale panic guard.** macOS leaks one kernel interface
+  reference for roughly every UDP packet tailscaled sends; the 32-bit count
+  wraps at 2^32 and the kernel panics
+  ([tailscale/tailscale#18953](https://github.com/tailscale/tailscale/issues/18953)).
+  Setup installs `runner-tailscale-guard` as a root LaunchDaemon that
+  accumulates the daemon's `magicsock_send_udp*` counters across tailscaled
+  restarts (the kernel count survives them; only a reboot resets it) and
+  cleanly reboots the host — waiting for idle runners first — long before the
+  wrap. See "The tailscaled kernel panic, and the reboot guard" below.
+  `--skip-tailscale` opts out of this too.
 - **Starts every runner and waits until it listens for jobs.** Runners left in
   maintenance by an interrupted upgrade, and runners crash-looping on a
   readiness gate, are restarted. Setup fails if any runner does not come
@@ -90,6 +106,43 @@ and exits so launchd starts a fresh, correct one. Three failed attempts
 the counter clears on the first healthy start. Setup reruns migrate older
 direct-`colima` daemons to the supervisor between jobs.
 
+## The tailscaled kernel panic, and the reboot guard
+
+Running tailscaled for boot-time access exposes the fleet to an upstream
+kernel bug,
+[tailscale/tailscale#18953](https://github.com/tailscale/tailscale/issues/18953):
+macOS's DLIL layer leaks one `ifnet` reference for roughly every UDP packet
+tailscaled sends through its utun interface. When the 32-bit refcount
+increments past 2^32 the kernel panics with
+`dlil_if_ref: wraparound refcnt`, naming `tailscaled` (or Tailscale's network
+extension) as the panicked task. It reproduces on Apple Silicon Macs across
+macOS 26/27 and current Tailscale releases, with both the Homebrew tailscaled
+and the standalone app. The leak rate tracks tailnet send volume, so time to
+panic ranges from days (screen sharing or KVM streams over the tailnet) to
+months (idle SSH access). Restarting tailscaled does **not** help: the leaked
+references stay on the interface until the machine reboots.
+
+Because this fleet is provisioned to come back from unattended reboots with
+runners online and tailscaled connected, the mitigation is to turn the
+eventual panic into a scheduled reboot. Setup installs
+`/Library/LaunchDaemons/com.github.runner-tailscale-guard.plist`, which runs
+`runner-tailscale-guard check` at boot and every 30 minutes as root. Each
+pass reads `tailscale debug metrics` from the boot daemon's socket, sums the
+`magicsock_send_udp*` counters, and accumulates them across tailscaled
+restarts in `/var/db/runner-tailscale-guard/state`, keyed by the kernel boot
+session UUID so a reboot resets the estimate. Past the soft limit
+(2.0e9, half the wrap) it reboots as soon as no `Runner.Worker` process is
+mid-job; past the hard limit (3.8e9) it reboots even mid-job, because the
+panic would kill the job anyway and take the filesystem down uncleanly with
+it. Guard logs go to `/Library/Logs/runner-tailscale-guard/`.
+
+Inspect the estimate on a Mini at any time:
+
+```sh
+runner-tailscale-guard status
+sudo runner-tailscale-guard check --dry-run
+```
+
 `autorestart=1` covers a power failure while the Mac was running. It does not
 guarantee startup after a deliberate shutdown followed by reconnecting AC power.
 That is a separate power-on policy. See [Apple's Energy settings reference](https://support.apple.com/guide/mac-help/mchlp1168/mac).
@@ -102,9 +155,11 @@ The existing service files are:
 /Library/LaunchDaemons/com.github.runner-1.plist
 /Library/LaunchDaemons/com.github.runner-2.plist
 /Library/LaunchDaemons/com.github.runner-colima.plist
+/Library/LaunchDaemons/com.github.runner-tailscale-guard.plist
 ```
 
-The Colima service is installed when `--colima` is selected. Each plist is owned
+The Colima service is installed when `--colima` is selected; the Tailscale
+guard whenever Tailscale setup is not skipped. Each plist is owned
 by `root:wheel`, has mode `644`, enables `RunAtLoad`, and is loaded into launchd's
 `system` domain. `UserName` selects the non-root runner owner. Explicit home and
 PATH settings avoid depending on an interactive shell. The Colima service
@@ -160,9 +215,9 @@ The isolated regression tests verify generated plists, permissions commands,
 service domains and startup gates. A loaded daemon alone does not prove a
 runner is ready. A real reboot with no GUI login is the acceptance check.
 
-1. Choose an idle Mini. If remote access is needed, enable **System Settings →
-   General → Sharing → Remote Login** for the service owner. Setup does not
-   enable SSH or install Tailscale.
+1. Choose an idle Mini. Setup enables Remote Login (SSH) itself when the
+   terminal has Full Disk Access; otherwise enable **System Settings →
+   General → Sharing → Remote Login** for the service owner.
 2. Run setup. Unless `--keep-filevault` was used, `fdesetup status` should
    report FileVault off or decrypting. An ordinary logged-out desktop does not
    require automatic GUI login.
