@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Clear removable Dock items for the invoking macOS user.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: clear-dock
+
+Clear pinned apps, files, folders, and recent apps from your Dock.
+Run as the user whose Dock you want to clear, without sudo.
+Finder, Trash, running apps, and minimized windows can still appear.
+The previous Dock preferences are backed up before any changes.
+EOF
+}
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  '') ;;
+  *) usage >&2; exit 2 ;;
+esac
+if [[ $# -gt 0 ]]; then
+  usage >&2
+  exit 2
+fi
+if [[ "$(uname -s)" != Darwin ]]; then
+  printf 'This script requires macOS.\n' >&2
+  exit 1
+fi
+if [[ "${EUID}" -eq 0 ]]; then
+  printf 'Run as the Dock owner, without sudo.\n' >&2
+  exit 1
+fi
+
+umask 077
+backup_root="${HOME}/Library/Application Support/clear-dock/backups"
+mkdir -p "${backup_root}"
+backup_dir="$(mktemp -d "${backup_root}/dock-$(date +%Y%m%d-%H%M%S).XXXXXX")"
+backup_file="${backup_dir}/preferences.plist"
+if ! defaults export com.apple.dock - > "${backup_file}"; then
+  rm -f "${backup_file}"
+  rmdir "${backup_dir}"
+  printf 'Could not back up Dock preferences; stopping before changing them.\n' >&2
+  exit 1
+fi
+
+for key in persistent-apps persistent-others static-apps static-others; do
+  defaults write com.apple.dock "${key}" -array
+done
+defaults write com.apple.dock show-recents -bool false
+
+# Only restart this user's Dock. When logged out, preferences apply next login.
+killall -u "$(id -un)" Dock 2>/dev/null || true
+
+printf 'Cleared removable Dock items. Finder, Trash, and running apps can remain.\n'
+printf 'Backup: %s\n' "${backup_file}"
+printf 'Restore with: defaults import com.apple.dock %q\n' "${backup_file}"
