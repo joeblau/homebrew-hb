@@ -4,8 +4,8 @@
 class RunnerSetup < Formula
   desc "Provision and tear down GitHub Actions self-hosted runners on macOS"
   homepage "https://github.com/joeblau/homebrew-hb"
-  url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/v1.13.3.tar.gz"
-  sha256 "f99d8532270be76d2964dada1eef6e6fe0d31fd4c8ca8706ec852f49e5daf14f"
+  url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/v1.14.0.tar.gz"
+  sha256 "3e4a42eb4aefad87e197e7c7be546119e8d5618623fd7f27d6dfaa631642afb2"
   license "MIT"
 
   depends_on "docker"
