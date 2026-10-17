@@ -186,6 +186,8 @@ tail -n 50 /opt/github-runners/runner-1/_diag/runner-stderr.log
 
 Check one canary Mac after a reboot before rolling out fleet-wide; fixture
 tests do not validate your VM backend or host's pre-login environment.
+Follow the [boot verification procedure](boot-startup.md) to check permissions,
+the system service domain, and readiness before a GUI login.
 FileVault's pre-boot unlock must complete before macOS services can start.
 Colima readiness is a startup gate, not a monitor that interrupts jobs if
 Docker becomes unavailable later.

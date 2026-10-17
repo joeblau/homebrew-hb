@@ -261,6 +261,7 @@ as_user() { "$@"; }
 xattr() { :; }
 plutil() { return 0; }
 sudo() {
+  printf '%s\n' "$*" >> "$TEST_ROOT/sudo-calls"
   case "$1" in
     launchctl)
       shift

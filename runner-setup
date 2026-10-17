@@ -47,6 +47,7 @@ DOCKER_HELPER=""
 COLIMA_UPGRADE_BIN=""
 COLIMA_CONFIG_HOME=""
 COLIMA_DOCKER_CONFIG=""
+CONFIGURE_POWER=1    # persistent host power settings for always-on runners
 EPHEMERAL=0           # 1 => LaunchDaemon runs runner-ephemeral, not runsvc.sh
 EPHEMERAL_BIN=""      # resolved absolute path of the runner-ephemeral supervisor
 TOOL_CACHE_DIR=""     # --tool-cache-dir override; default is per-runner DIR/_toolcache
@@ -131,6 +132,9 @@ OPTIONS:
                         re-registering them.
   --docker-timeout N    Docker readiness timeout in seconds (default: 300;
                         maximum: 3600). launchd retries failed starts.
+  --skip-power-config   Keep existing host power settings. By default, setup
+                        enables restart after power failure and disables system
+                        sleep, disk sleep and Power Nap where supported.
   --ephemeral           Make each runner ephemeral: instead of pointing the
                         LaunchDaemon at bin/runsvc.sh directly, point it at the
                         runner-ephemeral supervisor, which re-registers the
@@ -249,6 +253,7 @@ parse_args() {
         NAME_PREFIX="$2"; NAME_PREFIX_SET=1; shift 2 ;;
       --name-prefix=*) NAME_PREFIX="${1#*=}"; NAME_PREFIX_SET=1; shift ;;
       --colima) COLIMA=1; shift ;;
+      --skip-power-config) CONFIGURE_POWER=0; shift ;;
       --docker-timeout)
         [[ $# -ge 2 ]] || { err "--docker-timeout requires a value"; exit 2; }
         DOCKER_TIMEOUT="$2"; shift 2 ;;
@@ -462,11 +467,64 @@ require_cmds() {
 
 # Prime sudo once, up front, so password prompts don't interleave with progress.
 ensure_sudo() {
-  log "Requesting administrator privileges (needed for /opt and LaunchDaemons)"
+  log "Requesting administrator privileges (needed for host setup, /opt and LaunchDaemons)"
   if ! sudo -v; then
     err "Could not obtain sudo privileges."
     exit 1
   fi
+}
+
+# Configure the host once per setup, before provisioning any services. pmset
+# persists these settings across reboots; there is no per-runner power daemon.
+configure_power() {
+  if [[ "${CONFIGURE_POWER}" -eq 0 ]]; then
+    step "Keeping existing host power settings (--skip-power-config)"
+    return 0
+  fi
+  if ! command -v pmset >/dev/null 2>&1; then
+    err "Host power setup requires pmset."
+    return 1
+  fi
+  local capabilities key desired current index
+  local -a power_args=(-a)
+  if ! capabilities="$(pmset -g cap)"; then
+    err "Could not read supported host power settings."
+    return 1
+  fi
+  for key in autorestart sleep disksleep powernap; do
+    if printf '%s\n' "${capabilities}" | grep -Eq "^[[:space:]]*${key}[[:space:]]*$"; then
+      desired=0
+      [[ "${key}" != autorestart ]] || desired=1
+      power_args+=("${key}" "${desired}")
+    else
+      step "Skipping ${key}: not supported by this Mac"
+    fi
+  done
+  if [[ ${#power_args[@]} -eq 1 ]]; then
+    step "No supported host power settings to configure"
+    return 0
+  fi
+
+  log "Configuring persistent host power settings for always-on runners"
+  if ! sudo pmset "${power_args[@]}"; then
+    err "Could not apply host power settings; setup stopped."
+    return 1
+  fi
+  if ! current="$(pmset -g custom)"; then
+    err "Could not verify host power settings; setup stopped."
+    return 1
+  fi
+  for ((index = 1; index < ${#power_args[@]}; index += 2)); do
+    key="${power_args[$index]}"; desired="${power_args[$((index + 1))]}"
+    if ! printf '%s\n' "${current}" | awk -v key="${key}" -v desired="${desired}" '
+      $1 == key { found = 1; if ($2 != desired) mismatch = 1 }
+      END { exit (!found || mismatch) }
+    '; then
+      err "Host power setting ${key}=${desired} could not be verified; setup stopped."
+      return 1
+    fi
+    step "Verified ${key}=${desired}"
+  done
 }
 
 # Run a command as the real (non-root) user. Direct call if we already are that
@@ -1189,8 +1247,8 @@ EOF
 
   # --- Verify it is loaded. ------------------------------------------------
   if sudo launchctl print "system/${label}" >/dev/null 2>&1; then
-    step "${name} ('${runner_name}') is configured and running as ${REAL_USER}."
-    record_status "${name}" "OK '${runner_name}' (system/${label})"
+    step "${name} ('${runner_name}') is configured and loaded as ${REAL_USER}."
+    record_status "${name}" "LOADED '${runner_name}' (system/${label})"
   else
     warn "${name} installed but not visible in launchctl print."
     record_status "${name}" "INSTALLED (not confirmed)"
@@ -1213,6 +1271,7 @@ print_summary() {
   done
   printf '\n'
   log "Inspect with:  sudo launchctl print system/com.github.runner-1"
+  log "Readiness:     runner-health --once --dry-run"
   log "Logs:          ${RUNNER_ROOT}/runner-1/_diag/"
 }
 
@@ -1242,6 +1301,7 @@ main() {
     done
   fi
   ensure_sudo
+  configure_power || return 1
   local staging_root="${TMPDIR:-/tmp}"
   [[ "${EUID}" -ne 0 ]] || staging_root=/tmp
   WORK_TMPDIR="$(mktemp -d "${staging_root}/runner-setup.XXXXXX")"

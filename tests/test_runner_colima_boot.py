@@ -157,7 +157,11 @@ configure_runner 2 || exit 92
             self.assertEqual(args[:5], ['/fixture/runner-docker-builder','wait-colima','--timeout','120','--'])
             self.assertTrue(config['RunAtLoad'])
             self.assertEqual(config['KeepAlive'], {'SuccessfulExit':False})
+            self.assertTrue(config['SessionCreate'])
             self.assertEqual(config['UserName'],'fixture')
+            self.assertEqual(config['WorkingDirectory'],str(self.runner_root/f'runner-{index}'))
+            self.assertEqual(config['EnvironmentVariables']['HOME'],str(self.root/'home'))
+            self.assertNotIn('LimitLoadToSessionType',config)
             self.assertEqual(config['EnvironmentVariables']['DOCKER_CONFIG'],str(self.root/'docker-config'))
             self.assertEqual(config['EnvironmentVariables']['COLIMA_HOME'],str(self.root/'colima-home'))
             if index == 1:
@@ -165,6 +169,12 @@ configure_runner 2 || exit 92
             else:
                 self.assertEqual(args[5], '/fixture/runner-ephemeral')
                 self.assertIn('--org',args)
+        calls=(self.root/'sudo-calls').read_text().splitlines()
+        for index in (1,2):
+            plist=self.plists/f'com.github.runner-{index}.plist'
+            bootstrap=calls.index(f'launchctl bootstrap system {plist}')
+            self.assertLess(calls.index(f'chown root:wheel {plist}'),bootstrap)
+            self.assertLess(calls.index(f'chmod 644 {plist}'),bootstrap)
 
     def existing_runner(self):
         self.make_runner(1)
@@ -248,6 +258,14 @@ prepare_colima_boot || exit 92
         self.assertEqual(result.returncode,0,result.stderr)
         config=self.read_plist('com.github.runner-colima')
         self.assertEqual(config['UserName'],'fixture')
+        self.assertTrue(config['RunAtLoad'])
+        self.assertTrue(config['SessionCreate'])
+        self.assertNotIn('LimitLoadToSessionType',config)
+        calls=(self.root/'sudo-calls').read_text().splitlines()
+        plist=self.plists/'com.github.runner-colima.plist'
+        bootstrap=calls.index(f'launchctl bootstrap system {plist}')
+        self.assertLess(calls.index(f'chown root:wheel {plist}'),bootstrap)
+        self.assertLess(calls.index(f'chmod 644 {plist}'),bootstrap)
         self.assertEqual(config['ProgramArguments'],[str(colima),'start','default','--foreground'])
         self.assertTrue(config['RunAtLoad']);self.assertTrue(config['KeepAlive'])
         self.assertEqual(config['EnvironmentVariables']['HOME'],str(self.root/'home'))
@@ -259,6 +277,7 @@ prepare_colima_boot || exit 92
 export TMPDIR="$TEST_ROOT"
 detect_platform() { :; }; require_cmds() { :; }; detect_user() { :; }
 detect_arch() { :; }; detect_host() { :; }; ensure_sudo() { :; }
+configure_power() { :; }  # host power configuration is isolated in test_runner_power
 prepare_runner_archive() { :; }; prepare_root_dir() { :; }
 prepare_colima_boot() {
   [[ "$COLIMA" == 1 && "$COLIMA_INHERITED" == 1 ]] || return 1

@@ -33,6 +33,9 @@ Installing `runner-setup` with Homebrew also installs the Docker CLI and `jq`.
 For Docker builds, configure [Colima or a remote Linux builder](docs/docker-builds.md).
 Use `runner-setup --colima` to start Docker at boot and gate runner startup on Docker readiness.
 On Apple Silicon, Colima setup also installs missing Rosetta 2 for `linux/amd64` containers.
+Runner setup also enables restart after power failure and disables system sleep,
+disk sleep and Power Nap where supported. Use `--skip-power-config` to retain
+existing settings. See [power settings and boot verification](docs/boot-startup.md).
 
 - `runner-setup` / `runner-cleanup` — provision and tear down runners as system LaunchDaemons
 - `runner-ephemeral` — one-job runners, re-registered fresh after every job, with opt-in sandbox-exec confinement and APFS snapshot rollback ([docs](docs/ephemeral-runners.md))
