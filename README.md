@@ -25,6 +25,18 @@ repeated AI restoration; `--ai-strength` reduces its effect, and `--sharpen`
 adds optional edge sharpening.
 See [usage, format details, and running from a checkout](docs/super-resolution.md).
 
+## Clear Dock items (`clear-dock` formula)
+
+```sh
+brew install joeblau/hb/clear-dock
+clear-dock
+```
+
+Run as the user whose Dock you want to clear, without `sudo`. The command backs
+up Dock preferences, clears pinned apps, files and folders, hides recent apps,
+and restarts that user's Dock. Finder, Trash, running apps and minimized windows
+can still appear. The command prints the backup location and a restore command.
+
 ## Runner tooling (`runner-setup` formula)
 
 Provision and operate GitHub Actions self-hosted runners on macOS:
