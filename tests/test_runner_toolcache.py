@@ -267,6 +267,7 @@ sudo() {
       shift
       case "$1" in
         print) [[ -f "$TEST_ROOT/loaded-${2##*/}" ]] ;;
+        bootout) rm -f "$TEST_ROOT/loaded-${2##*/}" ;;
         bootstrap) local stem="${3##*/}"; touch "$TEST_ROOT/loaded-${stem%.plist}" ;;
         asuser) return 1 ;;   # no gui agent loaded in this fixture
         *) return 0 ;;

@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import plistlib
 import subprocess
 import tarfile
 import tempfile
@@ -47,16 +48,37 @@ prepare_runner_archive
         runner = self.root / "runner-1"
         runner.mkdir()
         (runner / ".runner").write_text(json.dumps({"agentName": "host-runner-1", "gitHubUrl": "https://github.com/acme/repo/"}))
-        (self.root / "com.github.runner-1.plist").touch()
+        (self.root / "stage").mkdir()
+        config = {
+            'Label':'com.github.runner-1', 'UserName':'fixture',
+            'WorkingDirectory':str(runner), 'ProgramArguments':[str(runner/'bin/runsvc.sh')],
+            'RunAtLoad':True, 'KeepAlive':True, 'SessionCreate':True,
+            'EnvironmentVariables':{
+                'HOME':str(self.root/'home'), 'USER':'fixture', 'LOGNAME':'fixture',
+                'ACTIONS_RUNNER_SVC':'1',
+                'PATH':'/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin',
+            },
+        }
+        (self.root / "com.github.runner-1.plist").write_bytes(plistlib.dumps(config))
         result = self.shell("runner-setup", '''
 RUNNER_ROOT="$TEST_ROOT"; LAUNCH_DAEMON_DIR="$TEST_ROOT"
+WORK_TMPDIR="$TEST_ROOT/stage"
+REAL_USER=fixture; REAL_HOME="$TEST_ROOT/home"; REAL_UID=501
+COLIMA_UPGRADE_BIN=/must-not-restart; SCOPE_SLUG=Acme-Repo
 RUNNER_URL=https://github.com/Acme/Repo
-sudo() { [[ "$*" == "launchctl print system/com.github.runner-1" ]] || exit 99; }
+as_user() { "$@"; }
+sudo() {
+  case "$*" in
+    'launchctl print system/com.github.runner-1'|'launchctl enable system/com.github.runner-1') return 0 ;;
+    'launchctl asuser '*) return 1 ;;
+    *) exit 99 ;;
+  esac
+}
 if ! configure_runner 1; then exit 98; fi
 printf '%s' "${STATUS_RESULT[0]}"
 ''')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("skipped", result.stdout)
+        self.assertIn("LOADED", result.stdout)
 
     def test_registration_pat_uses_stdin_and_invalid_json_fails(self):
         body = '''

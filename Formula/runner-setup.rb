@@ -66,6 +66,8 @@ class RunnerSetup < Formula
       Verify with: pmset -g custom
 
       Services run as system LaunchDaemons with a non-root service user.
+      Runners restart after any exit, including a clean exit. Setup reruns
+      repair existing startup settings and remove leftover runner login agents.
       A loaded service is not proof that a runner is ready. Verify startup:
         runner-health --once --dry-run
       Test a canary reboot before GUI or SSH login; confirm runners are online
@@ -80,13 +82,12 @@ class RunnerSetup < Formula
       On Apple Silicon, Colima setup installs missing Rosetta 2, accepting
       Apple's license. linux/amd64 containers run through Rosetta, never QEMU.
       Runners stay offline until Rosetta is active. For an existing VZ VM,
-      drain jobs and fully restart Colima after upgrading:
+      pause dispatch and drain jobs, then migrate the services after upgrading:
         runner-upgrade shutdown --all --yes
-        runner-docker-builder setup-colima
-        sudo launchctl bootout system/com.github.runner-colima
-        colima stop default
-        sudo launchctl bootstrap system /Library/LaunchDaemons/com.github.runner-colima.plist
+        runner-setup --org ORG_NAME --runners N --colima
         runner-upgrade start --all --yes
+      Explicit --colima setup stops the idle VM and restarts it under system
+      launchd so it survives logout. Keep your existing scope and runner count.
 
       Remove runners later (use a *removal* token to also deregister on GitHub):
         runner-cleanup --all --token REMOVE_TOKEN

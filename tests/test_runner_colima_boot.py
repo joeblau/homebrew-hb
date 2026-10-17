@@ -156,7 +156,7 @@ configure_runner 2 || exit 92
             args = config['ProgramArguments']
             self.assertEqual(args[:5], ['/fixture/runner-docker-builder','wait-colima','--timeout','120','--'])
             self.assertTrue(config['RunAtLoad'])
-            self.assertEqual(config['KeepAlive'], {'SuccessfulExit':False})
+            self.assertIs(config['KeepAlive'], True)
             self.assertTrue(config['SessionCreate'])
             self.assertEqual(config['UserName'],'fixture')
             self.assertEqual(config['WorkingDirectory'],str(self.runner_root/f'runner-{index}'))
@@ -175,6 +175,8 @@ configure_runner 2 || exit 92
             bootstrap=calls.index(f'launchctl bootstrap system {plist}')
             self.assertLess(calls.index(f'chown root:wheel {plist}'),bootstrap)
             self.assertLess(calls.index(f'chmod 644 {plist}'),bootstrap)
+            self.assertLess(calls.index(f'launchctl enable system/com.github.runner-{index}'),bootstrap)
+        self.assertFalse(any('kickstart -k' in call for call in calls))
 
     def existing_runner(self):
         self.make_runner(1)
@@ -223,6 +225,101 @@ configure_runner 1 || exit 92
         self.assertTrue((hold/'runner-1').exists())
         self.assertNotIn('start ', (self.root/'upgrade-calls').read_text())
 
+    def test_loaded_runner_without_colima_is_migrated_without_registering_again(self):
+        directory = self.existing_runner()
+        path = self.plists/'com.github.runner-1.plist'
+        config = self.read_plist()
+        config.update({'RunAtLoad':False, 'KeepAlive':{'SuccessfulExit':False},
+                       'SessionCreate':False, 'LimitLoadToSessionType':'Aqua', 'Disabled':True})
+        config['EnvironmentVariables']['HOME'] = '/wrong/login/home'
+        path.write_bytes(plistlib.dumps(config))
+        (self.root/'loaded-com.github.runner-1').touch()
+        (directory/'_work').mkdir()
+        (directory/'_work/keep').write_text('workspace')
+        (directory/'config.sh').write_text('#!/bin/bash\nexit 99\n')
+        result = self.shell('''
+COLIMA=0; COLIMA_UPGRADE_BIN="$TEST_ROOT/upgrade"
+configure_runner 1 || exit 91
+configure_runner 1 || exit 92
+''')
+        self.assertEqual(result.returncode,0,result.stderr)
+        config = self.read_plist()
+        self.assertIs(config['KeepAlive'],True)  # restart even after a clean exit
+        self.assertIs(config['RunAtLoad'],True)
+        self.assertIs(config['SessionCreate'],True)
+        self.assertNotIn('LimitLoadToSessionType',config)
+        self.assertNotIn('Disabled',config)
+        self.assertEqual(config['ProgramArguments'],[str(directory/'bin/runsvc.sh')])
+        env = config['EnvironmentVariables']
+        self.assertEqual(env['HOME'],str(self.root/'home'))
+        self.assertEqual(env['USER'],'fixture')
+        self.assertEqual(env['LOGNAME'],'fixture')
+        self.assertEqual(env['OPERATOR'],'keep & me')
+        self.assertEqual((directory/'.credentials').read_text(),'keep credentials')
+        self.assertEqual((directory/'_work/keep').read_text(),'workspace')
+        self.assertEqual(len((self.root/'upgrade-calls').read_text().splitlines()),2)
+
+    def test_existing_ephemeral_supervisor_keeps_arguments_during_migration(self):
+        self.existing_runner()
+        config = self.read_plist()
+        args = ['/fixture/runner-ephemeral','--org','acme','--labels','special,macmini',
+                '--ram-scratch','--ram-scratch-mb','512']
+        config['ProgramArguments'] = args
+        (self.plists/'com.github.runner-1.plist').write_bytes(plistlib.dumps(config))
+        result = self.shell(self.CONFIG + 'COLIMA_UPGRADE_BIN="$TEST_ROOT/upgrade"; configure_runner 1')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(self.read_plist()['ProgramArguments'][5:],args)
+
+    GUI_FIXTURE = r'''
+eval "$(declare -f sudo | sed '1s/sudo/sudo_fixture/')"
+sudo() {
+  if [[ "$1 $2" == 'launchctl asuser' ]]; then
+    case "$5" in
+      print) [[ -f "$TEST_ROOT/gui-loaded" ]] ;;
+      bootout) rm -f "$TEST_ROOT/gui-loaded" ;;
+      *) return 1 ;;
+    esac
+  else
+    sudo_fixture "$@"
+  fi
+}
+'''
+
+    def prepare_gui_fixture(self):
+        directory = self.existing_runner()
+        result = self.shell(self.CONFIG + 'COLIMA_UPGRADE_BIN="$TEST_ROOT/upgrade"; configure_runner 1')
+        self.assertEqual(result.returncode,0,result.stderr)
+        agent = self.root/'home/Library/LaunchAgents/actions.runner.acme.ci-runner-1.plist'
+        agent.parent.mkdir(parents=True)
+        agent.write_text('login-only service')
+        (self.root/'gui-loaded').touch()
+        return directory, agent
+
+    def test_login_agent_is_removed_even_when_system_configuration_is_unchanged(self):
+        _, agent = self.prepare_gui_fixture()
+        result = self.shell(self.CONFIG + self.GUI_FIXTURE + '''
+COLIMA_UPGRADE_BIN="$TEST_ROOT/upgrade"
+ps() { echo /sbin/launchd; }
+configure_runner 1
+''')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertFalse(agent.exists())
+        self.assertFalse((self.root/'gui-loaded').exists())
+        self.assertEqual(len((self.root/'upgrade-calls').read_text().splitlines()),2)
+
+    def test_active_login_agent_job_prevents_removal(self):
+        directory, agent = self.prepare_gui_fixture()
+        result = self.shell(self.CONFIG + self.GUI_FIXTURE + '''
+COLIMA_UPGRADE_BIN="$TEST_ROOT/upgrade"
+ps() { echo "$TEST_ROOT/runners/runner-1/bin/Runner.Worker"; }
+configure_runner 1
+''')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('Active job',result.stderr)
+        self.assertTrue(agent.exists())
+        self.assertTrue((self.root/'gui-loaded').exists())
+        self.assertEqual((directory/'.credentials').read_text(),'keep credentials')
+
     def test_unknown_runner_wrapper_is_not_replaced(self):
         self.existing_runner()
         path=self.plists/'com.github.runner-1.plist'
@@ -270,6 +367,72 @@ prepare_colima_boot || exit 92
         self.assertTrue(config['RunAtLoad']);self.assertTrue(config['KeepAlive'])
         self.assertEqual(config['EnvironmentVariables']['HOME'],str(self.root/'home'))
         self.assertEqual((self.root/'colima-setup').read_text(),'setup\n')
+        self.assertEqual(config['ExitTimeOut'],120)
+
+    COLIMA_SETUP_FIXTURE = r'''
+export PATH="$TEST_ROOT/bin:$PATH"
+as_user() {
+  if [[ "$*" == *runner-docker-builder*setup-colima* ]]; then
+    echo provision >> "$TEST_ROOT/vm-events"
+    touch "$TEST_ROOT/login-session-vm"
+    return 0
+  fi
+  "$@"
+}
+ps() { echo /sbin/launchd; }
+eval "$(declare -f sudo | sed '1s/sudo/sudo_fixture/')"
+sudo() {
+  if [[ "$1 $2" == 'launchctl bootstrap' ]]; then
+    [[ ! -f "$TEST_ROOT/login-session-vm" ]] || return 98
+    echo bootstrap >> "$TEST_ROOT/vm-events"
+  fi
+  sudo_fixture "$@"
+}
+'''
+
+    def colima_binary(self, code):
+        bin_dir = self.root/'bin'
+        bin_dir.mkdir()
+        binary = bin_dir/'colima'
+        binary.write_text('#!/bin/bash\n' + code + '\n')
+        binary.chmod(0o755)
+
+    def test_colima_vm_is_stopped_before_handoff_to_system_daemon(self):
+        self.colima_binary('''
+[[ "$*" == 'stop default' ]] || exit 99
+echo stop >> "$TEST_ROOT/vm-events"
+rm -f "$TEST_ROOT/login-session-vm"
+''')
+        result = self.shell(self.COLIMA_SETUP_FIXTURE + 'prepare_colima_boot')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual((self.root/'vm-events').read_text().splitlines(),['provision','stop','bootstrap'])
+        self.assertTrue((self.root/'loaded-com.github.runner-colima').exists())
+
+    def test_colima_handoff_stop_failure_never_bootstraps_a_supervisor(self):
+        self.colima_binary('exit 42')
+        result = self.shell(self.COLIMA_SETUP_FIXTURE + 'prepare_colima_boot')
+        self.assertNotEqual(result.returncode,0)
+        self.assertEqual((self.root/'vm-events').read_text().splitlines(),['provision'])
+        self.assertFalse((self.root/'loaded-com.github.runner-colima').exists())
+
+    def test_colima_stop_timeout_preserves_existing_service(self):
+        self.colima_binary('echo unexpected >> "$TEST_ROOT/vm-events"')
+        path = self.plists/'com.github.runner-colima.plist'
+        original = plistlib.dumps({'UserName':'fixture'})
+        path.write_bytes(original)
+        result = self.shell(self.COLIMA_SETUP_FIXTURE + '''
+sleep() { :; }
+sudo() {
+  if [[ "$1 $2" == 'launchctl print' ]]; then return 0; fi
+  if [[ "$1 $2" == 'launchctl bootout' ]]; then return 0; fi
+  sudo_fixture "$@"
+}
+prepare_colima_boot
+''')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('Timed out stopping',result.stderr)
+        self.assertEqual(path.read_bytes(),original)
+        self.assertEqual((self.root/'vm-events').read_text().splitlines(),['provision'])
 
     def test_later_setup_inherits_colima_for_autoscaled_runners(self):
         (self.plists/'com.github.runner-colima.plist').write_text('fixture')

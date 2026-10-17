@@ -129,7 +129,9 @@ OPTIONS:
                         Docker CLI and Buildx if needed. On Apple Silicon,
                         installs missing Rosetta 2, accepting Apple's license.
                         Updates existing same-scope runners without
-                        re-registering them.
+                        re-registering them. Restarts the idle VM to transfer
+                        it to system launchd; pause dispatch and finish jobs
+                        before running setup.
   --docker-timeout N    Docker readiness timeout in seconds (default: 300;
                         maximum: 3600). launchd retries failed starts.
   --skip-power-config   Keep existing host power settings. By default, setup
@@ -198,6 +200,10 @@ SECURITY NOTE:
   This script uses sudo for /opt and ${LAUNCH_DAEMON_DIR}; the runner
   processes themselves run as the invoking (non-root) user, because the
   GitHub Actions runner refuses to run as root.
+
+  Services start at boot without GUI login and restart after any exit.
+  Setup reruns repair existing same-scope service settings. Explicit maintenance
+  holds are retained; resume with runner-upgrade start --all --yes.
 EOF
 }
 
@@ -724,7 +730,8 @@ bootout_system() {
     sudo launchctl print "system/${label}" >/dev/null 2>&1 || return 0
     sleep 1
   done
-  return 0
+  err "Timed out stopping system/${label}; refusing to replace its live service."
+  return 1
 }
 
 # One foreground Colima service per host, independent of any single runner.
@@ -746,6 +753,10 @@ with open(sys.argv[1], "rb") as f:
     config = plistlib.load(f)
 if config.get("UserName") != sys.argv[2]:
     raise SystemExit("Colima boot service belongs to another runner user")
+if (config.get("RunAtLoad") is not True or config.get("KeepAlive") is not True
+        or config.get("SessionCreate") is not True or "LimitLoadToSessionType" in config
+        or config.get("Disabled") is True):
+    raise SystemExit("Colima boot service needs migration; rerun setup with --colima between jobs")
 env = config.get("EnvironmentVariables", {})
 for key in ("COLIMA_HOME", "DOCKER_CONFIG"):
     if not env.get(key, "").startswith("/"):
@@ -810,19 +821,22 @@ with open(path, "wb") as f:
             "DOCKER_CONFIG": docker_config, "RUNNER_DOCKER_TIMEOUT": timeout,
         },
         "RunAtLoad": True, "KeepAlive": True, "ThrottleInterval": 30,
+        "ExitTimeOut": 120,
         "SessionCreate": True,
         "StandardOutPath": logs + "/stdout.log", "StandardErrorPath": logs + "/stderr.log",
     }, f)
 PYDAEMON
   [[ $? -eq 0 ]] || return 1
   plutil -lint "${staged}" >/dev/null || return 1
+  # setup-colima starts a background VM to provision Docker/Buildx. Colima's
+  # --foreground mode returns immediately if that VM is already running; it
+  # does NOT adopt it. Stop both the old supervisor and that VM, so the new
+  # host agent is actually spawned by system launchd, outside a login session.
+  step "Handing the Colima VM to system launchd (restarting the idle VM)"
+  bootout_system "${label}" || return 1
+  as_user env COLIMA_PROFILE=default COLIMA_HOME="${COLIMA_CONFIG_HOME}" \
+    DOCKER_CONFIG="${COLIMA_DOCKER_CONFIG}" "${colima_bin}" stop default || return 1
   if ! cmp -s "${staged}" "${plist}"; then
-    if sudo launchctl print "system/${label}" >/dev/null 2>&1; then
-      bootout_system "${label}" || return 1
-      if sudo launchctl print "system/${label}" >/dev/null 2>&1; then
-        err "Previous Colima daemon has not stopped; retry setup."; return 1
-      fi
-    fi
     sudo cp "${staged}" "${plist}" && sudo chown root:wheel "${plist}"       && sudo chmod 644 "${plist}" || return 1
   fi
   sudo launchctl enable "system/${label}" || return 1
@@ -832,12 +846,13 @@ PYDAEMON
   step "Colima boot daemon installed; runner startup will wait for Docker."
 }
 
-# Wrap a known runner service without changing its registration or supervisor
-# options. plistlib handles XML quoting for paths and retained operator values.
-gate_colima_plist() {
-  python3 - "$1" "$2" "$3" "${DOCKER_HELPER}" "${DOCKER_TIMEOUT}"     "${REAL_USER}" "${COLIMA_DOCKER_CONFIG}" "${COLIMA_CONFIG_HOME}" <<'PYPLIST'
+# Reconcile a known runner service without changing its registration or
+# supervisor options. This also repairs existing plists on setup reruns.
+stage_runner_plist() {
+  python3 - "$1" "$2" "$3" "${DOCKER_HELPER}" "${DOCKER_TIMEOUT}" \
+    "${REAL_USER}" "${COLIMA_DOCKER_CONFIG}" "${COLIMA_CONFIG_HOME}" "${REAL_HOME}" "${COLIMA}" <<'PYPLIST'
 import pathlib, plistlib, sys
-source, target, directory, helper, timeout, user, docker_config, colima_home = sys.argv[1:]
+source, target, directory, helper, timeout, user, docker_config, colima_home, home, colima = sys.argv[1:]
 with open(source, "rb") as f:
     config = plistlib.load(f)
 args = config.get("ProgramArguments", [])
@@ -845,49 +860,88 @@ if (not isinstance(args, list) or not args or not all(isinstance(a, str) for a i
         or config.get("UserName") != user or config.get("WorkingDirectory") != directory
         or config.get("Program", args[0]) != args[0]):
     raise SystemExit("Unrecognized runner LaunchDaemon; refusing to replace its command")
-if pathlib.Path(args[0]).name == "runner-docker-builder":
+gated = pathlib.Path(args[0]).name == "runner-docker-builder"
+if gated:
     if len(args) < 6 or args[1:3] != ["wait-colima", "--timeout"] or args[4] != "--":
         raise SystemExit("Unrecognized Docker readiness wrapper")
     args = args[5:]
 if args[0] != directory + "/bin/runsvc.sh" and not (
         args[0].startswith("/") and pathlib.Path(args[0]).name == "runner-ephemeral"):
     raise SystemExit("Unrecognized runner entrypoint; refusing to replace its command")
-config["ProgramArguments"] = [helper, "wait-colima", "--timeout", timeout, "--"] + args
-if "Program" in config:
-    config["Program"] = helper
-config.setdefault("EnvironmentVariables", {})["DOCKER_CONFIG"] = docker_config
-config["EnvironmentVariables"]["COLIMA_HOME"] = colima_home
+if colima == "1":
+    config["ProgramArguments"] = [helper, "wait-colima", "--timeout", timeout, "--"] + args
+    if "Program" in config:
+        config["Program"] = helper
+env = config.setdefault("EnvironmentVariables", {})
+env.update({"HOME": home, "USER": user, "LOGNAME": user, "ACTIONS_RUNNER_SVC": "1"})
+env.setdefault("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+if colima == "1":
+    env.update({"DOCKER_CONFIG": docker_config, "COLIMA_HOME": colima_home})
 config["RunAtLoad"] = True
-config["KeepAlive"] = {"SuccessfulExit": False}
+config["KeepAlive"] = True
+config["SessionCreate"] = True
+config.pop("LimitLoadToSessionType", None)
+config.pop("Disabled", None)
 with open(target, "wb") as f:
     plistlib.dump(config, f)
 PYPLIST
 }
 
-# Existing same-scope runners can gain the gate without config.sh, a fresh
-# registration token, or changes to their ephemeral registration settings.
-retrofit_colima_runner() {
+# Existing same-scope runners retain registration, caches and supervisor args
+# while startup settings are repaired. An explicit maintenance hold is retained.
+reconcile_runner_service() {
   local idx="$1" dir="$2" plist="$3" staged="${WORK_TMPDIR}/colima-runner-${1}.plist"
-  gate_colima_plist "${plist}" "${staged}" "${dir}" || return 1
+  stage_runner_plist "${plist}" "${staged}" "${dir}" || return 1
+  if [[ -z "${COLIMA_UPGRADE_BIN}" ]]; then
+    local self_dir
+    self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    COLIMA_UPGRADE_BIN="${self_dir}/runner-upgrade"
+    [[ -x "${COLIMA_UPGRADE_BIN}" ]] || COLIMA_UPGRADE_BIN="$(command -v runner-upgrade)" || return 1
+  fi
   if cmp -s "${staged}" "${plist}"; then
+    remove_runner_launchagent "${dir}" || return 1
+    sudo launchctl enable "system/com.github.runner-${idx}" || return 1
     if [[ ! -e "${RUNNER_ROOT}/.maintenance/runner-${idx}" ]] \
         && ! sudo launchctl print "system/com.github.runner-${idx}" >/dev/null 2>&1; then
       as_user "${COLIMA_UPGRADE_BIN}" start --runner "${idx}" --yes \
         --health-timeout "$((DOCKER_TIMEOUT + 300))" || return 1
     fi
-    record_status "runner-${idx}" "OK (Colima gate already installed)"
+    record_status "runner-${idx}" "LOADED (system service configuration retained)"
     return 0
   fi
   local held=0
   [[ ! -e "${RUNNER_ROOT}/.maintenance/runner-${idx}" ]] || held=1
   as_user "${COLIMA_UPGRADE_BIN}" shutdown --runner "${idx}" --yes || return 1
+  remove_runner_launchagent "${dir}" || return 1
   if ! { sudo cp "${staged}" "${plist}" && sudo chown root:wheel "${plist}"       && sudo chmod 644 "${plist}"; }; then
-    err "Could not install Docker gate; runner-${idx} remains in maintenance."; return 1
+    err "Could not install system service; runner-${idx} remains in maintenance."; return 1
   fi
+  sudo launchctl enable "system/com.github.runner-${idx}" || return 1
   if [[ "${held}" -eq 0 ]]; then
     as_user "${COLIMA_UPGRADE_BIN}" start --runner "${idx}" --yes       --health-timeout "$((DOCKER_TIMEOUT + 300))" || return 1
   fi
-  record_status "runner-${idx}" "Colima gate installed (registration preserved)"
+  record_status "runner-${idx}" "System service updated (registration preserved)"
+}
+
+# Remove the official login-only agent even on the already-configured path.
+# A duplicate agent can make login appear to fix a stopped system daemon.
+remove_runner_launchagent() {
+  local dir="$1" name agent_label agent_plist processes
+  name="$(jq -r '.agentName // empty' "${dir}/.runner")" || return 1
+  [[ -n "${name}" ]] || return 1
+  agent_label="actions.runner.${SCOPE_SLUG}.${name}"
+  agent_plist="${REAL_HOME}/Library/LaunchAgents/${agent_label}.plist"
+  if sudo launchctl asuser "${REAL_UID}" launchctl print "gui/${REAL_UID}/${agent_label}" >/dev/null 2>&1; then
+    processes="$(ps -axo comm=)" || return 1
+    if printf '%s\n' "${processes}" | grep -Eq '(^|/)Runner[.]Worker$'; then
+      err "Active job detected; refusing to stop the login-only runner agent."; return 1
+    fi
+    sudo launchctl asuser "${REAL_UID}" launchctl bootout "gui/${REAL_UID}/${agent_label}" || return 1
+  fi
+  as_user rm -f "${agent_plist}" || return 1
+  if sudo launchctl asuser "${REAL_UID}" launchctl print "gui/${REAL_UID}/${agent_label}" >/dev/null 2>&1; then
+    err "Login-only runner agent ${agent_label} has not stopped; retry setup."; return 1
+  fi
 }
 
 configure_runner() {
@@ -927,39 +981,19 @@ configure_runner() {
 
   log "Configuring ${name} as '${runner_name}'  (${dir})"
 
-  if [[ "${COLIMA}" -eq 1 && -f "${dir}/.runner" && -f "${plist_dest}" ]]; then
+  if [[ -f "${dir}/.runner" && -f "${plist_dest}" ]]; then
     local prior_url
     prior_url="$(jq -r '.gitHubUrl // ""' "${dir}/.runner")" || return 1
     if [[ "$(printf '%s' "${prior_url%/}" | tr '[:upper:]' '[:lower:]')" ==           "$(printf '%s' "${RUNNER_URL%/}" | tr '[:upper:]' '[:lower:]')" ]]; then
-      retrofit_colima_runner "${idx}" "${dir}" "${plist_dest}"
+      reconcile_runner_service "${idx}" "${dir}" "${plist_dest}"
       return $?
     fi
-  fi
-
-  # --- Idempotency: already provisioned, loaded, AND same scope? -----------
-  # .runner is JSON containing "gitHubUrl"; only skip when it matches the
-  # requested scope, so re-running with a different --org/--repo/--url re-points
-  # the runner instead of silently keeping the old registration.
-  if [[ -f "${dir}/.runner" && -f "${plist_dest}" ]] \
-      && sudo launchctl print "system/${label}" >/dev/null 2>&1; then
-    local existing_url
-    existing_url="$(sed -n 's/.*"gitHubUrl"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-      "${dir}/.runner" 2>/dev/null | head -n1 || true)"
-    # GitHub owner/repo names are case-insensitive. Avoid restarting a loaded
-    # runner merely because the requested scope differs in casing/trailing '/'.
-    while [[ "${existing_url}" == */ ]]; do existing_url="${existing_url%/}"; done
-    if [[ "$(printf '%s' "${existing_url}" | tr '[:upper:]' '[:lower:]')" == "$(printf '%s' "${RUNNER_URL}" | tr '[:upper:]' '[:lower:]')" ]]; then
-      step "${name} already configured as '${runner_name}' for ${RUNNER_URL} and loaded — skipping."
-      record_status "${name}" "skipped (already loaded as '${runner_name}')"
-      return 0
-    fi
-    step "${name} loaded but registered to '${existing_url:-unknown}'; re-pointing to ${RUNNER_URL}."
   fi
 
   # --- Tear down any prior system daemon for a clean, idempotent re-run. ----
   if sudo launchctl print "system/${label}" >/dev/null 2>&1; then
     step "Booting out existing daemon system/${label}"
-    bootout_system "${label}"
+    bootout_system "${label}" || return 1
   fi
   sudo rm -f "${plist_dest}"
 
@@ -1174,6 +1208,10 @@ ${args_xml}  </array>
   <dict>
     <key>HOME</key>
     <string>${REAL_HOME}</string>
+    <key>USER</key>
+    <string>${REAL_USER}</string>
+    <key>LOGNAME</key>
+    <string>${REAL_USER}</string>
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>ACTIONS_RUNNER_SVC</key>
@@ -1184,10 +1222,7 @@ ${ramscratch_env_xml}  </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
-  <dict>
-    <key>SuccessfulExit</key>
-    <false/>
-  </dict>
+  <true/>
   <key>ThrottleInterval</key>
   <integer>10</integer>
   <key>SessionCreate</key>
@@ -1203,7 +1238,7 @@ ${ramscratch_env_xml}  </dict>
 EOF
 
   if [[ "${COLIMA}" -eq 1 ]]; then
-    if ! gate_colima_plist "${tmp_plist}" "${tmp_plist}.gated" "${dir}"         || ! mv "${tmp_plist}.gated" "${tmp_plist}"; then
+    if ! stage_runner_plist "${tmp_plist}" "${tmp_plist}.gated" "${dir}"         || ! mv "${tmp_plist}.gated" "${tmp_plist}"; then
       record_status "${name}" "FAILED (Docker readiness gate)"; return 1
     fi
   fi
@@ -1230,9 +1265,12 @@ EOF
   as_user touch "${log_dir}/runner-stdout.log" "${log_dir}/runner-stderr.log" \
     || warn "Could not pre-create log files in ${log_dir}; launchd will create them."
 
-  # --- Bootstrap into the system domain, enable, kickstart. ----------------
+  # --- Enable boot startup, then bootstrap into the system domain. ---------
   step "Bootstrapping system/${label}"
-  bootout_system "${label}"
+  bootout_system "${label}" || return 1
+  if ! sudo launchctl enable "system/${label}"; then
+    err "Could not enable system/${label} for boot."; return 1
+  fi
   if ! sudo launchctl bootstrap system "${plist_dest}"; then
     # Retry once after a brief settle — covers the async-teardown race.
     sleep 2
@@ -1242,8 +1280,8 @@ EOF
       return 1
     fi
   fi
-  sudo launchctl enable "system/${label}" 2>/dev/null || true
-  sudo launchctl kickstart -k "system/${label}" 2>/dev/null || true
+  # RunAtLoad launches the daemon. Killing that new listener with kickstart -k
+  # can leave a conflicting GitHub session and delay readiness by minutes.
 
   # --- Verify it is loaded. ------------------------------------------------
   if sudo launchctl print "system/${label}" >/dev/null 2>&1; then

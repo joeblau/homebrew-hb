@@ -47,9 +47,45 @@ PATH settings avoid depending on an interactive shell. The Colima service
 supervises the foreground VM; each runner waits for Docker and Rosetta readiness.
 The services have no Aqua login-session restriction.
 
+Runner daemons use unconditional `KeepAlive`, so launchd restarts them after
+both successful and unsuccessful exits. Maintenance uses `launchctl bootout`,
+which unloads the job and therefore still stops it deliberately. Setup reruns
+repair the startup policy on existing same-scope runners, including old Aqua
+restrictions, without changing their registration or supervisor arguments.
+They also remove a leftover official runner LaunchAgent even when the system
+plist otherwise needs no changes.
+
+Explicit `--colima` setup transfers the idle VM to system launchd: after
+provisioning Docker, it stops the old supervisor and VM, then starts the VM in
+the foreground through its system daemon. This handoff matters because
+[`colima start --foreground` returns immediately when the VM is already running](https://github.com/abiosoft/colima/blob/main/cmd/start.go);
+it does not adopt a VM started from a GUI session. The daemon gets 120 seconds
+to shut down gracefully. Setup aborts if it cannot confirm the old daemon has
+stopped or if stopping the VM fails.
+
 Use these existing services when operating this tap. Adding a second generic
 runner service can create competing listeners. A Homebrew user service for
 Colima starts at login; it must not compete with this tap's Colima boot daemon.
+
+## Apply the service update to an existing Mini
+
+Pause job dispatch and let active jobs finish. Run as the runner owner on each
+Mini; these commands use sudo internally:
+
+```sh
+brew update
+brew upgrade joeblau/hb/runner-setup
+runner-upgrade shutdown --all --yes
+runner-setup --org ORG_NAME --runners 2 --colima
+runner-upgrade start --all --yes
+runner-health --once --dry-run
+```
+
+Use the existing organization or repository and runner count for that machine.
+Existing same-scope Colima runners need no new registration token. An explicit
+maintenance hold stays in place during setup; `start` clears it only after the
+runner is listening for jobs. Deleted GitHub registrations need registration
+repair separately; a service-policy update cannot restore them.
 
 ## Verify one canary before updating the fleet
 
@@ -72,6 +108,9 @@ runner is ready. A real reboot with no GUI login is the acceptance check.
    below to inspect the services. The console owner should not be
    the runner's GUI user. Each service should have `state = running`, and
    runner health should report readiness.
+5. Log into the GUI, then explicitly **Log Out**. Confirm both runners remain
+   online in GitHub. Repeat with screen locking and display sleep. These are
+   separate cases from a reboot and should not stop the system daemons.
 
 ```sh
 stat -f '%Su' /dev/console
