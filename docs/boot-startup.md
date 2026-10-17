@@ -26,6 +26,32 @@ These settings persist across reboots; they do not need a separate LaunchDaemon.
 For MDM-managed machines, deploy the equivalent power policy with MDM and use
 `--skip-power-config` if that policy should remain under MDM control.
 
+## Everything else setup does for unattended restarts
+
+Each run of `runner-setup` also:
+
+- **Upgrades itself first.** A Homebrew-installed `runner-setup` runs
+  `brew upgrade joeblau/hb/runner-setup` and re-runs as the new release with the
+  same arguments. Pass `--skip-self-upgrade` to use the installed release.
+- **Turns off FileVault.** FileVault holds every restart, including
+  `autorestart` after a power failure, at a password screen, so no runner can
+  start. Setup runs `sudo fdesetup disable`, which asks for an admin's
+  credentials once and decrypts in the background. The disk is then not
+  encrypted at rest. Pass `--keep-filevault` to keep it and unlock each
+  restart manually.
+- **Installs Rosetta 2 on Apple Silicon Colima hosts**, accepting Apple's
+  license, whenever x86_64 code cannot run. The check runs on every setup,
+  including reruns that inherit Colima, because the runners refuse to listen
+  without it. A Colima VM that started before Rosetta was installed is
+  restarted between jobs so it comes back with Rosetta.
+- **Starts every runner and waits until it listens for jobs.** Runners left in
+  maintenance by an interrupted upgrade, and runners crash-looping on a
+  readiness gate, are restarted. Setup fails if any runner does not come
+  online, so a successful run means the runners are up.
+
+GitHub's runner updates its own binary when a new release is required, so a
+running fleet needs no scheduled upgrade job.
+
 `autorestart=1` covers a power failure while the Mac was running. It does not
 guarantee startup after a deliberate shutdown followed by reconnecting AC power.
 That is a separate power-on policy. See [Apple's Energy settings reference](https://support.apple.com/guide/mac-help/mchlp1168/mac).
@@ -73,19 +99,15 @@ Pause job dispatch and let active jobs finish. Run as the runner owner on each
 Mini; these commands use sudo internally:
 
 ```sh
-brew update
-brew upgrade joeblau/hb/runner-setup
-runner-upgrade shutdown --all --yes
 runner-setup --org ORG_NAME --runners 2 --colima
-runner-upgrade start --all --yes
-runner-health --once --dry-run
 ```
 
 Use the existing organization or repository and runner count for that machine.
-Existing same-scope Colima runners need no new registration token. An explicit
-maintenance hold stays in place during setup; `start` clears it only after the
-runner is listening for jobs. Deleted GitHub registrations need registration
-repair separately; a service-policy update cannot restore them.
+Existing same-scope Colima runners need no new registration token. Setup
+upgrades the tools, repairs the services, resumes held runners and returns
+only after every runner is listening for jobs. Deleted GitHub registrations
+need registration repair separately; a service-policy update cannot restore
+them.
 
 ## Verify one canary before updating the fleet
 
@@ -96,9 +118,9 @@ runner is ready. A real reboot with no GUI login is the acceptance check.
 1. Choose an idle Mini. If remote access is needed, enable **System Settings →
    General → Sharing → Remote Login** for the service owner. Setup does not
    enable SSH or install Tailscale.
-2. Check FileVault with `fdesetup status`. If it is enabled, its startup unlock
-   must complete before services depending on the data volume can run. An
-   ordinary logged-out desktop does not require automatic GUI login.
+2. Run setup. Unless `--keep-filevault` was used, `fdesetup status` should
+   report FileVault off or decrypting. An ordinary logged-out desktop does not
+   require automatic GUI login.
 3. Restart the Mini, or perform a cold boot when that is the scenario being
    tested. Leave its GUI at the login window. Allow boot and Docker startup
    to complete, then verify both runners are **Idle** or **Active** in the
@@ -127,7 +149,7 @@ colima ssh -- cat /proc/sys/fs/binfmt_misc/rosetta
 The final Rosetta check applies to Apple Silicon Colima hosts and should start
 with `enabled`. For hosts without Colima, omit its service and Docker checks.
 
-If a runner remains in maintenance, resume it with `runner-upgrade start --all
+If a runner remains in maintenance, rerun setup or `runner-upgrade start --all
 --yes` and repeat the checks. Startup clears maintenance only after readiness.
 
 If the services become ready only after GUI login and FileVault is off, capture

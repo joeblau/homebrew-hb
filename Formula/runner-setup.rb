@@ -65,6 +65,11 @@ class RunnerSetup < Formula
       Use --skip-power-config to keep existing or MDM-managed settings.
       Verify with: pmset -g custom
 
+      Setup turns off FileVault, which otherwise holds every restart at a
+      password screen; use --keep-filevault to keep it. It upgrades itself
+      through Homebrew first (--skip-self-upgrade to skip), resumes runners
+      left in maintenance, and finishes only when every runner is listening.
+
       Services run as system LaunchDaemons with a non-root service user.
       Runners restart after any exit, including a clean exit. Setup reruns
       repair existing startup settings and remove leftover runner login agents.
@@ -82,10 +87,8 @@ class RunnerSetup < Formula
       On Apple Silicon, Colima setup installs missing Rosetta 2, accepting
       Apple's license. linux/amd64 containers run through Rosetta, never QEMU.
       Runners stay offline until Rosetta is active. For an existing VZ VM,
-      pause dispatch and drain jobs, then migrate the services after upgrading:
-        runner-upgrade shutdown --all --yes
+      pause dispatch and drain jobs, then rerun setup:
         runner-setup --org ORG_NAME --runners N --colima
-        runner-upgrade start --all --yes
       Explicit --colima setup stops the idle VM and restarts it under system
       launchd so it survives logout. Keep your existing scope and runner count.
 

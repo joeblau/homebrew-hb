@@ -35,7 +35,9 @@ Use `runner-setup --colima` to start Docker at boot and gate runner startup on D
 On Apple Silicon, Colima setup also installs missing Rosetta 2 for `linux/amd64` containers.
 Runner setup also enables restart after power failure and disables system sleep,
 disk sleep and Power Nap where supported. Use `--skip-power-config` to retain
-existing settings. See [power settings and boot verification](docs/boot-startup.md).
+existing settings. It upgrades itself through Homebrew, turns off FileVault so
+restarts need no login (`--keep-filevault` opts out), and finishes only when
+every runner is listening for jobs. See [power settings and boot verification](docs/boot-startup.md).
 Runner services restart after any exit. Re-running setup repairs existing
 startup settings; explicit `--colima` setup transfers the idle VM to system
 launchd so it runs independently of the owner's GUI session.

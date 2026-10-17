@@ -44,10 +44,13 @@ COLIMA=0             # --colima: boot the shared VM and gate runner startup
 DOCKER_TIMEOUT=300
 COLIMA_INHERITED=0
 DOCKER_HELPER=""
-COLIMA_UPGRADE_BIN=""
+UPGRADE_BIN=""
 COLIMA_CONFIG_HOME=""
 COLIMA_DOCKER_CONFIG=""
 CONFIGURE_POWER=1    # persistent host power settings for always-on runners
+KEEP_FILEVAULT=0     # --keep-filevault: leave FileVault on (restarts then need a login)
+SELF_UPGRADE=1       # upgrade the Homebrew tools and re-run as the new release
+declare -a ORIGINAL_ARGS=()
 EPHEMERAL=0           # 1 => LaunchDaemon runs runner-ephemeral, not runsvc.sh
 EPHEMERAL_BIN=""      # resolved absolute path of the runner-ephemeral supervisor
 TOOL_CACHE_DIR=""     # --tool-cache-dir override; default is per-runner DIR/_toolcache
@@ -137,6 +140,12 @@ OPTIONS:
   --skip-power-config   Keep existing host power settings. By default, setup
                         enables restart after power failure and disables system
                         sleep, disk sleep and Power Nap where supported.
+  --keep-filevault      Leave FileVault on. By default, setup turns it off:
+                        FileVault holds every restart at the login window, so
+                        no runner can start until someone types a password.
+  --skip-self-upgrade   Do not upgrade the Homebrew tools first. By default, a
+                        Homebrew-installed setup upgrades joeblau/hb/runner-setup
+                        and re-runs itself as the new release.
   --ephemeral           Make each runner ephemeral: instead of pointing the
                         LaunchDaemon at bin/runsvc.sh directly, point it at the
                         runner-ephemeral supervisor, which re-registers the
@@ -202,8 +211,8 @@ SECURITY NOTE:
   GitHub Actions runner refuses to run as root.
 
   Services start at boot without GUI login and restart after any exit.
-  Setup reruns repair existing same-scope service settings. Explicit maintenance
-  holds are retained; resume with runner-upgrade start --all --yes.
+  Setup reruns repair existing same-scope service settings and resume runners
+  left in maintenance. Setup succeeds only when every runner listens for jobs.
 EOF
 }
 
@@ -260,6 +269,8 @@ parse_args() {
       --name-prefix=*) NAME_PREFIX="${1#*=}"; NAME_PREFIX_SET=1; shift ;;
       --colima) COLIMA=1; shift ;;
       --skip-power-config) CONFIGURE_POWER=0; shift ;;
+      --keep-filevault) KEEP_FILEVAULT=1; shift ;;
+      --skip-self-upgrade) SELF_UPGRADE=0; shift ;;
       --docker-timeout)
         [[ $# -ge 2 ]] || { err "--docker-timeout requires a value"; exit 2; }
         DOCKER_TIMEOUT="$2"; shift 2 ;;
@@ -533,6 +544,127 @@ configure_power() {
   done
 }
 
+# FileVault keeps the data volume locked at the login window after every
+# restart, including autorestart after a power failure, so no LaunchDaemon can
+# start until someone types a password. Unattended runners need it off.
+configure_filevault() {
+  if [[ "${KEEP_FILEVAULT}" -eq 1 ]]; then
+    step "Keeping FileVault settings (--keep-filevault)"
+    return 0
+  fi
+  command -v fdesetup >/dev/null 2>&1 || return 0
+  local status
+  if ! status="$(fdesetup status)"; then
+    err "Could not read FileVault status; setup stopped."
+    return 1
+  fi
+  case "${status}" in
+    *"Decryption in progress"*) step "FileVault decryption is in progress"; return 0 ;;
+    *"FileVault is Off"*) step "FileVault is off; restarts need no login"; return 0 ;;
+  esac
+  log "Turning off FileVault so runners start after restarts and power failures"
+  warn "The disk will not be encrypted at rest. Use --keep-filevault to keep it."
+  if ! sudo fdesetup disable; then
+    err "Could not turn off FileVault; setup stopped. Use --keep-filevault to skip."
+    return 1
+  fi
+  step "FileVault decryption started; it continues in the background"
+}
+
+# An installer receipt can outlive Rosetta across macOS upgrades, so check that
+# x86_64 code actually runs.
+rosetta_active() {
+  arch -x86_64 /usr/bin/true >/dev/null 2>&1
+}
+
+rosetta_wanted() {
+  [[ "${COLIMA}" -eq 1 && "${ARCH_TAG}" == arm64 && "${RUNNER_ALLOW_QEMU:-0}" != 1 ]]
+}
+
+# Colima runs linux/amd64 through Rosetta, and each runner refuses to listen
+# until it is active. Check on every setup, not only when Colima is first added.
+ensure_host_rosetta() {
+  rosetta_wanted || return 0
+  if rosetta_active; then
+    step "Rosetta 2 is active"
+    return 0
+  fi
+  log "Installing Rosetta 2 for Colima (accepting Apple's license)"
+  if ! sudo softwareupdate --install-rosetta --agree-to-license || ! rosetta_active; then
+    err "Rosetta 2 could not be installed; setup stopped."
+    return 1
+  fi
+  step "Rosetta 2 installed"
+}
+
+refuse_active_jobs() {
+  local processes
+  processes="$(ps -axo comm=)" || { err "Cannot inspect active jobs"; return 1; }
+  if printf '%s\n' "${processes}" | grep -Eq '(^|/)Runner[.]Worker$'; then
+    err "Active runner job detected. Pause dispatch and let jobs finish before $1."
+    return 1
+  fi
+}
+
+# A VM that booted before Rosetta was installed keeps running without it, and
+# every gated runner stays offline. Restart the supervised VM in that case.
+restart_colima_without_rosetta() {
+  rosetta_wanted || return 0
+  local colima_bin state=""
+  colima_bin="$(command -v colima)" || { err "colima not found"; return 1; }
+  state="$(as_user env COLIMA_PROFILE=default COLIMA_HOME="${COLIMA_CONFIG_HOME}" \
+    DOCKER_CONFIG="${COLIMA_DOCKER_CONFIG}" "${colima_bin}" ssh -- \
+    head -n 1 /proc/sys/fs/binfmt_misc/rosetta </dev/null 2>/dev/null)" || state=""
+  if [[ "${state}" == enabled ]]; then
+    step "Colima VM has Rosetta active"
+    return 0
+  fi
+  refuse_active_jobs "restarting Colima" || return 1
+  step "Restarting Colima so the VM starts with Rosetta"
+  sudo launchctl kickstart -k system/com.github.runner-colima
+}
+
+# A Homebrew install upgrades itself first and re-runs as the new release, so a
+# fleet rerun always applies the latest fixes. Repo checkouts run as they are.
+self_upgrade() {
+  [[ "${SELF_UPGRADE}" -eq 1 && -z "${RUNNER_SETUP_UPGRADED:-}" ]] || return 0
+  local brew_bin installed before after
+  brew_bin="$(command -v brew)" || return 0
+  installed="$(as_user "${brew_bin}" --prefix)/bin/${PROG_NAME}" || return 0
+  [[ "$0" -ef "${installed}" ]] || return 0
+  log "Upgrading joeblau/hb/runner-setup"
+  before="$(as_user "${brew_bin}" list --versions runner-setup 2>/dev/null)" || before=""
+  if ! { as_user "${brew_bin}" update --quiet \
+      && as_user "${brew_bin}" upgrade joeblau/hb/runner-setup; }; then
+    warn "Homebrew upgrade failed; continuing with the installed release."
+    return 0
+  fi
+  after="$(as_user "${brew_bin}" list --versions runner-setup 2>/dev/null)" || after=""
+  if [[ -n "${after}" && "${after}" != "${before}" ]]; then
+    step "Re-running as ${after}"
+    exec env RUNNER_SETUP_UPGRADED=1 "${installed}" "${ORIGINAL_ARGS[@]}"
+  fi
+  step "Already current: ${after}"
+}
+
+resolve_upgrade_bin() {
+  [[ -z "${UPGRADE_BIN}" ]] || return 0
+  local self_dir
+  self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  UPGRADE_BIN="${self_dir}/runner-upgrade"
+  [[ -x "${UPGRADE_BIN}" ]] || UPGRADE_BIN="$(command -v runner-upgrade)"
+}
+
+# Setup is complete only when every runner listens for jobs. This resumes
+# runners held by an interrupted maintenance or a failed start, and restarts
+# any that are crash-looping on a readiness gate.
+start_runners() {
+  resolve_upgrade_bin || { err "runner-upgrade not found; cannot start runners."; return 1; }
+  log "Starting runners and waiting until each one listens for jobs"
+  as_user "${UPGRADE_BIN}" start --runners "${RUNNERS}" --yes \
+    --health-timeout "$((DOCKER_TIMEOUT + 300))"
+}
+
 # Run a command as the real (non-root) user. Direct call if we already are that
 # user; otherwise drop privileges with sudo. We never set RUNNER_ALLOW_RUNASROOT,
 # so the runner's own root-refusal stays as a safety net.
@@ -737,12 +869,12 @@ bootout_system() {
 # One foreground Colima service per host, independent of any single runner.
 # No runner may accept a job until its own readiness gate succeeds.
 prepare_colima_boot() {
-  local self_dir colima_bin label="com.github.runner-colima" plist staged processes
+  local self_dir colima_bin label="com.github.runner-colima" plist staged
   self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   DOCKER_HELPER="${self_dir}/runner-docker-builder"
-  COLIMA_UPGRADE_BIN="${self_dir}/runner-upgrade"
+  UPGRADE_BIN="${self_dir}/runner-upgrade"
   [[ -x "${DOCKER_HELPER}" ]] || DOCKER_HELPER="$(command -v runner-docker-builder)" || return 1
-  [[ -x "${COLIMA_UPGRADE_BIN}" ]] || COLIMA_UPGRADE_BIN="$(command -v runner-upgrade)" || return 1
+  [[ -x "${UPGRADE_BIN}" ]] || UPGRADE_BIN="$(command -v runner-upgrade)" || return 1
   command -v python3 >/dev/null || { err "--colima requires python3"; return 1; }
   plist="${LAUNCH_DAEMON_DIR}/${label}.plist"
   if [[ "${COLIMA_INHERITED}" -eq 1 ]]; then
@@ -774,13 +906,11 @@ PYINHERIT
     if ! sudo launchctl print "system/${label}" >/dev/null 2>&1; then
       sudo launchctl bootstrap system "${plist}" || return 1
     fi
-    return 0
+    restart_colima_without_rosetta
+    return
   fi
   # Do not transition service ownership while any local CI worker is active.
-  processes="$(ps -axo comm=)" || { err "Cannot inspect active jobs"; return 1; }
-  if printf '%s\n' "${processes}" | grep -Eq '(^|/)Runner[.]Worker$'; then
-    err "Active runner job detected. Pause dispatch and let jobs finish before --colima setup."; return 1
-  fi
+  refuse_active_jobs "--colima setup" || return 1
   if [[ -e "${REAL_HOME}/Library/LaunchAgents/homebrew.mxcl.colima.plist"      || -e "${LAUNCH_DAEMON_DIR}/homebrew.mxcl.colima.plist" ]]; then
     err "Colima already has a Homebrew service. Stop that service between jobs before using --colima."; return 1
   fi
@@ -888,38 +1018,31 @@ PYPLIST
 }
 
 # Existing same-scope runners retain registration, caches and supervisor args
-# while startup settings are repaired. An explicit maintenance hold is retained.
+# while startup settings are repaired. Held runners are resumed: setup leaves
+# every runner listening for jobs.
 reconcile_runner_service() {
   local idx="$1" dir="$2" plist="$3" staged="${WORK_TMPDIR}/colima-runner-${1}.plist"
   stage_runner_plist "${plist}" "${staged}" "${dir}" || return 1
-  if [[ -z "${COLIMA_UPGRADE_BIN}" ]]; then
-    local self_dir
-    self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    COLIMA_UPGRADE_BIN="${self_dir}/runner-upgrade"
-    [[ -x "${COLIMA_UPGRADE_BIN}" ]] || COLIMA_UPGRADE_BIN="$(command -v runner-upgrade)" || return 1
-  fi
+  resolve_upgrade_bin || return 1
   if cmp -s "${staged}" "${plist}"; then
     remove_runner_launchagent "${dir}" || return 1
     sudo launchctl enable "system/com.github.runner-${idx}" || return 1
-    if [[ ! -e "${RUNNER_ROOT}/.maintenance/runner-${idx}" ]] \
-        && ! sudo launchctl print "system/com.github.runner-${idx}" >/dev/null 2>&1; then
-      as_user "${COLIMA_UPGRADE_BIN}" start --runner "${idx}" --yes \
+    if [[ -e "${RUNNER_ROOT}/.maintenance/runner-${idx}" ]] \
+        || ! sudo launchctl print "system/com.github.runner-${idx}" >/dev/null 2>&1; then
+      as_user "${UPGRADE_BIN}" start --runner "${idx}" --yes \
         --health-timeout "$((DOCKER_TIMEOUT + 300))" || return 1
     fi
     record_status "runner-${idx}" "LOADED (system service configuration retained)"
     return 0
   fi
-  local held=0
-  [[ ! -e "${RUNNER_ROOT}/.maintenance/runner-${idx}" ]] || held=1
-  as_user "${COLIMA_UPGRADE_BIN}" shutdown --runner "${idx}" --yes || return 1
+  as_user "${UPGRADE_BIN}" shutdown --runner "${idx}" --yes || return 1
   remove_runner_launchagent "${dir}" || return 1
   if ! { sudo cp "${staged}" "${plist}" && sudo chown root:wheel "${plist}"       && sudo chmod 644 "${plist}"; }; then
     err "Could not install system service; runner-${idx} remains in maintenance."; return 1
   fi
   sudo launchctl enable "system/com.github.runner-${idx}" || return 1
-  if [[ "${held}" -eq 0 ]]; then
-    as_user "${COLIMA_UPGRADE_BIN}" start --runner "${idx}" --yes       --health-timeout "$((DOCKER_TIMEOUT + 300))" || return 1
-  fi
+  as_user "${UPGRADE_BIN}" start --runner "${idx}" --yes \
+    --health-timeout "$((DOCKER_TIMEOUT + 300))" || return 1
   record_status "runner-${idx}" "System service updated (registration preserved)"
 }
 
@@ -1317,12 +1440,14 @@ print_summary() {
 # Main
 # ----------------------------------------------------------------------------
 main() {
+  ORIGINAL_ARGS=("$@")
   parse_args "$@"
   detect_platform
   require_cmds
   detect_user
   detect_arch
   detect_host
+  self_upgrade
   # Once a host opts in, autoscaled/new runners inherit the same boot gate.
   if [[ "${COLIMA}" -eq 0 && -f "${LAUNCH_DAEMON_DIR}/com.github.runner-colima.plist" ]]; then
     COLIMA=1
@@ -1340,6 +1465,8 @@ main() {
   fi
   ensure_sudo
   configure_power || return 1
+  configure_filevault || return 1
+  ensure_host_rosetta || return 1
   local staging_root="${TMPDIR:-/tmp}"
   [[ "${EUID}" -ne 0 ]] || staging_root=/tmp
   WORK_TMPDIR="$(mktemp -d "${staging_root}/runner-setup.XXXXXX")"
@@ -1418,10 +1545,11 @@ main() {
   done
 
   print_summary
+  start_runners || overall_rc=1
   if [[ "${overall_rc}" -ne 0 ]]; then
     err "One or more runners failed. See the summary above."
   else
-    log "All ${RUNNERS} runner(s) provisioned successfully."
+    log "All ${RUNNERS} runner(s) are listening for jobs."
   fi
   return "${overall_rc}"
 }

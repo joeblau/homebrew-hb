@@ -202,7 +202,7 @@ if [[ $1 == start ]]; then rm -f "$TEST_ROOT/runners/.maintenance/runner-1"; tou
         directory = self.existing_runner()
         before = (directory/'.runner').read_bytes()
         result = self.shell(self.CONFIG + '''
-COLIMA_UPGRADE_BIN="$TEST_ROOT/upgrade"
+UPGRADE_BIN="$TEST_ROOT/upgrade"
 configure_runner 1 || exit 91
 configure_runner 1 || exit 92
 ''')
@@ -215,15 +215,26 @@ configure_runner 1 || exit 92
         self.assertTrue(calls[1].startswith('start --runner 1'))
         self.assertEqual(self.read_plist()['EnvironmentVariables']['OPERATOR'],'keep & me')
 
-    def test_retrofit_preserves_existing_maintenance_hold(self):
+    def test_retrofit_resumes_runner_left_in_maintenance(self):
         self.existing_runner()
         hold = self.runner_root/'.maintenance'
         hold.mkdir()
         (hold/'runner-1').touch()
-        result = self.shell(self.CONFIG + 'COLIMA_UPGRADE_BIN="$TEST_ROOT/upgrade"; configure_runner 1')
+        result = self.shell(self.CONFIG + 'UPGRADE_BIN="$TEST_ROOT/upgrade"; configure_runner 1')
         self.assertEqual(result.returncode,0,result.stderr)
-        self.assertTrue((hold/'runner-1').exists())
-        self.assertNotIn('start ', (self.root/'upgrade-calls').read_text())
+        self.assertFalse((hold/'runner-1').exists())
+        self.assertTrue((self.root/'upgrade-calls').read_text().splitlines()[-1].startswith('start --runner 1'))
+
+    def test_unchanged_held_runner_is_started_again(self):
+        self.existing_runner()
+        first = self.shell(self.CONFIG + 'UPGRADE_BIN="$TEST_ROOT/upgrade"; configure_runner 1')
+        self.assertEqual(first.returncode,0,first.stderr)
+        (self.runner_root/'.maintenance/runner-1').touch()
+        result = self.shell(self.CONFIG + 'UPGRADE_BIN="$TEST_ROOT/upgrade"; configure_runner 1')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertFalse((self.runner_root/'.maintenance/runner-1').exists())
+        self.assertEqual((self.root/'upgrade-calls').read_text().splitlines()[-1].split()[:3],
+                         ['start','--runner','1'])
 
     def test_loaded_runner_without_colima_is_migrated_without_registering_again(self):
         directory = self.existing_runner()
@@ -238,7 +249,7 @@ configure_runner 1 || exit 92
         (directory/'_work/keep').write_text('workspace')
         (directory/'config.sh').write_text('#!/bin/bash\nexit 99\n')
         result = self.shell('''
-COLIMA=0; COLIMA_UPGRADE_BIN="$TEST_ROOT/upgrade"
+COLIMA=0; UPGRADE_BIN="$TEST_ROOT/upgrade"
 configure_runner 1 || exit 91
 configure_runner 1 || exit 92
 ''')
@@ -266,7 +277,7 @@ configure_runner 1 || exit 92
                 '--ram-scratch','--ram-scratch-mb','512']
         config['ProgramArguments'] = args
         (self.plists/'com.github.runner-1.plist').write_bytes(plistlib.dumps(config))
-        result = self.shell(self.CONFIG + 'COLIMA_UPGRADE_BIN="$TEST_ROOT/upgrade"; configure_runner 1')
+        result = self.shell(self.CONFIG + 'UPGRADE_BIN="$TEST_ROOT/upgrade"; configure_runner 1')
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertEqual(self.read_plist()['ProgramArguments'][5:],args)
 
@@ -287,7 +298,7 @@ sudo() {
 
     def prepare_gui_fixture(self):
         directory = self.existing_runner()
-        result = self.shell(self.CONFIG + 'COLIMA_UPGRADE_BIN="$TEST_ROOT/upgrade"; configure_runner 1')
+        result = self.shell(self.CONFIG + 'UPGRADE_BIN="$TEST_ROOT/upgrade"; configure_runner 1')
         self.assertEqual(result.returncode,0,result.stderr)
         agent = self.root/'home/Library/LaunchAgents/actions.runner.acme.ci-runner-1.plist'
         agent.parent.mkdir(parents=True)
@@ -298,7 +309,7 @@ sudo() {
     def test_login_agent_is_removed_even_when_system_configuration_is_unchanged(self):
         _, agent = self.prepare_gui_fixture()
         result = self.shell(self.CONFIG + self.GUI_FIXTURE + '''
-COLIMA_UPGRADE_BIN="$TEST_ROOT/upgrade"
+UPGRADE_BIN="$TEST_ROOT/upgrade"
 ps() { echo /sbin/launchd; }
 configure_runner 1
 ''')
@@ -310,7 +321,7 @@ configure_runner 1
     def test_active_login_agent_job_prevents_removal(self):
         directory, agent = self.prepare_gui_fixture()
         result = self.shell(self.CONFIG + self.GUI_FIXTURE + '''
-COLIMA_UPGRADE_BIN="$TEST_ROOT/upgrade"
+UPGRADE_BIN="$TEST_ROOT/upgrade"
 ps() { echo "$TEST_ROOT/runners/runner-1/bin/Runner.Worker"; }
 configure_runner 1
 ''')
@@ -325,7 +336,7 @@ configure_runner 1
         path=self.plists/'com.github.runner-1.plist'
         config=self.read_plist(); config['ProgramArguments']=['/operator/custom-wrapper']
         path.write_bytes(plistlib.dumps(config)); before=path.read_bytes()
-        result=self.shell(self.CONFIG+'COLIMA_UPGRADE_BIN="$TEST_ROOT/upgrade"; configure_runner 1')
+        result=self.shell(self.CONFIG+'UPGRADE_BIN="$TEST_ROOT/upgrade"; configure_runner 1')
         self.assertNotEqual(result.returncode,0)
         self.assertEqual(path.read_bytes(),before)
         self.assertFalse((self.root/'upgrade-calls').exists())
@@ -441,6 +452,8 @@ export TMPDIR="$TEST_ROOT"
 detect_platform() { :; }; require_cmds() { :; }; detect_user() { :; }
 detect_arch() { :; }; detect_host() { :; }; ensure_sudo() { :; }
 configure_power() { :; }  # host power configuration is isolated in test_runner_power
+configure_filevault() { :; }; ensure_host_rosetta() { :; }; self_upgrade() { :; }
+start_runners() { echo "started $RUNNERS"; }
 prepare_runner_archive() { :; }; prepare_root_dir() { :; }
 prepare_colima_boot() {
   [[ "$COLIMA" == 1 && "$COLIMA_INHERITED" == 1 ]] || return 1
@@ -453,6 +466,7 @@ main --org acme --token dummy --runners 3
         self.assertEqual((self.root/'prepared').read_text(), 'prepared\n')
         for index in range(1,4):
             self.assertIn(f'gated {index}', result.stdout)
+        self.assertIn('started 3', result.stdout)
 
     def test_tokenless_setup_rejects_missing_registration_before_mutations(self):
         result = self.shell('''

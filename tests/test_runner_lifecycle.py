@@ -64,7 +64,7 @@ prepare_runner_archive
 RUNNER_ROOT="$TEST_ROOT"; LAUNCH_DAEMON_DIR="$TEST_ROOT"
 WORK_TMPDIR="$TEST_ROOT/stage"
 REAL_USER=fixture; REAL_HOME="$TEST_ROOT/home"; REAL_UID=501
-COLIMA_UPGRADE_BIN=/must-not-restart; SCOPE_SLUG=Acme-Repo
+UPGRADE_BIN=/must-not-restart; SCOPE_SLUG=Acme-Repo
 RUNNER_URL=https://github.com/Acme/Repo
 as_user() { "$@"; }
 sudo() {
