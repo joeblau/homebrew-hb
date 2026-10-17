@@ -4,8 +4,8 @@
 class RunnerSetup < Formula
   desc "Provision and tear down GitHub Actions self-hosted runners on macOS"
   homepage "https://github.com/joeblau/homebrew-hb"
-  url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/v1.13.0.tar.gz"
-  sha256 "712883eddbe388ee0c2a017c34af52f9ba9944c49b0db79e1ef53e163703a8d8"
+  url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/v1.13.1.tar.gz"
+  sha256 "1941c914a2730b76b36ac856bc020727d1cd2fcfe5e71a8b884266c1b3f26476"
   license "MIT"
 
   depends_on "docker"
@@ -65,10 +65,16 @@ class RunnerSetup < Formula
       Existing same-scope runners need no new registration token. Enable this
       between jobs; preserve your existing scope and runner count.
 
-      On Apple Silicon, linux/amd64 containers run through Rosetta, never QEMU.
-      Runners stay offline until Rosetta is active. After upgrading, drain jobs:
+      On Apple Silicon, Colima setup installs missing Rosetta 2, accepting
+      Apple's license. linux/amd64 containers run through Rosetta, never QEMU.
+      Runners stay offline until Rosetta is active. For an existing VZ VM,
+      drain jobs and fully restart Colima after upgrading:
+        runner-upgrade shutdown --all --yes
         runner-docker-builder setup-colima
-        sudo launchctl kickstart -k system/com.github.runner-colima
+        sudo launchctl bootout system/com.github.runner-colima
+        colima stop default
+        sudo launchctl bootstrap system /Library/LaunchDaemons/com.github.runner-colima.plist
+        runner-upgrade start --all --yes
 
       Remove runners later (use a *removal* token to also deregister on GitHub):
         runner-cleanup --all --token REMOVE_TOKEN
