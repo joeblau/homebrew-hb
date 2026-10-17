@@ -25,6 +25,7 @@ case "$1" in
   -setremotelogin) [[ "$2" != on ]] || touch "$TEST_ROOT/remotelogin" ;;
 esac''',
     'tailscale': '''echo "$*" >> "$TEST_ROOT/tailscale-calls"
+while [[ "${1:-}" == --socket=* ]]; do shift; done
 case "$1" in
   status) [[ -f "$TEST_ROOT/ts-connected" ]] ;;
   up) touch "$TEST_ROOT/ts-connected" ;;
@@ -152,21 +153,33 @@ class HostBootTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.lines('systemsetup-calls'), [])
 
-    TAILSCALE_BREW = 'brew() { echo "$*" >> "$TEST_ROOT/brew-calls"; }\n'
+    TAILSCALE_BREW = ('brew() { echo "$*" >> "$TEST_ROOT/brew-calls"; }\n'
+                      'sleep() { :; }\n')
 
     def test_tailscale_service_is_started_and_login_warned_without_a_tty(self):
         result = self.shell(self.TAILSCALE_BREW + 'configure_tailscale')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('services start tailscale', self.lines('brew-calls'))
-        self.assertIn("run 'sudo tailscale up' once", result.stderr)
-        self.assertEqual(self.lines('tailscale-calls'), ['status'])
+        self.assertIn('sudo tailscale --socket=/var/run/tailscaled.socket up', result.stderr)
+        self.assertEqual(self.lines('tailscale-calls'),
+                         ['--socket=/var/run/tailscaled.socket status'])
+
+    def test_login_only_tailscale_agent_is_replaced_with_the_boot_service(self):
+        agent = self.root/'home/Library/LaunchAgents/homebrew.mxcl.tailscale.plist'
+        agent.parent.mkdir(parents=True)
+        agent.write_text('login-only')
+        result = self.shell(self.TAILSCALE_BREW + 'configure_tailscale')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(agent.exists())
+        self.assertIn('services stop tailscale', self.lines('brew-calls'))
+        self.assertIn('services start tailscale', self.lines('brew-calls'))
 
     def test_connected_tailscale_with_loaded_service_is_left_alone(self):
         (self.root/'ts-connected').touch()
         (self.root/'loaded-homebrew.mxcl.tailscale').touch()
         result = self.shell(self.TAILSCALE_BREW + 'configure_tailscale')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('Tailscale is connected', result.stderr)
+        self.assertIn('Tailscale boot service is connected', result.stderr)
         self.assertEqual(self.lines('brew-calls'), [])
 
     def test_running_menu_bar_app_is_called_out(self):

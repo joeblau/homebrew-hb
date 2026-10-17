@@ -55,9 +55,15 @@ Each run of `runner-setup` also:
 - **Runs tailscaled as a system service.** The Tailscale menu-bar app only
   connects after GUI login, so a rebooted, logged-out Mini vanishes from the
   tailnet. Setup installs the Tailscale CLI and starts its Homebrew system
-  service, which is reachable at the login window; `sudo tailscale up` runs
-  once interactively. Quit the menu-bar app afterwards — two tailscaled
-  processes fight over the tunnel. `--skip-tailscale` opts out.
+  service, which is reachable at the login window. The menu-bar app's login
+  does not carry over — it can even answer `tailscale status` for the
+  logged-in user and mask a logged-out boot daemon — so setup authenticates
+  against the boot service's own socket:
+  `sudo tailscale --socket=/var/run/tailscaled.socket up`, once,
+  interactively. The boot service registers as its own tailnet node; remove
+  the menu-bar app's old node in the Tailscale admin console, and quit the
+  app itself — two tailscaled processes fight over the tunnel.
+  `--skip-tailscale` opts out.
 - **Starts every runner and waits until it listens for jobs.** Runners left in
   maintenance by an interrupted upgrade, and runners crash-looping on a
   readiness gate, are restarted. Setup fails if any runner does not come

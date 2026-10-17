@@ -155,9 +155,10 @@ OPTIONS:
                         enable and continues.
   --skip-tailscale      Keep Tailscale as it is. By default, setup installs the
                         Tailscale CLI and runs tailscaled as a system service,
-                        so the Mac stays reachable at the login window; the
-                        one-time 'sudo tailscale up' login runs only in an
-                        interactive setup.
+                        so the Mac stays reachable at the login window. The
+                        one-time login targets that boot service's socket (the
+                        menu-bar app's own login does not count) and runs only
+                        in an interactive setup.
   --ephemeral           Make each runner ephemeral: instead of pointing the
                         LaunchDaemon at bin/runsvc.sh directly, point it at the
                         runner-ephemeral supervisor, which re-registers the
@@ -634,6 +635,17 @@ configure_tailscale() {
     warn "The Tailscale menu-bar app is running. It only connects after GUI login"
     warn "and conflicts with the boot service. Quit it and remove its Login Item."
   fi
+  local ts_bin
+  ts_bin="$(command -v tailscale)" || { warn "tailscale CLI not found; skipping."; return 0; }
+  # `brew services start` without sudo installs a login-only agent that leaves
+  # the Mac unreachable at the login window; replace it with the boot service.
+  if [[ -e "${REAL_HOME}/Library/LaunchAgents/homebrew.mxcl.tailscale.plist" ]]; then
+    warn "Replacing the login-only Tailscale service with the boot service."
+    as_user "${brew_bin}" services stop tailscale >/dev/null 2>&1 || true
+    sudo launchctl asuser "${REAL_UID}" launchctl bootout \
+      "gui/${REAL_UID}/homebrew.mxcl.tailscale" 2>/dev/null || true
+    as_user rm -f "${REAL_HOME}/Library/LaunchAgents/homebrew.mxcl.tailscale.plist" || true
+  fi
   if sudo launchctl print system/homebrew.mxcl.tailscale >/dev/null 2>&1; then
     step "Tailscale system service is already loaded"
   else
@@ -641,15 +653,30 @@ configure_tailscale() {
     sudo "${brew_bin}" services start tailscale \
       || { warn "Could not start the Tailscale system service."; return 0; }
   fi
-  if tailscale status >/dev/null 2>&1; then
-    step "Tailscale is connected"
+  # A plain `tailscale status` can be answered by the menu-bar app's daemon
+  # for the logged-in user, which made setup skip authentication while the
+  # BOOT daemon stayed logged out (and the Mac vanished from the tailnet at
+  # the login window). Pin every query to the system daemon's socket.
+  local ts_socket=/var/run/tailscaled.socket _i
+  for _i in 1 2 3 4 5 6 7 8 9 10; do
+    [[ ! -S "${ts_socket}" ]] || break
+    sleep 1
+  done
+  if sudo "${ts_bin}" --socket="${ts_socket}" status >/dev/null 2>&1; then
+    step "Tailscale boot service is connected"
     return 0
   fi
   if [[ -t 0 ]]; then
-    log "Authenticating Tailscale (follow the login URL it prints)"
-    sudo tailscale up || warn "Tailscale login failed; run 'sudo tailscale up' once."
+    log "Authenticating the Tailscale boot service (follow the login URL it prints)"
+    if sudo "${ts_bin}" --socket="${ts_socket}" up \
+        && sudo "${ts_bin}" --socket="${ts_socket}" status >/dev/null 2>&1; then
+      step "Tailscale boot service is connected"
+    else
+      warn "Tailscale boot service is still not logged in; run:"
+      warn "  sudo tailscale --socket=${ts_socket} up"
+    fi
   else
-    warn "Tailscale is installed but not logged in; run 'sudo tailscale up' once."
+    warn "Tailscale boot service is not logged in; run: sudo tailscale --socket=${ts_socket} up"
   fi
   return 0
 }
