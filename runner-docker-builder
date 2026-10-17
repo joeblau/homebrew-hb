@@ -28,9 +28,10 @@
 # Run as the same non-root user as the runner service (see runner-setup).
 # Client/Colima configuration uses that user's directories; BuildKit state
 # lives on its Docker host. Homebrew manages CLI installations in its prefix.
-# This script never invokes sudo on the macOS host and never changes runner
-# LaunchDaemons. Writing buildkitd.toml inside the throwaway Colima VM uses
-# that VM's own non-interactive (passwordless) sudo via `colima ssh`.
+# setup-colima uses sudo on the macOS host only to install missing Rosetta 2
+# on Apple Silicon. The script never changes runner LaunchDaemons. Writing
+# buildkitd.toml inside the throwaway Colima VM uses that VM's own
+# non-interactive (passwordless) sudo via `colima ssh`.
 
 set -euo pipefail
 
@@ -202,9 +203,11 @@ LAYER CACHING:
 SECURITY NOTE:
   Run as the same non-root user that runs the runner daemons. Use SSH keys
   or a service-accessible SSH agent, never passwords on the command line.
-  Registry credentials should come from CI secrets. The script never invokes
-  sudo on the macOS host (gc configure --colima-vm uses the Colima VM's own
-  non-interactive sudo); Homebrew installs tooling into its configured prefix.
+  Registry credentials should come from CI secrets. On Apple Silicon,
+  setup-colima installs missing Rosetta 2 with sudo softwareupdate
+  --install-rosetta --agree-to-license, accepting Apple's license. Other host
+  operations run without sudo; gc configure --colima-vm uses the VM's own sudo.
+  Homebrew installs tooling into its configured prefix.
   The registry mirror binds to loopback/local-network addresses only.
 EOF
 }
@@ -556,6 +559,35 @@ rosetta_wanted() {
   [[ "$(uname -m)" == arm64 && "${RUNNER_ALLOW_QEMU:-0}" != 1 ]]
 }
 
+# Colima checks for host Rosetta when generating the VM configuration. Install
+# it first so a new VZ VM does not silently start without Linux translation.
+ensure_rosetta() {
+  rosetta_wanted || return 0
+  local c
+  for c in pkgutil sudo softwareupdate; do
+    if ! command -v "${c}" >/dev/null 2>&1; then
+      err "Rosetta 2 setup requires ${c}."
+      return 1
+    fi
+  done
+  if pkgutil --pkg-info com.apple.pkg.RosettaUpdateAuto >/dev/null 2>&1; then
+    step "Rosetta 2 is already installed"
+    return 0
+  fi
+
+  log "Installing Rosetta 2 for Colima (accepting Apple's license)"
+  if ! sudo softwareupdate --install-rosetta --agree-to-license; then
+    err "Rosetta 2 installation failed; Colima setup stopped."
+    err "Retry: sudo softwareupdate --install-rosetta --agree-to-license"
+    return 1
+  fi
+  if ! pkgutil --pkg-info com.apple.pkg.RosettaUpdateAuto >/dev/null 2>&1; then
+    err "Rosetta 2 installation could not be verified; Colima setup stopped."
+    return 1
+  fi
+  step "Rosetta 2 installed"
+}
+
 # Persist rosetta: true / binfmt: false so every VM boot skips QEMU
 # registration. Succeeds only when it changed the file.
 colima_rosetta_config() {
@@ -598,6 +630,8 @@ setup_colima() {
     err "Homebrew is required for setup-colima (brew install colima docker docker-buildx)."
     exit 1
   fi
+
+  ensure_rosetta || return 1
 
   log "Installing colima, docker CLI, and buildx via Homebrew (as $(whoami))"
   brew install colima docker docker-buildx
@@ -912,7 +946,7 @@ gc_configure() {
 # The Colima VM docker daemon's embedded BuildKit (plain `docker build` on the
 # default builder) reads /etc/buildkit/buildkitd.toml inside the VM. The file
 # is root-owned, so the write uses the VM's non-interactive sudo via colima ssh;
-# no sudo is ever invoked on the macOS host.
+# this command does not need sudo on the macOS host.
 gc_configure_colima_vm() {
   if ! command -v colima >/dev/null 2>&1; then
     err "colima not found. Install it with: brew install colima"

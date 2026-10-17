@@ -19,7 +19,7 @@
 #
 # The GitHub Actions runner refuses to run as root unless RUNNER_ALLOW_RUNASROOT=1.
 # We intentionally NEVER set that: config.sh / runsvc.sh always run as the real
-# user, while only privileged filesystem and launchd operations use sudo.
+# user, while privileged setup and launchd operations use sudo.
 
 set -euo pipefail
 
@@ -125,8 +125,10 @@ OPTIONS:
                         re-run (runner-cleanup it first to actually rename it).
   --colima              Start Colima at boot as the runner user and wait for
                         Docker before starting each runner. Installs Colima,
-                        Docker CLI and Buildx if needed. Updates existing
-                        same-scope runners without re-registering them.
+                        Docker CLI and Buildx if needed. On Apple Silicon,
+                        installs missing Rosetta 2, accepting Apple's license.
+                        Updates existing same-scope runners without
+                        re-registering them.
   --docker-timeout N    Docker readiness timeout in seconds (default: 300;
                         maximum: 3600). launchd retries failed starts.
   --ephemeral           Make each runner ephemeral: instead of pointing the

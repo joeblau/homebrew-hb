@@ -30,6 +30,21 @@ def inspect(builder):
     print("Status:        running\nPlatforms:     linux/arm64")
 if name == "uname":
     print({"-s": "Darwin", "-m": state.get("arch", "arm64"), "-r": "25.0.0"}[args[0]])
+elif name == "pkgutil":
+    assert args == ["--pkg-info", "com.apple.pkg.RosettaUpdateAuto"], args
+    sys.exit(0 if state.get("rosetta_installed", False) else 1)
+elif name == "sudo":
+    assert args == ["softwareupdate", "--install-rosetta", "--agree-to-license"], args
+    if state.get("sudo_rc"):
+        sys.exit(state["sudo_rc"])
+    os.execvp(args[0], args)
+elif name == "softwareupdate":
+    assert args == ["--install-rosetta", "--agree-to-license"], args
+    if state.get("rosetta_install_rc"):
+        sys.exit(state["rosetta_install_rc"])
+    if not state.get("rosetta_receipt_missing"):
+        state["rosetta_installed"] = True
+        save()
 elif name == "brew":
     if args == ["--prefix", "docker-buildx"]:
         print(root / "brew-buildx")
@@ -129,7 +144,7 @@ class BuilderTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.bin = self.root / "bin"
         self.bin.mkdir()
-        for name in ("docker", "brew", "colima", "uname"):
+        for name in ("docker", "brew", "colima", "uname", "pkgutil", "sudo", "softwareupdate"):
             path = self.bin / name
             path.write_text(f"#!{sys.executable}\n" + MOCK)
             path.chmod(0o755)
@@ -172,6 +187,7 @@ class BuilderTests(unittest.TestCase):
         self.remote()
         self.assertIn(["docker", "--host", "ssh://ci@builder:2222", "info", "--format", "{{.OSType}}"], self.calls())
         self.assertIn(["docker", "buildx", "create", "--name", "runner-remote", "--driver", "docker-container", "ssh://ci@builder:2222"], self.calls())
+        self.assertFalse(any(c[0] in ("pkgutil", "sudo", "softwareupdate") for c in self.calls()))
 
     def test_repeat_setup_reuses_warm_builder(self):
         self.remote()
@@ -245,6 +261,37 @@ class BuilderTests(unittest.TestCase):
     def rosetta_ssh(self):
         return [c for c in self.calls() if c[:1] == ["colima"] and "qemu-x86_64" in " ".join(c)]
 
+    def test_missing_rosetta_is_installed_once_before_colima_starts(self):
+        self.run_helper("setup-colima")
+        self.run_helper("setup-colima")
+        calls = self.calls()
+        installer = ["softwareupdate", "--install-rosetta", "--agree-to-license"]
+        self.assertEqual(calls.count(installer), 1)
+        start = next(c for c in calls if c[:2] == ["colima", "start"])
+        self.assertLess(calls.index(installer), calls.index(start))
+        self.assertTrue(json.loads((self.root / "state.json").read_text())["rosetta_installed"])
+
+    def test_installed_rosetta_needs_no_sudo_or_installation(self):
+        self.write_state({"rosetta_installed": True})
+        result = self.run_helper("setup-colima")
+        self.assertIn("Rosetta 2 is already installed", result.stderr)
+        self.assertFalse(any(c[0] in ("sudo", "softwareupdate") for c in self.calls()))
+
+    def test_rosetta_installation_failure_stops_before_colima_setup(self):
+        for failure in ({"rosetta_install_rc": 1}, {"sudo_rc": 1}):
+            with self.subTest(failure=failure):
+                self.write_state(failure)
+                result = self.run_helper("setup-colima", success=False)
+                self.assertIn("Rosetta 2 installation failed", result.stderr)
+                self.assertIn("sudo softwareupdate --install-rosetta", result.stderr)
+                self.assertFalse(any(c[0] in ("brew", "colima", "docker") for c in self.calls()))
+
+    def test_successful_installer_without_rosetta_stops_before_colima_setup(self):
+        self.write_state({"rosetta_receipt_missing": True})
+        result = self.run_helper("setup-colima", success=False)
+        self.assertIn("installation could not be verified", result.stderr)
+        self.assertFalse(any(c[0] in ("brew", "colima", "docker") for c in self.calls()))
+
     def test_new_arm_vm_uses_rosetta_and_strips_qemu(self):
         self.run_helper("setup-colima")
         start = next(c for c in self.calls() if c[:2] == ["colima", "start"])
@@ -279,11 +326,13 @@ class BuilderTests(unittest.TestCase):
         start = next(c for c in self.calls() if c[:2] == ["colima", "start"])
         self.assertNotIn("--vz-rosetta", start)
         self.assertEqual(self.rosetta_ssh(), [])
+        self.assertFalse(any(c[0] in ("pkgutil", "sudo", "softwareupdate") for c in self.calls()))
 
     def test_intel_host_skips_rosetta(self):
         self.write_state({"arch": "x86_64"})
         self.run_helper("setup-colima")
         self.assertEqual(self.rosetta_ssh(), [])
+        self.assertFalse(any(c[0] in ("pkgutil", "sudo", "softwareupdate") for c in self.calls()))
 
     def test_colima_rejects_builder_pointing_at_desktop(self):
         self.write_state({"colima_running": True, "builders": {"runner-colima": {"driver": "docker-container", "endpoint": "desktop-linux"}}})

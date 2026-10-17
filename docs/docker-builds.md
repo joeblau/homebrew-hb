@@ -62,10 +62,18 @@ the same builds reliably and much faster.
 
 `setup-colima` therefore:
 
+- installs missing Rosetta 2 on the Mac before starting Colima, using
+  `sudo softwareupdate --install-rosetta --agree-to-license` (accepting Apple's
+  license); installation failure stops setup before any VM provisioning;
 - creates new VZ profiles with `--vz-rosetta --binfmt=false`;
 - rewrites an existing VZ profile's `colima.yaml` to `rosetta: true` and
   `binfmt: false` (a running VM picks this up on its next start);
 - removes the live `qemu-x86_64`/`qemu-i386` handlers from the running VM.
+
+This also applies to `runner-setup --colima`, which calls `setup-colima`.
+An existing Rosetta installation is reused. Intel Macs, remote builders, and
+hosts opting out with `RUNNER_ALLOW_QEMU=1` skip Rosetta installation. See
+[Lima's Rosetta installation guidance](https://lima-vm.io/docs/faq/#lima-gets-stuck-at-installing-rosetta).
 
 `wait-colima`, which gates every runner started by `runner-setup --colima`,
 repeats the removal on every runner start. The runner stays offline if QEMU
@@ -74,10 +82,19 @@ QEMU. It also stays offline on a non-VZ (QEMU-engine) profile, which cannot
 use Rosetta. To move an existing runner host to Rosetta, drain its jobs, then:
 
 ```sh
-runner-docker-builder setup-colima                        # writes colima.yaml
-sudo launchctl kickstart -k system/com.github.runner-colima   # restart the VM
-colima ssh -- ls /proc/sys/fs/binfmt_misc                 # rosetta, no qemu-*
+runner-upgrade shutdown --all --yes
+runner-docker-builder setup-colima   # installs Rosetta and writes colima.yaml
+sudo launchctl bootout system/com.github.runner-colima
+colima stop default
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.github.runner-colima.plist
+runner-upgrade start --all --yes
+colima ssh -- cat /proc/sys/fs/binfmt_misc/rosetta   # first line: enabled
 ```
+
+Restart the VM itself after changing Rosetta settings; restarting only its
+foreground supervisor can leave the existing VM running with the old settings.
+Existing non-VZ profiles cannot enable Rosetta; preserve their data and migrate
+to a VZ profile separately instead of deleting them during runner setup.
 
 Jobs that run `docker/setup-qemu-action` or `tonistiigi/binfmt --install`
 re-register QEMU until the next runner start; remove those steps from Mac
@@ -346,7 +363,7 @@ colima stop && colima start   # between jobs, to load the new policy
 ```
 
 The VM write uses the Colima VM's own non-interactive sudo via `colima ssh`;
-the script never invokes sudo on the macOS host.
+this command does not need sudo on the macOS host.
 
 ## Registry mirror (pull-through cache)
 
