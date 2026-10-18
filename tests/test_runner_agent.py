@@ -10,7 +10,8 @@ import unittest
 
 
 REPO = Path(__file__).resolve().parents[1]
-SCRIPT = REPO / "runner-agent"
+BIN = REPO / "bin"
+SCRIPT = BIN / "runner-agent"
 
 # Multi-line bodies are folded onto one log line so calls() stays one-per-call.
 FAKE_GH = r'''#!/bin/bash
@@ -46,7 +47,7 @@ class RunnerAgentBase(unittest.TestCase):
         self.write_exe("gh", FAKE_GH)
         self.write_exe("claude", FAKE_CLAUDE)
         # runner-mcp is resolved next to the script; a symlinked bin dir keeps it real.
-        (self.bin / "runner-mcp").symlink_to(REPO / "runner-mcp")
+        (self.bin / "runner-mcp").symlink_to(BIN / "runner-mcp")
         (self.bin / "runner-agent").symlink_to(SCRIPT)
         self.state = self.root / "temp"
         self.state.mkdir()

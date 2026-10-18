@@ -17,11 +17,12 @@ from test_runner_docker_builder import MOCK as DOCKER_MOCK  # noqa: E402
 
 
 REPO = Path(__file__).resolve().parents[1]
+BIN = REPO / "bin"
 
 
 def definitions(script):
     """Script body with its top-level main call removed, for sourcing."""
-    text = (REPO / script).read_text()
+    text = (BIN / script).read_text()
     if '\nif [[ "${BASH_SOURCE[0]}"' in text:
         return text.rsplit('\nif [[ "${BASH_SOURCE[0]}"', 1)[0]
     return text.rsplit('main "$@"', 1)[0]
@@ -192,7 +193,7 @@ JSON=1
 cmd_status
 '''
             result = subprocess.run(
-                ["/bin/bash", "-c", prelude, "test", str(REPO / "runner-cache"), str(root)],
+                ["/bin/bash", "-c", prelude, "test", str(BIN / "runner-cache"), str(root)],
                 text=True, capture_output=True, timeout=20,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -223,7 +224,7 @@ class DockerBuilderStatusJsonTests(unittest.TestCase):
             env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "HOME": str(root),
                    "DOCKER_CONFIG": str(root), "MOCK_ROOT": str(root)}
             result = subprocess.run(
-                ["/bin/bash", str(REPO / "runner-docker-builder"), "status", "--json"],
+                ["/bin/bash", str(BIN / "runner-docker-builder"), "status", "--json"],
                 env=env, text=True, capture_output=True, timeout=20,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -262,7 +263,7 @@ class RunnerMcpTests(unittest.TestCase):
     def serve(self, *messages, env=None):
         stdin = "".join(json.dumps(m) + "\n" if isinstance(m, dict) else m + "\n" for m in messages)
         result = subprocess.run(
-            ["/bin/bash", str(REPO / "runner-mcp")],
+            ["/bin/bash", str(BIN / "runner-mcp")],
             input=stdin, text=True, capture_output=True, timeout=30,
             env={**os.environ, "RUNNER_MCP_BIN_DIR": str(self.bin),
                  "RUNNER_MCP_TEST_CALLS": str(self.calls), **(env or {})},
@@ -346,10 +347,10 @@ class RunnerMcpTests(unittest.TestCase):
         self.assertIn("not installed", replies[1]["result"]["content"][0]["text"])
 
     def test_list_prints_catalogue_and_help_documents_usage(self):
-        listing = subprocess.run(["/bin/bash", str(REPO / "runner-mcp"), "--list"], text=True, capture_output=True, timeout=20)
+        listing = subprocess.run(["/bin/bash", str(BIN / "runner-mcp"), "--list"], text=True, capture_output=True, timeout=20)
         self.assertEqual(listing.returncode, 0, listing.stderr)
         self.assertEqual(len(json.loads(listing.stdout)), 7)
-        helptext = subprocess.run(["/bin/bash", str(REPO / "runner-mcp"), "--help"], text=True, capture_output=True, timeout=20)
+        helptext = subprocess.run(["/bin/bash", str(BIN / "runner-mcp"), "--help"], text=True, capture_output=True, timeout=20)
         self.assertIn("USAGE", helptext.stderr)
 
 

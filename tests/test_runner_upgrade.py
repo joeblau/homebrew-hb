@@ -9,7 +9,7 @@ import tempfile
 import unittest
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "runner-upgrade"
+SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "runner-upgrade"
 
 
 class RunnerUpgradeTests(unittest.TestCase):

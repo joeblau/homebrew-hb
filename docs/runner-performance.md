@@ -250,7 +250,7 @@ production numbers can be compared in one aggregator.
 
 ```sh
 python3 -m unittest discover -s tests -p 'test_runner_*.py' -v
-for tool in runner-*; do /bin/bash -n "$tool"; done
+for tool in bin/runner-*; do /bin/bash -n "$tool"; done
 ruby -c Formula/runner-setup.rb
 git diff --check
 ```

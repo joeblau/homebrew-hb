@@ -8,7 +8,7 @@ import tempfile
 import unittest
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "runner-bazel-cache"
+SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "runner-bazel-cache"
 
 
 def scope_slug(kind, scope):

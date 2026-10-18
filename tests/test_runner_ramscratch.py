@@ -14,11 +14,12 @@ import tempfile
 import unittest
 
 REPO = Path(__file__).resolve().parents[1]
+BIN = REPO / "bin"
 
 
 def definitions(script):
     """Script body with its top-level main call removed, for sourcing."""
-    text = (REPO / script).read_text()
+    text = (BIN / script).read_text()
     if '\nif [[ "${BASH_SOURCE[0]}"' in text:
         return text.rsplit('\nif [[ "${BASH_SOURCE[0]}"', 1)[0]
     return text.rsplit('main "$@"', 1)[0]
@@ -103,7 +104,7 @@ class RamScratchHelperTests(unittest.TestCase):
             text=True, capture_output=True)
 
     def run_cli(self, *args):
-        return subprocess.run(["/bin/bash", str(REPO / "runner-ramscratch"), *args],
+        return subprocess.run(["/bin/bash", str(BIN / "runner-ramscratch"), *args],
                               text=True, capture_output=True)
 
     # --- usage ------------------------------------------------------------
@@ -512,7 +513,7 @@ prepare_sandbox_profile || exit 97
 
     def test_ram_scratch_requires_explicit_sizing(self):
         result = subprocess.run(
-            ["/bin/bash", str(REPO / "runner-ephemeral"),
+            ["/bin/bash", str(BIN / "runner-ephemeral"),
              "--dir", "/tmp/x", "--org", "acme", "--ram-scratch"],
             text=True, capture_output=True)
         self.assertEqual(result.returncode, 2)
@@ -520,7 +521,7 @@ prepare_sandbox_profile || exit 97
 
     def test_env_var_enables_ram_scratch(self):
         result = subprocess.run(
-            ["/bin/bash", str(REPO / "runner-ephemeral"),
+            ["/bin/bash", str(BIN / "runner-ephemeral"),
              "--dir", "/tmp/x", "--org", "acme"],
             env=dict(os.environ, RUNNER_RAMSCRATCH="1"),
             text=True, capture_output=True)

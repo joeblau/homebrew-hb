@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 import unittest
 
-SCRIPT = Path(__file__).resolve().parents[1] / "runner-logs"
+SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "runner-logs"
 
 PRELUDE = r'''
 source "$1"

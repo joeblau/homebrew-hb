@@ -12,7 +12,7 @@ import subprocess
 import tempfile
 import unittest
 
-SCRIPT = Path(__file__).resolve().parents[1] / "runner-bench"
+SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "runner-bench"
 
 PRELUDE = r'''
 source "$1"
@@ -325,7 +325,7 @@ main run --reps 1 --interval 1 --workdir "${WORKDIR}" --results-dir "${RESULTS_D
         self.assertTrue(any("fewer than 5" in w for w in data["comparisons"][0]["warnings"]))
 
     def test_documented_workload_runs_five_repetitions_in_all_scenarios(self):
-        doc = (SCRIPT.parent / "docs/runner-performance.md").read_text()
+        doc = (SCRIPT.parents[1] / "docs/runner-performance.md").read_text()
         workload = doc.split("BENCH=$(cat <<'WORKLOAD'\n", 1)[1].split("\nWORKLOAD\n", 1)[0]
         for scenario in ("cold", "warm", "edited"):
             body = "WL=$(cat <<'DOCWORKLOAD'\n" + workload + "\nDOCWORKLOAD\n)\n"

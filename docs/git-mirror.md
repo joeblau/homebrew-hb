@@ -154,9 +154,6 @@ percentage here.
   and `/opt/github-runner-git/logs/update-stderr.log`.
 - If the timer plist was removed manually, re-run any `add` (after `remove`)
   to reinstall it.
-- The tool ships in this repository but is not yet wired into
-  `Formula/runner-setup.rb`; run it from a checkout or install it on PATH
-  yourself.
 
 | Command | Behavior |
 | --- | --- |

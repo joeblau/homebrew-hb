@@ -11,6 +11,7 @@ import tempfile
 import unittest
 
 REPO = Path(__file__).resolve().parents[1]
+BIN = REPO / "bin"
 
 
 class LifecycleTests(unittest.TestCase):
@@ -21,7 +22,7 @@ class LifecycleTests(unittest.TestCase):
 
     def shell(self, script, body, **env):
         # Evaluate the function definitions, excluding the sole CLI entrypoint.
-        text = (REPO / script).read_text()
+        text = (BIN / script).read_text()
         if '\nif [[ "${BASH_SOURCE[0]}"' in text:
             definitions = text.rsplit('\nif [[ "${BASH_SOURCE[0]}"', 1)[0]
         else:

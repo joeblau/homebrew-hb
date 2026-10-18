@@ -11,7 +11,7 @@ import tempfile
 import unittest
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "clear-mac"
+SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "clear-mac"
 DOMAINS = ("com.apple.dock", "com.apple.WindowManager")
 MOCK = r'''
 import json, os, pathlib, subprocess, sys

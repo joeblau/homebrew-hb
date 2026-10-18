@@ -20,11 +20,12 @@ import tempfile
 import unittest
 
 REPO = Path(__file__).resolve().parents[1]
+BIN = REPO / "bin"
 
 
 def definitions(script):
     """Script body with its top-level main call removed, for sourcing."""
-    text = (REPO / script).read_text()
+    text = (BIN / script).read_text()
     if '\nif [[ "${BASH_SOURCE[0]}"' in text:
         return text.rsplit('\nif [[ "${BASH_SOURCE[0]}"', 1)[0]
     return text.rsplit('main "$@"', 1)[0]
@@ -527,7 +528,7 @@ class PruneToolCacheTests(unittest.TestCase):
 
     def run_prune(self, *args, **env):
         return subprocess.run(
-            ["/bin/bash", str(REPO / "runner-prune"), "--runners-dir", str(self.fleet), *args],
+            ["/bin/bash", str(BIN / "runner-prune"), "--runners-dir", str(self.fleet), *args],
             env=dict(self.env, **env), capture_output=True, text=True)
 
     def test_hook_prune_keeps_persistent_tool_cache(self):

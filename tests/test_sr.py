@@ -11,14 +11,15 @@ import unittest
 
 
 REPO = Path(__file__).resolve().parents[1]
+BIN = REPO / "bin"
 MAGICK = shutil.which("magick")
 
 
 class SrCliTests(unittest.TestCase):
     def test_help_and_version_need_no_dependencies(self):
-        for option, expected in (("--help", "super-resolution"), ("--version", "sr 0.2.0")):
+        for option, expected in (("--help", "super-resolution"), ("--version", "sr 0.2.1")):
             result = subprocess.run(
-                [sys.executable, str(REPO / "sr"), option],
+                [sys.executable, str(BIN / "sr"), option],
                 env={**os.environ, "PATH": ""}, capture_output=True, text=True,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -44,7 +45,7 @@ class SrCliTests(unittest.TestCase):
         ):
             with self.subTest(args=args):
                 result = subprocess.run(
-                    [sys.executable, str(REPO / "sr"), *args], capture_output=True, text=True,
+                    [sys.executable, str(BIN / "sr"), *args], capture_output=True, text=True,
                 )
                 self.assertEqual(result.returncode, 2)
                 self.assertIn(expected, result.stderr)
@@ -114,7 +115,7 @@ subprocess.run([*command, target], check=True)
 
     def sr(self, *args, **env):
         result = subprocess.run(
-            [sys.executable, str(REPO / "sr"), *map(str, args)],
+            [sys.executable, str(BIN / "sr"), *map(str, args)],
             env={**self.env, **env}, capture_output=True, text=True,
         )
         self.assertEqual(self.source.read_bytes(), self.original)

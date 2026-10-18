@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 import unittest
 
-SCRIPT = Path(__file__).resolve().parents[1] / "runner-autoscale"
+SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "runner-autoscale"
 
 
 class AutoscaleTests(unittest.TestCase):

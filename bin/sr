@@ -11,7 +11,7 @@ import sys
 import tempfile
 
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 MODELS = {"photo": "realesrgan-x4plus", "anime": "realesrgan-x4plus-anime"}
 OUTPUT_FORMATS = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp", ".heic", ".avif"}
 

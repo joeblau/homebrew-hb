@@ -7,7 +7,7 @@ import tempfile
 import unittest
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "runner-cache"
+SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "runner-cache"
 
 
 class RunnerCacheTests(unittest.TestCase):

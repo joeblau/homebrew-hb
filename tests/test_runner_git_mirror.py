@@ -15,7 +15,7 @@ import tempfile
 import unittest
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "runner-git-mirror"
+SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "runner-git-mirror"
 
 
 class RunnerGitMirrorTests(unittest.TestCase):

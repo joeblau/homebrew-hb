@@ -4,6 +4,15 @@
 brew tap joeblau/hb
 ```
 
+| Path | Contents |
+| --- | --- |
+| `Formula/` | Homebrew formulas (`formula_renames.json` maps renamed ones) |
+| `bin/` | Every installable script; formulas install from here |
+| `agent-mcp/` | Rust source for the `agent-mcp` formula |
+| `docs/` | Per-tool guides |
+| `tests/` | Isolated regression tests (`python3 -m unittest discover -s tests`) |
+| `Brewfile` | Bootstrap bundle for a fresh runner Mac |
+
 ## Image super-resolution (`sr` formula)
 
 Upscale images locally with Real-ESRGAN on Apple Silicon or Intel Macs:
@@ -80,6 +89,7 @@ launchd so it runs independently of the owner's GUI session.
 - `runner-ephemeral` — one-job runners, re-registered fresh after every job, with opt-in sandbox-exec confinement and APFS snapshot rollback ([docs](docs/ephemeral-runners.md))
 - `runner-prune` — scoped checkout cleanup that preserves warm caches, with a free-space floor ([docs](docs/disk-cleanup.md))
 - `runner-health` — liveness watchdog with stuck/offline detection and alerts ([docs](docs/health-checks.md))
+- `runner-tailscale-guard` — reboots the host, idle-first, before tailscaled's kernel refcount leak panics macOS; installed by setup ([docs](docs/boot-startup.md))
 - `runner-cache` — local S3-compatible (MinIO) storage for an S3-aware cache action, plus an optional GitHub Actions cache-protocol gateway for stock `actions/cache` ([docs](docs/cache-backend.md))
 - `runner-bazel-cache` — per-scope Bazel remote cache service (bazel-remote) as LaunchDaemons ([docs](docs/bazel-cache.md))
 - `runner-sccache` — opt-in per-scope sccache compiler caches on persistent SSD storage ([docs](docs/compiler-cache.md))

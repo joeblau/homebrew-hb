@@ -8,6 +8,7 @@ import unittest
 
 
 REPO = Path(__file__).resolve().parents[1]
+BIN = REPO / "bin"
 
 
 class MaintenanceControllerTests(unittest.TestCase):
@@ -28,7 +29,7 @@ class MaintenanceControllerTests(unittest.TestCase):
         (self.root / "plists" / f"com.github.{name}.plist").touch()
 
     def shell(self, script, body):
-        definitions = (REPO / script).read_text()
+        definitions = (BIN / script).read_text()
         if script == "runner-health":
             definitions = definitions.rsplit('main "$@"', 1)[0]
         else:

@@ -15,7 +15,8 @@ import tempfile
 import unittest
 
 REPO = Path(__file__).resolve().parents[1]
-GUARD = REPO / "runner-tailscale-guard"
+BIN = REPO / "bin"
+GUARD = BIN / "runner-tailscale-guard"
 
 FAKES = {
     # Counter lives in $TEST_ROOT/metrics as raw `name value` lines.

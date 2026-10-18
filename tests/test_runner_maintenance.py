@@ -9,7 +9,7 @@ import tempfile
 import unittest
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "runner-upgrade"
+SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "runner-upgrade"
 DELETED_REGISTRATION = (
     "Failed to create a session. The runner registration has been deleted "
     "from the server, please re-configure."

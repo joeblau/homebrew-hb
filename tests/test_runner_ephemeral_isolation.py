@@ -8,11 +8,12 @@ import tempfile
 import unittest
 
 REPO = Path(__file__).resolve().parents[1]
+BIN = REPO / "bin"
 
 
 def definitions(script):
     """Script body with its top-level main call removed, for sourcing."""
-    text = (REPO / script).read_text()
+    text = (BIN / script).read_text()
     if '\nif [[ "${BASH_SOURCE[0]}"' in text:
         return text.rsplit('\nif [[ "${BASH_SOURCE[0]}"', 1)[0]
     return text.rsplit('main "$@"', 1)[0]
@@ -203,7 +204,7 @@ if ! run_cycle; then exit 99; fi
 
 class CliTests(unittest.TestCase):
     def run_cli(self, *args):
-        return subprocess.run(["/bin/bash", str(REPO / "runner-ephemeral"), *args],
+        return subprocess.run(["/bin/bash", str(BIN / "runner-ephemeral"), *args],
                               text=True, capture_output=True)
 
     def test_help_lists_hardening_options(self):

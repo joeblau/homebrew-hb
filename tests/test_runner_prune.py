@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 import unittest
 
-SCRIPT = Path(__file__).resolve().parents[1] / "runner-prune"
+SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "runner-prune"
 
 
 class PruneTests(unittest.TestCase):

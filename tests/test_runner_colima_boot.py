@@ -13,7 +13,8 @@ import unittest
 import test_runner_toolcache as setup_fixture
 
 REPO = Path(__file__).resolve().parents[1]
-BUILDER = REPO / 'runner-docker-builder'
+BIN = REPO / "bin"
+BUILDER = BIN / 'runner-docker-builder'
 
 
 class ReadinessTests(unittest.TestCase):

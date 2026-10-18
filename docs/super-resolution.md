@@ -82,7 +82,7 @@ brew install imagemagick
 chmod +x /path/to/realesrgan/realesrgan-ncnn-vulkan
 export SR_BACKEND=/path/to/realesrgan/realesrgan-ncnn-vulkan
 export SR_MODEL_DIR=/path/to/realesrgan/models
-./sr image.jpg
+bin/sr image.jpg
 ```
 
 `SR_BACKEND` may also name an executable on `PATH`. Without an override, `sr`

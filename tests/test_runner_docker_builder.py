@@ -9,7 +9,7 @@ import tempfile
 import unittest
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "runner-docker-builder"
+SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "runner-docker-builder"
 MOCK = r'''
 import json, os, pathlib, sys
 root = pathlib.Path(os.environ["MOCK_ROOT"])
