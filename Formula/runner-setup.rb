@@ -4,8 +4,8 @@
 class RunnerSetup < Formula
   desc "Provision and tear down GitHub Actions self-hosted runners on macOS"
   homepage "https://github.com/joeblau/homebrew-hb"
-  url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/v1.16.1.tar.gz"
-  sha256 "f93c00841ab64bb6902ca30751dda3e9720428a8309906033d621c01a0664875"
+  url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/v1.17.0.tar.gz"
+  sha256 "dcef227109e2d8c28b6190a9c59e600cf39ae0395b3c2a7394f31b8ca2d5d4aa"
   license "MIT"
 
   depends_on "docker"
@@ -16,6 +16,7 @@ class RunnerSetup < Formula
   def install
     bin.install %w[
       runner-setup
+      runner-bootstrap
       runner-cleanup
       runner-ephemeral
       runner-prune
@@ -61,25 +62,15 @@ class RunnerSetup < Formula
       Runners register as <machine-name>-runner-N by default, so several Macs
       can join one scope without name clashes. Override with --name-prefix.
 
-      Setup configures persistent host power settings where supported:
-        autorestart 1, sleep 0, disksleep 0, powernap 0
-      Use --skip-power-config to keep existing or MDM-managed settings.
-      Verify with: pmset -g custom
-
-      Setup turns off FileVault, which otherwise holds every restart at a
-      password screen; use --keep-filevault to keep it. It upgrades itself
-      through Homebrew first (--skip-self-upgrade to skip), resumes runners
-      left in maintenance, and finishes only when every runner is listening.
-      It also enables Remote Login (needs Full Disk Access for the terminal)
-      and runs tailscaled as a system service so the Mac stays reachable at
-      the login window (--skip-remote-login / --skip-tailscale opt out).
-      macOS leaks a kernel reference per tailscaled UDP packet and panics
-      when the count wraps (tailscale/tailscale#18953), so setup also installs
-      runner-tailscale-guard, a root LaunchDaemon that reboots the host —
-      idle-first — before the wrap. Inspect it: runner-tailscale-guard status
-      The Colima boot daemon supervises the VM and restarts it if macOS raced it
-      past Rosetta at boot. Bootstrap a fresh Mac with the tap's Brewfile:
-        brew bundle --file="$(brew --repository joeblau/hb)/Brewfile"
+      Prepare the Mac itself first — Homebrew, the tap's Brewfile, power
+      settings, FileVault off, Remote Login, tailscaled at boot with its
+      kernel-panic reboot guard, optional automatic login, a cleared Dock:
+        runner-bootstrap               # --check verifies without changing
+      runner-setup only provisions runners. It upgrades itself through
+      Homebrew first (--skip-self-upgrade to skip), resumes runners left in
+      maintenance, and finishes only when every runner is listening. The
+      Colima boot daemon supervises the VM and restarts it if macOS raced it
+      past Rosetta at boot.
 
       Services run as system LaunchDaemons with a non-root service user.
       Runners restart after any exit, including a clean exit. Setup reruns
@@ -125,6 +116,7 @@ class RunnerSetup < Formula
   test do
     %w[
       runner-setup
+      runner-bootstrap
       runner-cleanup
       runner-ephemeral
       runner-prune
