@@ -9,6 +9,7 @@ brew "joeblau/hb/runner-setup" # runner-setup, runner-bootstrap and tools; bring
 brew "joeblau/hb/clear-mac"    # clears the Dock and desktop widgets
 brew "gnu-tar"                 # GNU tar, available as gtar
 brew "gh"                      # GitHub CLI
+brew "gnupg"                   # OpenPGP tools, including gpg
 brew "colima"                  # Linux VM for Docker jobs (runner-setup --colima)
 brew "docker-buildx"           # buildx plugin wired up by setup-colima
 brew "tailscale"               # boot-time remote access; bootstrap starts its system service

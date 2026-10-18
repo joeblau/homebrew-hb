@@ -14,7 +14,8 @@
 #
 #   1. Homebrew — installed if missing, and its shellenv added to ~/.zprofile.
 #   2. Brewfile — taps joeblau/hb and runs `brew bundle` on the tap's Brewfile
-#      (runner-setup, colima, docker-buildx, tailscale, clear-mac, gnu-tar, gh).
+#      (runner-setup, colima, docker-buildx, tailscale, clear-mac, gnu-tar, gh,
+#      gnupg).
 #      A copy run from curl or a checkout then re-runs as the installed release,
 #      so host settings always come from a released runner-bootstrap.
 #   3. Host settings — power policy for always-on use, FileVault off (it holds
