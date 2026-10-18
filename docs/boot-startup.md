@@ -27,8 +27,8 @@ required item is wrong.
   `autorestart` after a power failure, at a password screen, so no runner can
   start. Bootstrap runs `sudo fdesetup disable`, which asks for an admin's
   credentials once and decrypts in the background. The disk is then not
-  encrypted at rest. Pass `--keep-filevault` to keep it and unlock each
-  restart manually.
+  encrypted at rest. There is no opt-out: runner Macs run without FileVault,
+  which automatic login also requires.
 - **Turns on Remote Login (SSH)** so the fleet can be administered without a
   keyboard. macOS lets a terminal change this only with Full Disk Access
   (System Settings → Privacy & Security → Full Disk Access); without it bootstrap
@@ -63,12 +63,13 @@ required item is wrong.
   cleanly reboots the host — waiting for idle runners first — long before the
   wrap. See "The tailscaled kernel panic, and the reboot guard" below.
   `--skip-tailscale` opts out of this too.
-- **Turns on automatic login, when asked.** `--auto-login` logs the admin in
-  after every boot, for jobs that must open GUI windows; the runner services
-  themselves start without any login. macOS stores the account password for
-  the login window, so `sysadminctl` prompts for it — the script never sees
-  it. macOS disables automatic login while FileVault is on, so this needs
-  FileVault fully off (re-run after decryption finishes).
+- **Turns on automatic login.** The admin is logged in after every boot, so
+  jobs can open GUI windows; the runner services themselves start without
+  any login. macOS stores the account password for the login window, so
+  `sysadminctl` prompts for it once — the script never sees it. Because macOS
+  allows automatic login only once FileVault is fully off, the first run on a
+  Mac that is still decrypting reports a warning; re-run bootstrap after
+  decryption finishes. `--skip-auto-login` opts out.
 - **Clears the Dock and desktop widgets** with `clear-mac`, which backs up both
   preference domains first ([details](clear-mac.md)). It runs only when
   something is left to clear. `--skip-clear-desktop` opts out.
@@ -103,8 +104,8 @@ pmset -g custom | grep -E 'autorestart|sleep|disksleep|powernap|womp|tcpkeepaliv
 ## What `runner-setup` does
 
 `runner-setup` no longer touches host settings; it still accepts the old
-`--skip-power-config`, `--keep-filevault`, `--skip-remote-login` and
-`--skip-tailscale` flags but only warns that they moved. Each run:
+`--skip-power-config`, `--skip-remote-login`, `--skip-tailscale` and
+`--keep-filevault` flags but ignores them with a warning. Each run:
 
 - **Upgrades itself first.** A Homebrew-installed `runner-setup` runs
   `brew upgrade joeblau/hb/runner-setup` and re-runs as the new release with the

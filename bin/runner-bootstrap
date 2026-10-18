@@ -19,7 +19,7 @@
 #      settings always come from a released runner-bootstrap.
 #   3. Host settings — power policy for always-on use, FileVault off (it holds
 #      every restart at a password screen), Remote Login, tailscaled as a boot
-#      service plus its kernel-panic reboot guard, optional automatic login,
+#      service plus its kernel-panic reboot guard, automatic login,
 #      and a cleared Dock and desktop.
 #   4. Verification — every item is re-read and reported; the exit status is
 #      non-zero when anything required is wrong.
@@ -43,10 +43,9 @@ CHECK_ONLY=0
 INSTALL_BREW=1            # --skip-brew: skip Homebrew install and brew bundle
 BREWFILE=""               # --brewfile: override the tap's Brewfile
 CONFIGURE_POWER=1         # --skip-power-config
-KEEP_FILEVAULT=0          # --keep-filevault
 CONFIGURE_REMOTE_LOGIN=1  # --skip-remote-login
 CONFIGURE_TAILSCALE=1     # --skip-tailscale (also skips the panic guard)
-AUTO_LOGIN=0              # --auto-login: log the admin in automatically at boot
+AUTO_LOGIN=1              # --skip-auto-login: leave the login window at boot
 CLEAR_DESKTOP=1           # --skip-clear-desktop
 declare -a ORIGINAL_ARGS=()
 
@@ -91,9 +90,6 @@ OPTIONS:
                         restart after power failure, wake on LAN and TCP
                         keepalive, and disable system sleep, disk sleep and
                         Power Nap where supported.
-  --keep-filevault      Leave FileVault on. By default it is turned off:
-                        FileVault holds every restart at the login window, so
-                        nothing starts until someone types a password.
   --skip-remote-login   Leave Remote Login (SSH) as it is. Turning it on
                         needs Full Disk Access for this terminal; without it,
                         bootstrap prints what to enable and continues.
@@ -101,11 +97,11 @@ OPTIONS:
                         a system service reachable at the login window, log it
                         in once (interactive runs only), and install the
                         runner-tailscale-guard reboot daemon.
-  --auto-login          Log ${USER:-this user} in automatically after every boot.
-                        Needed only for jobs that must open GUI windows; the
-                        runners themselves start without a login. Prompts for
-                        the account password (macOS stores it for the login
-                        window), and requires FileVault off.
+  --skip-auto-login     Leave the login window at boot. By default,
+                        ${USER:-this user} is logged in automatically after
+                        every boot so jobs can open GUI windows. Turning it on
+                        prompts once for the account password (macOS stores it
+                        for the login window).
   --skip-clear-desktop  Leave the Dock and desktop widgets as they are. By
                         default they are cleared once with clear-mac, which
                         backs up both preference domains first.
@@ -126,20 +122,15 @@ parse_args() {
         BREWFILE="$2"; shift 2 ;;
       --brewfile=*) BREWFILE="${1#*=}"; shift ;;
       --skip-power-config) CONFIGURE_POWER=0; shift ;;
-      --keep-filevault) KEEP_FILEVAULT=1; shift ;;
       --skip-remote-login) CONFIGURE_REMOTE_LOGIN=0; shift ;;
       --skip-tailscale) CONFIGURE_TAILSCALE=0; shift ;;
       --auto-login) AUTO_LOGIN=1; shift ;;
+      --skip-auto-login) AUTO_LOGIN=0; shift ;;
       --skip-clear-desktop) CLEAR_DESKTOP=0; shift ;;
       -h|--help) usage; exit 0 ;;
       *) err "Unknown argument: $1"; usage; exit 2 ;;
     esac
   done
-  if [[ "${AUTO_LOGIN}" -eq 1 && "${KEEP_FILEVAULT}" -eq 1 ]]; then
-    err "--auto-login cannot work with --keep-filevault: macOS disables"
-    err "automatic login while FileVault is on."
-    exit 2
-  fi
 }
 
 # ----------------------------------------------------------------------------
@@ -306,12 +297,9 @@ configure_power() {
 
 # FileVault keeps the data volume locked at the login window after every
 # restart, including autorestart after a power failure, so no LaunchDaemon can
-# start until someone types a password. Unattended runners need it off.
+# start until someone types a password, and macOS refuses automatic login
+# while it is on. Runner Macs always run without it; there is no opt-out.
 configure_filevault() {
-  if [[ "${KEEP_FILEVAULT}" -eq 1 ]]; then
-    step "Keeping FileVault settings (--keep-filevault)"
-    return 0
-  fi
   command -v fdesetup >/dev/null 2>&1 || return 0
   local status
   if ! status="$(fdesetup status)"; then
@@ -323,9 +311,9 @@ configure_filevault() {
     *"FileVault is Off"*) step "FileVault is off; restarts need no login"; return 0 ;;
   esac
   log "Turning off FileVault so runners start after restarts and power failures"
-  warn "The disk will not be encrypted at rest. Use --keep-filevault to keep it."
+  warn "The disk will not be encrypted at rest."
   if ! sudo fdesetup disable; then
-    err "Could not turn off FileVault; bootstrap stopped. Use --keep-filevault to skip."
+    err "Could not turn off FileVault; bootstrap stopped."
     return 1
   fi
   step "FileVault decryption started; it continues in the background"
@@ -521,7 +509,7 @@ configure_auto_login() {
   fi
   if ! filevault_off; then
     warn "Automatic login needs FileVault fully off; decryption is still running."
-    warn "Re-run ${PROG_NAME} --auto-login once 'fdesetup status' reports Off."
+    warn "Re-run ${PROG_NAME} once 'fdesetup status' reports Off."
     return 0
   fi
   if [[ ! -t 0 ]]; then
@@ -631,12 +619,7 @@ check_filevault() {
   case "${status}" in
     *"FileVault is Off"*) record "FileVault" ok "off; restarts need no password" ;;
     *"Decryption in progress"*) record "FileVault" ok "decrypting" ;;
-    *)
-      if [[ "${KEEP_FILEVAULT}" -eq 1 ]]; then
-        record "FileVault" skip "on (--keep-filevault); restarts wait for a password"
-      else
-        record "FileVault" FAIL "on; every restart waits at a password screen"
-      fi ;;
+    *) record "FileVault" FAIL "on; every restart waits at a password screen" ;;
   esac
 }
 
@@ -686,10 +669,12 @@ check_auto_login() {
   user="$(auto_login_user)"
   if [[ -n "${user}" ]]; then
     record "Automatic login" ok "${user}"
-  elif [[ "${AUTO_LOGIN}" -eq 1 ]]; then
-    record "Automatic login" FAIL "off; re-run interactively with --auto-login"
+  elif [[ "${AUTO_LOGIN}" -eq 0 ]]; then
+    record "Automatic login" skip "off (--skip-auto-login)"
+  elif [[ "$(fdesetup status 2>/dev/null)" == *"Decryption in progress"* ]]; then
+    record "Automatic login" warn "waits for FileVault decryption; re-run bootstrap after it finishes"
   else
-    record "Automatic login" off "not requested (--auto-login)"
+    record "Automatic login" FAIL "off; re-run ${PROG_NAME} interactively"
   fi
 }
 

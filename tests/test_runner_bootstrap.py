@@ -84,18 +84,17 @@ class BootstrapTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(self.lines('fdesetup-calls'), ['status'])
 
-    def test_keep_filevault_skips_every_filevault_command(self):
-        (self.root/'filevault').write_text('FileVault is On.\n')
-        result = self.shell('parse_args --keep-filevault; configure_filevault')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.lines('fdesetup-calls'), [])
+    def test_keep_filevault_is_no_longer_an_option(self):
+        result = self.shell('parse_args --keep-filevault')
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('Unknown argument: --keep-filevault', result.stderr)
 
     def test_filevault_disable_failure_stops_setup(self):
         (self.root/'filevault').write_text('FileVault is On.\n')
         (self.root/'disable-rc').write_text('1')
         result = self.shell('configure_filevault')
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('--keep-filevault', result.stderr)
+        self.assertIn('Could not turn off FileVault', result.stderr)
 
     def test_remote_login_is_enabled_and_verified(self):
         result = self.shell('configure_remote_access')
@@ -219,20 +218,26 @@ class BootstrapTests(unittest.TestCase):
 
     # --- bootstrap-only behavior ------------------------------------------
 
-    def test_auto_login_conflicts_with_keep_filevault(self):
-        result = self.shell('parse_args --auto-login --keep-filevault')
-        self.assertEqual(result.returncode, 2)
-        self.assertIn('FileVault', result.stderr)
-
     def test_runner_options_are_rejected(self):
         result = self.shell('parse_args --org acme')
         self.assertEqual(result.returncode, 2)
         self.assertIn('Unknown argument: --org', result.stderr)
 
-    def test_auto_login_is_off_unless_requested(self):
-        result = self.shell('configure_auto_login')
+    def test_auto_login_is_on_by_default(self):
+        result = self.shell('parse_args; echo "auto=$AUTO_LOGIN"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('auto=1', result.stdout)
+
+    def test_skip_auto_login_never_calls_sysadminctl(self):
+        result = self.shell('parse_args --skip-auto-login; configure_auto_login')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.lines('sysadminctl-calls'), [])
+
+    def test_pending_decryption_is_a_warning_not_a_failure(self):
+        (self.root/'filevault').write_text('FileVault is On.\nDecryption in progress\n')
+        result = self.shell('check_auto_login; print_checks')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stderr, r'Automatic login\s+warn')
 
     def test_auto_login_needs_filevault_off(self):
         (self.root/'filevault').write_text('FileVault is On.\nDecryption in progress\n')
@@ -345,12 +350,13 @@ brew_path() { echo /opt/homebrew/bin/brew; }
 
     def test_check_table_passes_when_only_warnings_remain(self):
         (self.root/'filevault').write_text('FileVault is Off.\n')
-        result = self.shell('check_filevault; check_auto_login; check_desktop; print_checks')
+        result = self.shell('AUTO_LOGIN=0; check_filevault; check_auto_login; check_desktop; print_checks')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('This Mac is ready', result.stderr)
 
-    def test_requested_auto_login_that_is_off_fails_the_check(self):
-        result = self.shell('AUTO_LOGIN=1; check_auto_login; print_checks')
+    def test_default_auto_login_that_is_off_fails_the_check(self):
+        (self.root/'filevault').write_text('FileVault is Off.\n')
+        result = self.shell('check_auto_login; print_checks')
         self.assertNotEqual(result.returncode, 0)
         self.assertRegex(result.stderr, r'Automatic login\s+FAIL')
 

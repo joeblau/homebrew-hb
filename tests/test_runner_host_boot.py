@@ -104,7 +104,8 @@ class HostBootTests(unittest.TestCase):
                             '--skip-remote-login --skip-tailscale; echo "parsed $ORG"')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('parsed acme', result.stdout)
-        self.assertEqual(result.stderr.count('now belongs to runner-bootstrap'), 4)
+        self.assertEqual(result.stderr.count('now belongs to runner-bootstrap'), 3)
+        self.assertIn('--keep-filevault is gone', result.stderr)
 
     def test_setup_finishes_by_starting_and_verifying_every_runner(self):
         result = self.shell('UPGRADE_BIN="$TEST_ROOT/bin/upgrade"; RUNNERS=2; DOCKER_TIMEOUT=120; start_runners')

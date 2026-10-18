@@ -265,8 +265,12 @@ parse_args() {
       --name-prefix=*) NAME_PREFIX="${1#*=}"; NAME_PREFIX_SET=1; shift ;;
       --colima) COLIMA=1; shift ;;
       --skip-self-upgrade) SELF_UPGRADE=0; shift ;;
-      --skip-power-config|--keep-filevault|--skip-remote-login|--skip-tailscale)
+      --skip-power-config|--skip-remote-login|--skip-tailscale)
         warn "$1 now belongs to runner-bootstrap; runner-setup ignores it."
+        shift ;;
+      --keep-filevault)
+        warn "--keep-filevault is gone: runner Macs always run without FileVault"
+        warn "(runner-bootstrap turns it off). runner-setup ignores it."
         shift ;;
       --docker-timeout)
         [[ $# -ge 2 ]] || { err "--docker-timeout requires a value"; exit 2; }
