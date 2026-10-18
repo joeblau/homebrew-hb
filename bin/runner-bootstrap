@@ -1,0 +1,775 @@
+#!/usr/bin/env bash
+#
+# runner-bootstrap — prepare a Mac to host unattended CI runners
+#
+# Usage:
+#   runner-bootstrap [options]     # install, configure, then verify
+#   runner-bootstrap --check       # verify only; change nothing
+#
+# On a fresh Mac, run it straight from GitHub:
+#   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/joeblau/homebrew-hb/main/bin/runner-bootstrap)"
+#
+# Everything about the HOST lives here; runner-setup only provisions the
+# GitHub runners themselves. In order:
+#
+#   1. Homebrew — installed if missing, and its shellenv added to ~/.zprofile.
+#   2. Brewfile — taps joeblau/hb and runs `brew bundle` on the tap's Brewfile
+#      (runner-setup, colima, docker-buildx, tailscale, clear-mac). A copy run
+#      from curl or a checkout then re-runs as the installed release, so host
+#      settings always come from a released runner-bootstrap.
+#   3. Host settings — power policy for always-on use, FileVault off (it holds
+#      every restart at a password screen), Remote Login, tailscaled as a boot
+#      service plus its kernel-panic reboot guard, optional automatic login,
+#      and a cleared Dock and desktop.
+#   4. Verification — every item is re-read and reported; the exit status is
+#      non-zero when anything required is wrong.
+#
+# Run as the admin user who will own the runners, not as root: Homebrew
+# refuses root, and the Dock/desktop belong to that user. sudo is used only
+# for system settings and LaunchDaemons.
+
+set -euo pipefail
+
+# ----------------------------------------------------------------------------
+# Constants / globals
+# ----------------------------------------------------------------------------
+PROG_NAME="$(basename "${BASH_SOURCE[0]:-runner-bootstrap}")"
+TAP="joeblau/hb"
+LAUNCH_DAEMON_DIR="/Library/LaunchDaemons"
+HOMEBREW_INSTALLER="https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh"
+KCPASSWORD="${RUNNER_BOOTSTRAP_KCPASSWORD:-/etc/kcpassword}"   # written by macOS for automatic login
+
+CHECK_ONLY=0
+INSTALL_BREW=1            # --skip-brew: skip Homebrew install and brew bundle
+BREWFILE=""               # --brewfile: override the tap's Brewfile
+CONFIGURE_POWER=1         # --skip-power-config
+KEEP_FILEVAULT=0          # --keep-filevault
+CONFIGURE_REMOTE_LOGIN=1  # --skip-remote-login
+CONFIGURE_TAILSCALE=1     # --skip-tailscale (also skips the panic guard)
+AUTO_LOGIN=0              # --auto-login: log the admin in automatically at boot
+CLEAR_DESKTOP=1           # --skip-clear-desktop
+declare -a ORIGINAL_ARGS=()
+
+REAL_USER=""
+REAL_UID=""
+REAL_HOME=""
+
+# Verification results, printed as one table at the end.
+declare -a CHECK_NAME=()
+declare -a CHECK_STATE=()
+declare -a CHECK_NOTE=()
+CHECK_FAILED=0
+
+# ----------------------------------------------------------------------------
+# Output helpers — progress goes to stderr.
+# ----------------------------------------------------------------------------
+log()  { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
+step() { printf '\033[1;32m  ->\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[1;33mWARN:\033[0m %s\n' "$*" >&2; }
+err()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; }
+
+usage() {
+  cat >&2 <<EOF
+${PROG_NAME} — prepare a Mac to host unattended CI runners
+
+USAGE:
+  ${PROG_NAME} [options]
+  ${PROG_NAME} --check
+
+  On a fresh Mac (no Homebrew yet):
+    /bin/bash -c "\$(curl -fsSL https://raw.githubusercontent.com/joeblau/homebrew-hb/main/bin/runner-bootstrap)"
+
+  Then provision the runners themselves:
+    runner-setup --org ORG --token TOKEN --runners 2 --colima
+
+OPTIONS:
+  --check               Verify every item and change nothing. Exits non-zero
+                        when a required item is wrong.
+  --skip-brew           Skip installing Homebrew and the tap's Brewfile.
+  --brewfile PATH       Bundle this Brewfile instead of the tap's.
+  --skip-power-config   Keep existing power settings. By default, enable
+                        restart after power failure, wake on LAN and TCP
+                        keepalive, and disable system sleep, disk sleep and
+                        Power Nap where supported.
+  --keep-filevault      Leave FileVault on. By default it is turned off:
+                        FileVault holds every restart at the login window, so
+                        nothing starts until someone types a password.
+  --skip-remote-login   Leave Remote Login (SSH) as it is. Turning it on
+                        needs Full Disk Access for this terminal; without it,
+                        bootstrap prints what to enable and continues.
+  --skip-tailscale      Leave Tailscale as it is. By default, run tailscaled as
+                        a system service reachable at the login window, log it
+                        in once (interactive runs only), and install the
+                        runner-tailscale-guard reboot daemon.
+  --auto-login          Log ${USER:-this user} in automatically after every boot.
+                        Needed only for jobs that must open GUI windows; the
+                        runners themselves start without a login. Prompts for
+                        the account password (macOS stores it for the login
+                        window), and requires FileVault off.
+  --skip-clear-desktop  Leave the Dock and desktop widgets as they are. By
+                        default they are cleared once with clear-mac, which
+                        backs up both preference domains first.
+  -h, --help            Show this help and exit.
+EOF
+}
+
+# ----------------------------------------------------------------------------
+# Argument parsing
+# ----------------------------------------------------------------------------
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --check) CHECK_ONLY=1; shift ;;
+      --skip-brew) INSTALL_BREW=0; shift ;;
+      --brewfile)
+        [[ $# -ge 2 ]] || { err "--brewfile requires a value"; usage; exit 2; }
+        BREWFILE="$2"; shift 2 ;;
+      --brewfile=*) BREWFILE="${1#*=}"; shift ;;
+      --skip-power-config) CONFIGURE_POWER=0; shift ;;
+      --keep-filevault) KEEP_FILEVAULT=1; shift ;;
+      --skip-remote-login) CONFIGURE_REMOTE_LOGIN=0; shift ;;
+      --skip-tailscale) CONFIGURE_TAILSCALE=0; shift ;;
+      --auto-login) AUTO_LOGIN=1; shift ;;
+      --skip-clear-desktop) CLEAR_DESKTOP=0; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) err "Unknown argument: $1"; usage; exit 2 ;;
+    esac
+  done
+  if [[ "${AUTO_LOGIN}" -eq 1 && "${KEEP_FILEVAULT}" -eq 1 ]]; then
+    err "--auto-login cannot work with --keep-filevault: macOS disables"
+    err "automatic login while FileVault is on."
+    exit 2
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# Environment
+# ----------------------------------------------------------------------------
+detect_user() {
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    err "This tool only supports macOS."
+    exit 1
+  fi
+  if [[ "${EUID}" -eq 0 ]]; then
+    err "Run ${PROG_NAME} as the admin user who will own the runners, not as"
+    err "root or with sudo. It uses sudo itself only where macOS requires it."
+    exit 1
+  fi
+  REAL_USER="$(id -un)"
+  REAL_UID="$(id -u)"
+  REAL_HOME="${HOME:-/Users/${REAL_USER}}"
+}
+
+# These are all run as the invoking user already; kept so the host functions
+# read the same here as they did in runner-setup.
+as_user() { "$@"; }
+
+ensure_sudo() {
+  log "Requesting administrator privileges (needed for system settings and LaunchDaemons)"
+  if ! sudo -v; then
+    err "Could not obtain sudo privileges."
+    exit 1
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# 1. Homebrew
+# ----------------------------------------------------------------------------
+brew_path() {
+  local candidate
+  for candidate in "$(command -v brew 2>/dev/null || true)" /opt/homebrew/bin/brew /usr/local/bin/brew; do
+    [[ -n "${candidate}" && -x "${candidate}" ]] && { printf '%s\n' "${candidate}"; return 0; }
+  done
+  return 1
+}
+
+load_brew_env() {
+  local brew_bin
+  brew_bin="$(brew_path)" || return 1
+  eval "$("${brew_bin}" shellenv)"
+}
+
+install_homebrew() {
+  if brew_path >/dev/null; then
+    step "Homebrew is installed: $(brew_path)"
+  else
+    log "Installing Homebrew"
+    local installer
+    installer="$(curl -fsSL "${HOMEBREW_INSTALLER}")" \
+      || { err "Could not download the Homebrew installer."; return 1; }
+    if [[ -t 0 ]]; then
+      /bin/bash -c "${installer}" || { err "Homebrew installation failed."; return 1; }
+    else
+      NONINTERACTIVE=1 /bin/bash -c "${installer}" \
+        || { err "Homebrew installation failed."; return 1; }
+    fi
+  fi
+  load_brew_env || { err "Homebrew is not on PATH after installation."; return 1; }
+  # New login shells (and SSH sessions) need brew on PATH too.
+  local profile="${REAL_HOME}/.zprofile" line
+  line="eval \"\$($(brew_path) shellenv)\""
+  if ! grep -qs 'brew shellenv' "${profile}"; then
+    printf '\n%s\n' "${line}" >> "${profile}"
+    step "Added Homebrew to ${profile}"
+  fi
+}
+
+resolve_brewfile() {
+  if [[ -n "${BREWFILE}" ]]; then
+    printf '%s\n' "${BREWFILE}"
+  else
+    printf '%s/Brewfile\n' "$(brew --repository "${TAP}")"
+  fi
+}
+
+install_brewfile() {
+  log "Tapping ${TAP} and installing its Brewfile"
+  brew tap "${TAP}" || { err "Could not tap ${TAP}."; return 1; }
+  local brewfile
+  brewfile="$(resolve_brewfile)"
+  [[ -f "${brewfile}" ]] || { err "Brewfile not found: ${brewfile}"; return 1; }
+  brew bundle --file="${brewfile}" || { err "brew bundle failed for ${brewfile}."; return 1; }
+  step "Brewfile installed: ${brewfile}"
+}
+
+# A copy run from curl or a checkout hands over to the installed release, so
+# host settings always come from a released runner-bootstrap.
+reexec_installed() {
+  [[ "${RUNNER_BOOTSTRAP_REEXEC:-0}" != 1 ]] || return 0
+  local installed self="${BASH_SOURCE[0]:-}"
+  installed="$(brew --prefix)/bin/runner-bootstrap"
+  [[ -x "${installed}" ]] || return 0
+  if [[ -n "${self}" && -f "${self}" ]] && cmp -s "${self}" "${installed}"; then
+    return 0
+  fi
+  step "Continuing as the installed ${installed}"
+  RUNNER_BOOTSTRAP_REEXEC=1 exec "${installed}" ${ORIGINAL_ARGS[@]+"${ORIGINAL_ARGS[@]}"} --skip-brew
+}
+
+# ----------------------------------------------------------------------------
+# 3. Host settings
+# ----------------------------------------------------------------------------
+# Configure the host power policy once, before any services start. pmset
+# persists these settings across reboots; there is no per-runner power daemon.
+configure_power() {
+  if [[ "${CONFIGURE_POWER}" -eq 0 ]]; then
+    step "Keeping existing host power settings (--skip-power-config)"
+    return 0
+  fi
+  if ! command -v pmset >/dev/null 2>&1; then
+    err "Host power setup requires pmset."
+    return 1
+  fi
+  local capabilities key desired current index
+  local -a power_args=(-a)
+  if ! capabilities="$(pmset -g cap)"; then
+    err "Could not read supported host power settings."
+    return 1
+  fi
+  for key in autorestart sleep disksleep powernap womp tcpkeepalive; do
+    if printf '%s\n' "${capabilities}" | grep -Eq "^[[:space:]]*${key}[[:space:]]*$"; then
+      case "${key}" in
+        autorestart|womp|tcpkeepalive) desired=1 ;;
+        *) desired=0 ;;
+      esac
+      power_args+=("${key}" "${desired}")
+    else
+      step "Skipping ${key}: not supported by this Mac"
+    fi
+  done
+  if [[ ${#power_args[@]} -eq 1 ]]; then
+    step "No supported host power settings to configure"
+    return 0
+  fi
+
+  log "Configuring persistent host power settings for an always-on Mac"
+  if ! sudo pmset "${power_args[@]}"; then
+    err "Could not apply host power settings; bootstrap stopped."
+    return 1
+  fi
+  if ! current="$(pmset -g custom)"; then
+    err "Could not verify host power settings; bootstrap stopped."
+    return 1
+  fi
+  for ((index = 1; index < ${#power_args[@]}; index += 2)); do
+    key="${power_args[$index]}"; desired="${power_args[$((index + 1))]}"
+    if ! printf '%s\n' "${current}" | awk -v key="${key}" -v desired="${desired}" '
+      $1 == key { found = 1; if ($2 != desired) mismatch = 1 }
+      END { exit (!found || mismatch) }
+    '; then
+      err "Host power setting ${key}=${desired} could not be verified; bootstrap stopped."
+      return 1
+    fi
+    step "Verified ${key}=${desired}"
+  done
+}
+
+# FileVault keeps the data volume locked at the login window after every
+# restart, including autorestart after a power failure, so no LaunchDaemon can
+# start until someone types a password. Unattended runners need it off.
+configure_filevault() {
+  if [[ "${KEEP_FILEVAULT}" -eq 1 ]]; then
+    step "Keeping FileVault settings (--keep-filevault)"
+    return 0
+  fi
+  command -v fdesetup >/dev/null 2>&1 || return 0
+  local status
+  if ! status="$(fdesetup status)"; then
+    err "Could not read FileVault status; bootstrap stopped."
+    return 1
+  fi
+  case "${status}" in
+    *"Decryption in progress"*) step "FileVault decryption is in progress"; return 0 ;;
+    *"FileVault is Off"*) step "FileVault is off; restarts need no login"; return 0 ;;
+  esac
+  log "Turning off FileVault so runners start after restarts and power failures"
+  warn "The disk will not be encrypted at rest. Use --keep-filevault to keep it."
+  if ! sudo fdesetup disable; then
+    err "Could not turn off FileVault; bootstrap stopped. Use --keep-filevault to skip."
+    return 1
+  fi
+  step "FileVault decryption started; it continues in the background"
+}
+
+# Remote Login lets the fleet be administered over SSH, including at the login
+# window after an unattended restart. systemsetup requires Full Disk Access
+# for the invoking terminal; failing that is reported, never fatal.
+configure_remote_access() {
+  if [[ "${CONFIGURE_REMOTE_LOGIN}" -eq 0 ]]; then
+    step "Keeping Remote Login settings (--skip-remote-login)"
+    return 0
+  fi
+  command -v systemsetup >/dev/null 2>&1 || return 0
+  local state=""
+  state="$(sudo systemsetup -getremotelogin 2>/dev/null)" || state=""
+  if [[ "${state}" == *": On"* ]]; then
+    step "Remote Login (SSH) is on"
+    return 0
+  fi
+  sudo systemsetup -setremotelogin on >/dev/null 2>&1 || true
+  state="$(sudo systemsetup -getremotelogin 2>/dev/null)" || state=""
+  if [[ "${state}" == *": On"* ]]; then
+    step "Enabled Remote Login (SSH) for remote administration"
+    return 0
+  fi
+  warn "Could not enable Remote Login (SSH). macOS requires Full Disk Access for"
+  warn "the terminal running bootstrap: System Settings > Privacy & Security >"
+  warn "Full Disk Access. Or enable it in System Settings > General > Sharing."
+  return 0
+}
+
+# The Tailscale menu-bar app only connects after GUI login, so a rebooted Mini
+# disappears from the tailnet until someone types a password — and current
+# releases don't even persist their "Launch Tailscale at Login" setting across
+# restarts (tailscale/tailscale#18042), so logging in doesn't reliably bring it
+# back either. tailscaled as a root system service keeps the Mac reachable at
+# the login window and depends on neither. Failures here cost remote access,
+# not CI, so they warn instead of stopping bootstrap.
+configure_tailscale() {
+  if [[ "${CONFIGURE_TAILSCALE}" -eq 0 ]]; then
+    step "Keeping Tailscale settings (--skip-tailscale)"
+    return 0
+  fi
+  local brew_bin
+  brew_bin="$(command -v brew)" || { warn "Homebrew not found; skipping Tailscale."; return 0; }
+  if ! command -v tailscale >/dev/null 2>&1; then
+    log "Installing Tailscale (CLI + tailscaled) for boot-time remote access"
+    as_user "${brew_bin}" install tailscale \
+      || { warn "Tailscale install failed; continuing without it."; return 0; }
+  fi
+  if command -v pgrep >/dev/null 2>&1 && pgrep -qx Tailscale 2>/dev/null; then
+    warn "The Tailscale menu-bar app is running. It only connects after GUI login"
+    warn "and conflicts with the boot service. Quit it and remove its Login Item."
+  fi
+  local ts_bin
+  ts_bin="$(command -v tailscale)" || { warn "tailscale CLI not found; skipping."; return 0; }
+  # `brew services start` without sudo installs a login-only agent that leaves
+  # the Mac unreachable at the login window; replace it with the boot service.
+  if [[ -e "${REAL_HOME}/Library/LaunchAgents/homebrew.mxcl.tailscale.plist" ]]; then
+    warn "Replacing the login-only Tailscale service with the boot service."
+    as_user "${brew_bin}" services stop tailscale >/dev/null 2>&1 || true
+    sudo launchctl asuser "${REAL_UID}" launchctl bootout \
+      "gui/${REAL_UID}/homebrew.mxcl.tailscale" 2>/dev/null || true
+    as_user rm -f "${REAL_HOME}/Library/LaunchAgents/homebrew.mxcl.tailscale.plist" || true
+  fi
+  if sudo launchctl print system/homebrew.mxcl.tailscale >/dev/null 2>&1; then
+    step "Tailscale system service is already loaded"
+  else
+    log "Starting tailscaled as a system service (reachable at the login window)"
+    sudo "${brew_bin}" services start tailscale \
+      || { warn "Could not start the Tailscale system service."; return 0; }
+  fi
+  # A plain `tailscale status` can be answered by the menu-bar app's daemon
+  # for the logged-in user, which once made setup skip authentication while the
+  # BOOT daemon stayed logged out (and the Mac vanished from the tailnet at
+  # the login window). Pin every query to the system daemon's socket.
+  local ts_socket=/var/run/tailscaled.socket _i
+  for _i in 1 2 3 4 5 6 7 8 9 10; do
+    [[ ! -S "${ts_socket}" ]] || break
+    sleep 1
+  done
+  if sudo "${ts_bin}" --socket="${ts_socket}" status >/dev/null 2>&1; then
+    step "Tailscale boot service is connected"
+    return 0
+  fi
+  if [[ -t 0 ]]; then
+    log "Authenticating the Tailscale boot service (follow the login URL it prints)"
+    if sudo "${ts_bin}" --socket="${ts_socket}" up \
+        && sudo "${ts_bin}" --socket="${ts_socket}" status >/dev/null 2>&1; then
+      step "Tailscale boot service is connected"
+    else
+      warn "Tailscale boot service is still not logged in; run:"
+      warn "  sudo tailscale --socket=${ts_socket} up"
+    fi
+  else
+    warn "Tailscale boot service is not logged in; run: sudo tailscale --socket=${ts_socket} up"
+  fi
+  return 0
+}
+
+# macOS leaks a kernel ifnet reference per UDP packet tailscaled sends; the
+# 32-bit refcount wraps at 2^32 and the kernel PANICS, taking every runner
+# down mid-job (tailscale/tailscale#18953 — confirmed on Apple Silicon minis
+# with the Homebrew tailscaled this fleet runs). Restarting tailscaled does
+# not reset the kernel count; only a reboot does. Install runner-tailscale-guard
+# as a root LaunchDaemon that tracks the daemon's send counters and reboots the
+# host — idle-first — long before the wrap. Like configure_tailscale, failures
+# here warn instead of stopping bootstrap.
+configure_tailscale_guard() {
+  if [[ "${CONFIGURE_TAILSCALE}" -eq 0 ]]; then
+    step "Keeping Tailscale guard settings (--skip-tailscale)"
+    return 0
+  fi
+  local self_dir guard_bin label="com.github.runner-tailscale-guard" plist staged
+  self_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+  guard_bin="${self_dir}/runner-tailscale-guard"
+  [[ -x "${guard_bin}" ]] || guard_bin="$(command -v runner-tailscale-guard)" \
+    || { warn "runner-tailscale-guard not found; skipping the panic guard."; return 0; }
+  local log_dir="${RUNNER_TS_GUARD_LOGS:-/Library/Logs/runner-tailscale-guard}"
+  plist="${LAUNCH_DAEMON_DIR}/${label}.plist"
+  staged="$(mktemp "${TMPDIR:-/tmp}/${label}.XXXXXX")" || return 0
+  sudo mkdir -p "${log_dir}" 2>/dev/null || true
+  python3 - "${staged}" "${guard_bin}" "${log_dir}" <<'PYGUARD'
+import plistlib, sys
+path, guard, logs = sys.argv[1:]
+with open(path, "wb") as f:
+    plistlib.dump({
+        "Label": "com.github.runner-tailscale-guard",
+        "ProgramArguments": [guard, "check"],
+        "EnvironmentVariables": {
+            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        },
+        "RunAtLoad": True, "StartInterval": 1800,
+        "StandardOutPath": logs + "/stdout.log",
+        "StandardErrorPath": logs + "/stderr.log",
+    }, f)
+PYGUARD
+  [[ $? -eq 0 ]] || { rm -f "${staged}"; warn "Could not stage the Tailscale guard plist."; return 0; }
+  plutil -lint "${staged}" >/dev/null \
+    || { rm -f "${staged}"; warn "Staged Tailscale guard plist failed lint."; return 0; }
+  if ! cmp -s "${staged}" "${plist}"; then
+    bootout_system "${label}" || true
+    { sudo cp "${staged}" "${plist}" && sudo chown root:wheel "${plist}" \
+      && sudo chmod 644 "${plist}"; } \
+      || { rm -f "${staged}"; warn "Could not install the Tailscale guard plist."; return 0; }
+  fi
+  rm -f "${staged}"
+  sudo launchctl enable "system/${label}" 2>/dev/null || true
+  if ! sudo launchctl print "system/${label}" >/dev/null 2>&1; then
+    sudo launchctl bootstrap system "${plist}" \
+      || { warn "Could not start the Tailscale guard daemon."; return 0; }
+  fi
+  step "Tailscale panic guard installed (reboots before tailscale/tailscale#18953 wraps)"
+}
+
+
+# bootout` is asynchronous: it returns before the domain has finished tearing
+# the service down, so an immediate `bootstrap` can intermittently fail with
+# "Bootstrap failed: 5: Input/output error" / "service already bootstrapped" on
+# fast machines. Poll until it is gone (bounded).
+bootout_system() {
+  local label="$1"
+  local _i
+  sudo launchctl bootout "system/${label}" 2>/dev/null || true
+  for _i in 1 2 3 4 5 6 7 8 9 10; do
+    sudo launchctl print "system/${label}" >/dev/null 2>&1 || return 0
+    sleep 1
+  done
+  err "Timed out stopping system/${label}; refusing to replace its live service."
+  return 1
+}
+
+
+auto_login_user() {
+  defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser 2>/dev/null || true
+}
+
+filevault_off() {
+  local status
+  status="$(fdesetup status 2>/dev/null)" || return 1
+  [[ "${status}" == *"FileVault is Off"* ]]
+}
+
+# Automatic login gives jobs that open windows a desktop session after every
+# boot. macOS keeps the account password for the login window, so sysadminctl
+# prompts for it itself; this script never sees it.
+configure_auto_login() {
+  [[ "${AUTO_LOGIN}" -eq 1 ]] || return 0
+  if [[ "$(auto_login_user)" == "${REAL_USER}" && -f "${KCPASSWORD}" ]]; then
+    step "Automatic login is on for ${REAL_USER}"
+    return 0
+  fi
+  if ! filevault_off; then
+    warn "Automatic login needs FileVault fully off; decryption is still running."
+    warn "Re-run ${PROG_NAME} --auto-login once 'fdesetup status' reports Off."
+    return 0
+  fi
+  if [[ ! -t 0 ]]; then
+    warn "Automatic login asks for ${REAL_USER}'s password; re-run interactively."
+    return 0
+  fi
+  log "Turning on automatic login for ${REAL_USER} (enter that account's password)"
+  if ! sudo sysadminctl -autologin set -userName "${REAL_USER}" -password -; then
+    warn "Could not turn on automatic login. Set it in System Settings >"
+    warn "Users & Groups > Automatically log in as."
+  fi
+}
+
+# clear-mac backs up and restarts the Dock on every run, so only call it when
+# something is left to clear.
+desktop_is_clear() {
+  local key value
+  for key in persistent-apps persistent-others; do
+    value="$(defaults read com.apple.dock "${key}" 2>/dev/null | tr -d '[:space:]')" || return 1
+    [[ "${value}" == "()" ]] || return 1
+  done
+  for key in static-apps static-others; do
+    value="$(defaults read com.apple.dock "${key}" 2>/dev/null | tr -d '[:space:]' || true)"
+    [[ -z "${value}" || "${value}" == "()" ]] || return 1
+  done
+  [[ "$(defaults read com.apple.dock show-recents 2>/dev/null || true)" == 0 ]] || return 1
+  for key in StandardHideWidgets StageManagerHideWidgets; do
+    [[ "$(defaults read com.apple.WindowManager "${key}" 2>/dev/null || true)" == 1 ]] || return 1
+  done
+}
+
+configure_desktop() {
+  if [[ "${CLEAR_DESKTOP}" -eq 0 ]]; then
+    step "Keeping the Dock and desktop as they are (--skip-clear-desktop)"
+    return 0
+  fi
+  if desktop_is_clear; then
+    step "Dock and desktop widgets are already clear"
+    return 0
+  fi
+  if ! command -v clear-mac >/dev/null 2>&1; then
+    warn "clear-mac is not installed; skipping the Dock and desktop. Install it"
+    warn "with: brew install ${TAP}/clear-mac"
+    return 0
+  fi
+  log "Clearing the Dock and desktop widgets (preferences are backed up first)"
+  clear-mac >&2 || warn "clear-mac failed; the Dock and desktop were left as they were."
+}
+
+# ----------------------------------------------------------------------------
+# 4. Verification
+# ----------------------------------------------------------------------------
+# record <name> <ok|warn|FAIL|skip|off> <note>
+record() {
+  CHECK_NAME+=("$1"); CHECK_STATE+=("$2"); CHECK_NOTE+=("$3")
+  [[ "$2" != FAIL ]] || CHECK_FAILED=1
+}
+
+check_brew() {
+  local brew_bin
+  if ! brew_bin="$(brew_path)"; then
+    record "Homebrew" FAIL "not installed"
+    return 0
+  fi
+  if grep -qs 'brew shellenv' "${REAL_HOME}/.zprofile"; then
+    record "Homebrew" ok "${brew_bin}"
+  else
+    record "Homebrew" warn "not in ~/.zprofile; new shells will not find brew"
+  fi
+  local brewfile missing="FAIL"
+  [[ "${INSTALL_BREW}" -eq 1 ]] || missing="warn"
+  brewfile="$(resolve_brewfile 2>/dev/null)" || brewfile=""
+  if [[ -z "${brewfile}" || ! -f "${brewfile}" ]]; then
+    record "Brewfile" "${missing}" "${TAP} is not tapped"
+  elif brew bundle check --file="${brewfile}" >/dev/null 2>&1; then
+    record "Brewfile" ok "everything installed"
+  else
+    record "Brewfile" "${missing}" "missing dependencies; run: brew bundle --file=${brewfile}"
+  fi
+}
+
+check_power() {
+  if [[ "${CONFIGURE_POWER}" -eq 0 ]]; then
+    record "Power settings" skip "--skip-power-config"
+    return 0
+  fi
+  local capabilities current key desired bad=""
+  capabilities="$(pmset -g cap 2>/dev/null)" || { record "Power settings" FAIL "pmset -g cap failed"; return 0; }
+  current="$(pmset -g custom 2>/dev/null)" || { record "Power settings" FAIL "pmset -g custom failed"; return 0; }
+  for key in autorestart sleep disksleep powernap womp tcpkeepalive; do
+    printf '%s\n' "${capabilities}" | grep -Eq "^[[:space:]]*${key}[[:space:]]*$" || continue
+    case "${key}" in autorestart|womp|tcpkeepalive) desired=1 ;; *) desired=0 ;; esac
+    printf '%s\n' "${current}" | awk -v key="${key}" -v desired="${desired}" '
+      $1 == key { found = 1; if ($2 != desired) mismatch = 1 }
+      END { exit (!found || mismatch) }' || bad+=" ${key}!=${desired}"
+  done
+  if [[ -z "${bad}" ]]; then
+    record "Power settings" ok "restart after power loss, never sleep"
+  else
+    record "Power settings" FAIL "wrong:${bad}"
+  fi
+}
+
+check_filevault() {
+  local status
+  status="$(fdesetup status 2>/dev/null)" || { record "FileVault" FAIL "could not read status"; return 0; }
+  case "${status}" in
+    *"FileVault is Off"*) record "FileVault" ok "off; restarts need no password" ;;
+    *"Decryption in progress"*) record "FileVault" ok "decrypting" ;;
+    *)
+      if [[ "${KEEP_FILEVAULT}" -eq 1 ]]; then
+        record "FileVault" skip "on (--keep-filevault); restarts wait for a password"
+      else
+        record "FileVault" FAIL "on; every restart waits at a password screen"
+      fi ;;
+  esac
+}
+
+check_remote_login() {
+  local state
+  state="$(sudo systemsetup -getremotelogin 2>/dev/null)" || state=""
+  if [[ "${state}" == *": On"* ]]; then
+    record "Remote Login (SSH)" ok "on"
+  elif [[ "${state}" == *": Off"* ]]; then
+    if [[ "${CONFIGURE_REMOTE_LOGIN}" -eq 0 ]]; then
+      record "Remote Login (SSH)" skip "off (--skip-remote-login)"
+    else
+      record "Remote Login (SSH)" FAIL "off"
+    fi
+  else
+    record "Remote Login (SSH)" warn "unknown; reading it needs Full Disk Access for this terminal"
+  fi
+}
+
+check_tailscale() {
+  if [[ "${CONFIGURE_TAILSCALE}" -eq 0 ]]; then
+    record "Tailscale" skip "--skip-tailscale"
+    return 0
+  fi
+  local ts_bin ts_socket=/var/run/tailscaled.socket
+  if ! ts_bin="$(command -v tailscale)"; then
+    record "Tailscale boot service" FAIL "tailscale CLI not installed"
+  elif ! sudo launchctl print system/homebrew.mxcl.tailscale >/dev/null 2>&1; then
+    record "Tailscale boot service" FAIL "tailscaled is not a loaded system service"
+  elif ! sudo "${ts_bin}" --socket="${ts_socket}" status >/dev/null 2>&1; then
+    record "Tailscale boot service" FAIL "not logged in; run: sudo tailscale --socket=${ts_socket} up"
+  else
+    record "Tailscale boot service" ok "connected at boot, before any login"
+  fi
+  if command -v pgrep >/dev/null 2>&1 && pgrep -qx Tailscale 2>/dev/null; then
+    record "Tailscale menu-bar app" warn "running; quit it and remove its Login Item"
+  fi
+  if sudo launchctl print system/com.github.runner-tailscale-guard >/dev/null 2>&1; then
+    record "Tailscale panic guard" ok "loaded"
+  else
+    record "Tailscale panic guard" FAIL "com.github.runner-tailscale-guard is not loaded"
+  fi
+}
+
+check_auto_login() {
+  local user
+  user="$(auto_login_user)"
+  if [[ -n "${user}" ]]; then
+    record "Automatic login" ok "${user}"
+  elif [[ "${AUTO_LOGIN}" -eq 1 ]]; then
+    record "Automatic login" FAIL "off; re-run interactively with --auto-login"
+  else
+    record "Automatic login" off "not requested (--auto-login)"
+  fi
+}
+
+check_desktop() {
+  if desktop_is_clear; then
+    record "Dock and desktop" ok "cleared"
+  elif [[ "${CLEAR_DESKTOP}" -eq 0 ]]; then
+    record "Dock and desktop" skip "--skip-clear-desktop"
+  else
+    record "Dock and desktop" warn "not cleared; run: clear-mac"
+  fi
+}
+
+check_rosetta() {
+  [[ "$(uname -m)" == arm64 ]] || return 0
+  if arch -x86_64 /usr/bin/true >/dev/null 2>&1; then
+    record "Rosetta 2" ok "active"
+  else
+    record "Rosetta 2" off "not installed; runner-setup --colima installs it"
+  fi
+}
+
+verify_host() {
+  log "Verifying host setup"
+  check_brew
+  check_power
+  check_filevault
+  check_remote_login
+  check_tailscale
+  check_auto_login
+  check_desktop
+  check_rosetta
+}
+
+print_checks() {
+  local i
+  printf '\n  %-24s %-5s %s\n' "CHECK" "STATE" "DETAIL" >&2
+  printf '  %-24s %-5s %s\n' "-----" "-----" "------" >&2
+  for ((i = 0; i < ${#CHECK_NAME[@]}; i++)); do
+    printf '  %-24s %-5s %s\n' "${CHECK_NAME[$i]}" "${CHECK_STATE[$i]}" "${CHECK_NOTE[$i]}" >&2
+  done
+  printf '\n' >&2
+  if [[ "${CHECK_FAILED}" -ne 0 ]]; then
+    err "This Mac is not ready for unattended runners; fix the FAIL rows above."
+    return 1
+  fi
+  log "This Mac is ready. Provision runners with:"
+  log "  runner-setup --org ORG --token TOKEN --runners 2 --colima"
+}
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+main() {
+  ORIGINAL_ARGS=("$@")
+  parse_args "$@"
+  detect_user
+  ensure_sudo
+  if [[ "${CHECK_ONLY}" -eq 1 ]]; then
+    load_brew_env || true
+    verify_host
+    print_checks
+    return
+  fi
+  if [[ "${INSTALL_BREW}" -eq 1 ]]; then
+    install_homebrew || return 1
+    install_brewfile || return 1
+    reexec_installed
+  else
+    load_brew_env || true
+  fi
+  configure_power || return 1
+  configure_filevault || return 1
+  configure_remote_access
+  configure_tailscale
+  configure_tailscale_guard
+  configure_auto_login
+  configure_desktop
+  verify_host
+  print_checks
+}
+
+main "$@"

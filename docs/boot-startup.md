@@ -1,54 +1,37 @@
-# Runner power settings and boot verification
+# Unattended runner Macs: bootstrap, power and boot verification
 
-`runner-setup` prepares a Mac for always-on CI before provisioning its services.
-It applies these persistent settings to all power sources where the hardware
-supports them, then reads them back with `pmset -g custom`:
-
-| Setting | Value | Effect |
-| --- | --- | --- |
-| `autorestart` | `1` | Restart when power returns after a power failure |
-| `sleep` | `0` | Disable automatic system sleep |
-| `disksleep` | `0` | Disable automatic disk sleep |
-| `powernap` | `0` | Disable Power Nap |
-| `womp` | `1` | Wake on LAN (magic packet) |
-| `tcpkeepalive` | `1` | Keep network sessions alive |
-
-Unsupported settings are reported and skipped. A failed write or verification
-stops setup before it provisions runners or Colima. Display sleep and screen
-locking can remain enabled. Pass `--skip-power-config` to keep existing host
-power settings, for example on a shared development Mac.
-
-Inspect the resulting policy on each Mini:
+A runner Mac is prepared in two steps. `runner-bootstrap` sets up the host —
+everything that has nothing to do with GitHub — and `runner-setup` provisions
+the runners. On a fresh Mac, before Homebrew exists:
 
 ```sh
-pmset -g custom | grep -E 'autorestart|sleep|disksleep|powernap|womp|tcpkeepalive'
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/joeblau/homebrew-hb/main/bin/runner-bootstrap)"
+runner-setup --org ORG_NAME --token REGISTRATION_TOKEN --runners 2 --colima
 ```
 
-These settings persist across reboots; they do not need a separate LaunchDaemon.
-For MDM-managed machines, deploy the equivalent power policy with MDM and use
-`--skip-power-config` if that policy should remain under MDM control.
+Re-run `runner-bootstrap` any time; every step is idempotent. `runner-bootstrap
+--check` re-reads every item, changes nothing, and exits non-zero when a
+required item is wrong.
 
-## Everything else setup does for unattended restarts
+## What `runner-bootstrap` does
 
-Each run of `runner-setup` also:
-
-- **Upgrades itself first.** A Homebrew-installed `runner-setup` runs
-  `brew upgrade joeblau/hb/runner-setup` and re-runs as the new release with the
-  same arguments. Pass `--skip-self-upgrade` to use the installed release.
+- **Installs Homebrew** if it is missing, and adds `brew shellenv` to
+  `~/.zprofile` so SSH sessions find it. `--skip-brew` skips this and the next
+  step.
+- **Installs the tap's [Brewfile](../Brewfile):** `runner-setup` (and with it
+  every `runner-*` tool), `clear-mac`, Colima, Docker Buildx and Tailscale. A
+  copy run from curl or a checkout then re-runs as the installed release, so
+  host settings always come from a released `runner-bootstrap`.
+- **Applies the power policy below.**
 - **Turns off FileVault.** FileVault holds every restart, including
   `autorestart` after a power failure, at a password screen, so no runner can
-  start. Setup runs `sudo fdesetup disable`, which asks for an admin's
+  start. Bootstrap runs `sudo fdesetup disable`, which asks for an admin's
   credentials once and decrypts in the background. The disk is then not
   encrypted at rest. Pass `--keep-filevault` to keep it and unlock each
   restart manually.
-- **Installs Rosetta 2 on Apple Silicon Colima hosts**, accepting Apple's
-  license, whenever x86_64 code cannot run. The check runs on every setup,
-  including reruns that inherit Colima, because the runners refuse to listen
-  without it. A Colima VM that started before Rosetta was installed is
-  restarted between jobs so it comes back with Rosetta.
 - **Turns on Remote Login (SSH)** so the fleet can be administered without a
   keyboard. macOS lets a terminal change this only with Full Disk Access
-  (System Settings → Privacy & Security → Full Disk Access); without it setup
+  (System Settings → Privacy & Security → Full Disk Access); without it bootstrap
   prints the manual path and continues. After the first SSH connection, grant
   Full Disk Access to `sshd-keygen-wrapper` if remote sessions need protected
   directories. `--skip-remote-login` opts out.
@@ -60,10 +43,10 @@ Each run of `runner-setup` also:
   — the checkbox silently resets to disabled), so even a GUI login does not
   reliably reconnect the Mac; the issue's own workaround is the
   `TailscaleStartOnLogin` MDM key. The system service needs neither the app
-  nor a login. Setup installs the Tailscale CLI and starts its Homebrew system
+  nor a login. Bootstrap installs the Tailscale CLI and starts its Homebrew system
   service, which is reachable at the login window. The menu-bar app's login
   does not carry over — it can even answer `tailscale status` for the
-  logged-in user and mask a logged-out boot daemon — so setup authenticates
+  logged-in user and mask a logged-out boot daemon — so bootstrap authenticates
   against the boot service's own socket:
   `sudo tailscale --socket=/var/run/tailscaled.socket up`, once,
   interactively. The boot service registers as its own tailnet node; remove
@@ -74,12 +57,63 @@ Each run of `runner-setup` also:
   reference for roughly every UDP packet tailscaled sends; the 32-bit count
   wraps at 2^32 and the kernel panics
   ([tailscale/tailscale#18953](https://github.com/tailscale/tailscale/issues/18953)).
-  Setup installs `runner-tailscale-guard` as a root LaunchDaemon that
+  Bootstrap installs `runner-tailscale-guard` as a root LaunchDaemon that
   accumulates the daemon's `magicsock_send_udp*` counters across tailscaled
   restarts (the kernel count survives them; only a reboot resets it) and
   cleanly reboots the host — waiting for idle runners first — long before the
   wrap. See "The tailscaled kernel panic, and the reboot guard" below.
   `--skip-tailscale` opts out of this too.
+- **Turns on automatic login, when asked.** `--auto-login` logs the admin in
+  after every boot, for jobs that must open GUI windows; the runner services
+  themselves start without any login. macOS stores the account password for
+  the login window, so `sysadminctl` prompts for it — the script never sees
+  it. macOS disables automatic login while FileVault is on, so this needs
+  FileVault fully off (re-run after decryption finishes).
+- **Clears the Dock and desktop widgets** with `clear-mac`, which backs up both
+  preference domains first ([details](clear-mac.md)). It runs only when
+  something is left to clear. `--skip-clear-desktop` opts out.
+- **Verifies everything** and prints one table: Homebrew, Brewfile, power,
+  FileVault, Remote Login, the Tailscale boot service and guard, automatic
+  login, the Dock, and Rosetta.
+
+### Power policy
+
+Bootstrap applies these persistent settings to all power sources where the
+hardware supports them, then reads them back with `pmset -g custom`:
+
+| Setting | Value | Effect |
+| --- | --- | --- |
+| `autorestart` | `1` | Restart when power returns after a power failure |
+| `sleep` | `0` | Disable automatic system sleep |
+| `disksleep` | `0` | Disable automatic disk sleep |
+| `powernap` | `0` | Disable Power Nap |
+| `womp` | `1` | Wake on LAN (magic packet) |
+| `tcpkeepalive` | `1` | Keep network sessions alive |
+
+Unsupported settings are reported and skipped. A failed write or verification
+stops bootstrap before any later step. Display sleep and screen locking can
+remain enabled. Pass `--skip-power-config` to keep existing host power
+settings, for example on a shared development Mac or under MDM control.
+These settings persist across reboots; they need no LaunchDaemon.
+
+```sh
+pmset -g custom | grep -E 'autorestart|sleep|disksleep|powernap|womp|tcpkeepalive'
+```
+
+## What `runner-setup` does
+
+`runner-setup` no longer touches host settings; it still accepts the old
+`--skip-power-config`, `--keep-filevault`, `--skip-remote-login` and
+`--skip-tailscale` flags but only warns that they moved. Each run:
+
+- **Upgrades itself first.** A Homebrew-installed `runner-setup` runs
+  `brew upgrade joeblau/hb/runner-setup` and re-runs as the new release with the
+  same arguments. Pass `--skip-self-upgrade` to use the installed release.
+- **Installs Rosetta 2 on Apple Silicon Colima hosts**, accepting Apple's
+  license, whenever x86_64 code cannot run. The check runs on every setup,
+  including reruns that inherit Colima, because the runners refuse to listen
+  without it. A Colima VM that started before Rosetta was installed is
+  restarted between jobs so it comes back with Rosetta.
 - **Starts every runner and waits until it listens for jobs.** Runners left in
   maintenance by an interrupted upgrade, and runners crash-looping on a
   readiness gate, are restarted. Setup fails if any runner does not come
@@ -124,7 +158,7 @@ references stay on the interface until the machine reboots.
 
 Because this fleet is provisioned to come back from unattended reboots with
 runners online and tailscaled connected, the mitigation is to turn the
-eventual panic into a scheduled reboot. Setup installs
+eventual panic into a scheduled reboot. `runner-bootstrap` installs
 `/Library/LaunchDaemons/com.github.runner-tailscale-guard.plist`, which runs
 `runner-tailscale-guard check` at boot and every 30 minutes as root. Each
 pass reads `tailscale debug metrics` from the boot daemon's socket, sums the
@@ -158,8 +192,8 @@ The existing service files are:
 /Library/LaunchDaemons/com.github.runner-tailscale-guard.plist
 ```
 
-The Colima service is installed when `--colima` is selected; the Tailscale
-guard whenever Tailscale setup is not skipped. Each plist is owned
+`runner-setup --colima` installs the Colima service; `runner-bootstrap`
+installs the Tailscale guard unless `--skip-tailscale` is given. Each plist is owned
 by `root:wheel`, has mode `644`, enables `RunAtLoad`, and is loaded into launchd's
 `system` domain. `UserName` selects the non-root runner owner. Explicit home and
 PATH settings avoid depending on an interactive shell. The Colima service
@@ -196,11 +230,10 @@ runner-setup --org ORG_NAME --runners 2 --colima
 ```
 
 Use the existing organization or repository and runner count for that machine.
-For a brand-new Mini, install everything first with the tap's Brewfile:
+For a brand-new Mini, prepare the host first:
 
 ```sh
-brew tap joeblau/hb
-brew bundle --file="$(brew --repository joeblau/hb)/Brewfile"
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/joeblau/homebrew-hb/main/bin/runner-bootstrap)"
 ```
 
 Existing same-scope Colima runners need no new registration token. Setup
@@ -215,12 +248,12 @@ The isolated regression tests verify generated plists, permissions commands,
 service domains and startup gates. A loaded daemon alone does not prove a
 runner is ready. A real reboot with no GUI login is the acceptance check.
 
-1. Choose an idle Mini. Setup enables Remote Login (SSH) itself when the
-   terminal has Full Disk Access; otherwise enable **System Settings →
-   General → Sharing → Remote Login** for the service owner.
-2. Run setup. Unless `--keep-filevault` was used, `fdesetup status` should
-   report FileVault off or decrypting. An ordinary logged-out desktop does not
-   require automatic GUI login.
+1. Choose an idle Mini. Run `runner-bootstrap`, then `runner-bootstrap
+   --check`; every row should be `ok` (or a deliberate `skip`). Bootstrap
+   enables Remote Login (SSH) itself when the terminal has Full Disk Access;
+   otherwise enable **System Settings → General → Sharing → Remote Login**.
+2. Run `runner-setup`. An ordinary logged-out desktop does not require
+   automatic GUI login.
 3. Restart the Mini, or perform a cold boot when that is the scenario being
    tested. Leave its GUI at the login window. Allow boot and Docker startup
    to complete, then verify both runners are **Idle** or **Active** in the

@@ -1,4 +1,4 @@
-"""Host power policy tests using fake pmset/sudo; never alter real power settings."""
+"""runner-bootstrap host power policy tests using fake pmset/sudo; never alter real power settings."""
 
 import json
 from pathlib import Path
@@ -69,7 +69,7 @@ class PowerTests(unittest.TestCase):
     def shell(self, body='configure_power'):
         (self.root/'state.json').write_text(json.dumps(self.state))
         return subprocess.run(
-            ['/bin/bash', '-c', definitions('runner-setup') + '\ntrap - EXIT\n' + body],
+            ['/bin/bash', '-c', definitions('runner-bootstrap') + '\ntrap - EXIT\n' + body],
             env={'PATH': f'{self.root}/bin:/usr/bin:/bin', 'TEST_ROOT': str(self.root)},
             capture_output=True, text=True, timeout=10,
         )
@@ -111,7 +111,7 @@ class PowerTests(unittest.TestCase):
         self.assertNotIn('autorestart', write)
 
     def test_skip_option_does_not_even_inspect_power_settings(self):
-        result = self.shell('parse_args --org acme --token dummy --skip-power-config\nconfigure_power')
+        result = self.shell('parse_args --skip-power-config\nconfigure_power')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.calls(), [])
 
@@ -154,21 +154,19 @@ class PowerTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('autorestart=1 could not be verified', result.stderr)
 
-    def test_power_failure_aborts_main_before_runner_or_colima_provisioning(self):
+    def test_power_failure_aborts_bootstrap_before_later_host_steps(self):
         self.state['write_rc'] = 1
         result = self.shell('''
-RUNNER_ROOT="$TEST_ROOT/runners"; LAUNCH_DAEMON_DIR="$TEST_ROOT/plists"
-detect_platform() { :; }; require_cmds() { :; }; detect_user() { :; }
-detect_arch() { :; }; detect_host() { :; }; ensure_sudo() { :; }
-prepare_runner_archive() { touch "$TEST_ROOT/provisioned"; }
-prepare_root_dir() { touch "$TEST_ROOT/provisioned"; }
-prepare_colima_boot() { touch "$TEST_ROOT/provisioned"; }
-configure_runner() { touch "$TEST_ROOT/provisioned"; }
-main --org acme --token dummy --colima
+detect_user() { :; }; ensure_sudo() { :; }; load_brew_env() { :; }
+for step in configure_filevault configure_remote_access configure_tailscale \\
+    configure_tailscale_guard configure_auto_login configure_desktop verify_host; do
+  eval "$step() { touch \"\$TEST_ROOT/$step\"; }"
+done
+main --skip-brew
 ''')
         self.assertNotEqual(result.returncode, 0)
-        self.assertFalse((self.root/'provisioned').exists())
-
+        self.assertEqual(sorted(p.name for p in self.root.glob('configure_*')), [])
+        self.assertFalse((self.root/'verify_host').exists())
 
 if __name__ == '__main__':
     unittest.main()

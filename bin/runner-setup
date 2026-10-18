@@ -17,6 +17,10 @@
 # `svc.sh install`, which avoids the "service loaded twice" hazard (a gui agent
 # AND a system daemon both registered for the same runner name).
 #
+# Host preparation (Homebrew, power, FileVault, SSH, Tailscale, auto-login, the
+# Dock) belongs to runner-bootstrap; run it first on a new Mac. This script
+# only provisions the runners and the Colima VM they depend on.
+#
 # The GitHub Actions runner refuses to run as root unless RUNNER_ALLOW_RUNASROOT=1.
 # We intentionally NEVER set that: config.sh / runsvc.sh always run as the real
 # user, while privileged setup and launchd operations use sudo.
@@ -47,10 +51,6 @@ DOCKER_HELPER=""
 UPGRADE_BIN=""
 COLIMA_CONFIG_HOME=""
 COLIMA_DOCKER_CONFIG=""
-CONFIGURE_POWER=1    # persistent host power settings for always-on runners
-KEEP_FILEVAULT=0     # --keep-filevault: leave FileVault on (restarts then need a login)
-CONFIGURE_REMOTE_LOGIN=1  # enable Remote Login (SSH) for remote administration
-CONFIGURE_TAILSCALE=1     # install tailscaled as a system service for boot-time access
 SELF_UPGRADE=1       # upgrade the Homebrew tools and re-run as the new release
 declare -a ORIGINAL_ARGS=()
 EPHEMERAL=0           # 1 => LaunchDaemon runs runner-ephemeral, not runsvc.sh
@@ -139,27 +139,10 @@ OPTIONS:
                         before running setup.
   --docker-timeout N    Docker readiness timeout in seconds (default: 300;
                         maximum: 3600). launchd retries failed starts.
-  --skip-power-config   Keep existing host power settings. By default, setup
-                        enables restart after power failure and disables system
-                        sleep, disk sleep and Power Nap where supported.
-  --keep-filevault      Leave FileVault on. By default, setup turns it off:
-                        FileVault holds every restart at the login window, so
-                        no runner can start until someone types a password.
   --skip-self-upgrade   Do not upgrade the Homebrew tools first. By default, a
                         Homebrew-installed setup upgrades joeblau/hb/runner-setup
                         and re-runs itself as the new release.
-  --skip-remote-login   Keep Remote Login (SSH) as it is. By default, setup
-                        turns it on so the fleet can be administered without a
-                        keyboard. macOS only allows this for a terminal with
-                        Full Disk Access; without it, setup prints what to
-                        enable and continues.
-  --skip-tailscale      Keep Tailscale as it is. By default, setup installs the
-                        Tailscale CLI and runs tailscaled as a system service,
-                        so the Mac stays reachable at the login window. The
-                        one-time login targets that boot service's socket (the
-                        menu-bar app's own login does not count) and runs only
-                        in an interactive setup.
-  --ephemeral           Make each runner ephemeral: instead of pointing the
+  --ephemeral          Make each runner ephemeral: instead of pointing the
                         LaunchDaemon at bin/runsvc.sh directly, point it at the
                         runner-ephemeral supervisor, which re-registers the
                         runner with a FRESH token (via the GitHub API) before
@@ -281,11 +264,10 @@ parse_args() {
         NAME_PREFIX="$2"; NAME_PREFIX_SET=1; shift 2 ;;
       --name-prefix=*) NAME_PREFIX="${1#*=}"; NAME_PREFIX_SET=1; shift ;;
       --colima) COLIMA=1; shift ;;
-      --skip-power-config) CONFIGURE_POWER=0; shift ;;
-      --keep-filevault) KEEP_FILEVAULT=1; shift ;;
       --skip-self-upgrade) SELF_UPGRADE=0; shift ;;
-      --skip-remote-login) CONFIGURE_REMOTE_LOGIN=0; shift ;;
-      --skip-tailscale) CONFIGURE_TAILSCALE=0; shift ;;
+      --skip-power-config|--keep-filevault|--skip-remote-login|--skip-tailscale)
+        warn "$1 now belongs to runner-bootstrap; runner-setup ignores it."
+        shift ;;
       --docker-timeout)
         [[ $# -ge 2 ]] || { err "--docker-timeout requires a value"; exit 2; }
         DOCKER_TIMEOUT="$2"; shift 2 ;;
@@ -499,244 +481,11 @@ require_cmds() {
 
 # Prime sudo once, up front, so password prompts don't interleave with progress.
 ensure_sudo() {
-  log "Requesting administrator privileges (needed for host setup, /opt and LaunchDaemons)"
+  log "Requesting administrator privileges (needed for /opt and LaunchDaemons)"
   if ! sudo -v; then
     err "Could not obtain sudo privileges."
     exit 1
   fi
-}
-
-# Configure the host once per setup, before provisioning any services. pmset
-# persists these settings across reboots; there is no per-runner power daemon.
-configure_power() {
-  if [[ "${CONFIGURE_POWER}" -eq 0 ]]; then
-    step "Keeping existing host power settings (--skip-power-config)"
-    return 0
-  fi
-  if ! command -v pmset >/dev/null 2>&1; then
-    err "Host power setup requires pmset."
-    return 1
-  fi
-  local capabilities key desired current index
-  local -a power_args=(-a)
-  if ! capabilities="$(pmset -g cap)"; then
-    err "Could not read supported host power settings."
-    return 1
-  fi
-  for key in autorestart sleep disksleep powernap womp tcpkeepalive; do
-    if printf '%s\n' "${capabilities}" | grep -Eq "^[[:space:]]*${key}[[:space:]]*$"; then
-      case "${key}" in
-        autorestart|womp|tcpkeepalive) desired=1 ;;
-        *) desired=0 ;;
-      esac
-      power_args+=("${key}" "${desired}")
-    else
-      step "Skipping ${key}: not supported by this Mac"
-    fi
-  done
-  if [[ ${#power_args[@]} -eq 1 ]]; then
-    step "No supported host power settings to configure"
-    return 0
-  fi
-
-  log "Configuring persistent host power settings for always-on runners"
-  if ! sudo pmset "${power_args[@]}"; then
-    err "Could not apply host power settings; setup stopped."
-    return 1
-  fi
-  if ! current="$(pmset -g custom)"; then
-    err "Could not verify host power settings; setup stopped."
-    return 1
-  fi
-  for ((index = 1; index < ${#power_args[@]}; index += 2)); do
-    key="${power_args[$index]}"; desired="${power_args[$((index + 1))]}"
-    if ! printf '%s\n' "${current}" | awk -v key="${key}" -v desired="${desired}" '
-      $1 == key { found = 1; if ($2 != desired) mismatch = 1 }
-      END { exit (!found || mismatch) }
-    '; then
-      err "Host power setting ${key}=${desired} could not be verified; setup stopped."
-      return 1
-    fi
-    step "Verified ${key}=${desired}"
-  done
-}
-
-# FileVault keeps the data volume locked at the login window after every
-# restart, including autorestart after a power failure, so no LaunchDaemon can
-# start until someone types a password. Unattended runners need it off.
-configure_filevault() {
-  if [[ "${KEEP_FILEVAULT}" -eq 1 ]]; then
-    step "Keeping FileVault settings (--keep-filevault)"
-    return 0
-  fi
-  command -v fdesetup >/dev/null 2>&1 || return 0
-  local status
-  if ! status="$(fdesetup status)"; then
-    err "Could not read FileVault status; setup stopped."
-    return 1
-  fi
-  case "${status}" in
-    *"Decryption in progress"*) step "FileVault decryption is in progress"; return 0 ;;
-    *"FileVault is Off"*) step "FileVault is off; restarts need no login"; return 0 ;;
-  esac
-  log "Turning off FileVault so runners start after restarts and power failures"
-  warn "The disk will not be encrypted at rest. Use --keep-filevault to keep it."
-  if ! sudo fdesetup disable; then
-    err "Could not turn off FileVault; setup stopped. Use --keep-filevault to skip."
-    return 1
-  fi
-  step "FileVault decryption started; it continues in the background"
-}
-
-# Remote Login lets the fleet be administered over SSH, including at the login
-# window after an unattended restart. systemsetup requires Full Disk Access
-# for the invoking terminal; failing that is reported, never fatal.
-configure_remote_access() {
-  if [[ "${CONFIGURE_REMOTE_LOGIN}" -eq 0 ]]; then
-    step "Keeping Remote Login settings (--skip-remote-login)"
-    return 0
-  fi
-  command -v systemsetup >/dev/null 2>&1 || return 0
-  local state=""
-  state="$(sudo systemsetup -getremotelogin 2>/dev/null)" || state=""
-  if [[ "${state}" == *": On"* ]]; then
-    step "Remote Login (SSH) is on"
-    return 0
-  fi
-  sudo systemsetup -setremotelogin on >/dev/null 2>&1 || true
-  state="$(sudo systemsetup -getremotelogin 2>/dev/null)" || state=""
-  if [[ "${state}" == *": On"* ]]; then
-    step "Enabled Remote Login (SSH) for remote administration"
-    return 0
-  fi
-  warn "Could not enable Remote Login (SSH). macOS requires Full Disk Access for"
-  warn "the terminal running setup: System Settings > Privacy & Security >"
-  warn "Full Disk Access. Or enable it in System Settings > General > Sharing."
-  return 0
-}
-
-# The Tailscale menu-bar app only connects after GUI login, so a rebooted Mini
-# disappears from the tailnet until someone types a password — and current
-# releases don't even persist their "Launch Tailscale at Login" setting across
-# restarts (tailscale/tailscale#18042), so logging in doesn't reliably bring it
-# back either. tailscaled as a root system service keeps the Mac reachable at
-# the login window and depends on neither. Failures here cost remote access,
-# not CI, so they warn instead of stopping setup.
-configure_tailscale() {
-  if [[ "${CONFIGURE_TAILSCALE}" -eq 0 ]]; then
-    step "Keeping Tailscale settings (--skip-tailscale)"
-    return 0
-  fi
-  local brew_bin
-  brew_bin="$(command -v brew)" || { warn "Homebrew not found; skipping Tailscale."; return 0; }
-  if ! command -v tailscale >/dev/null 2>&1; then
-    log "Installing Tailscale (CLI + tailscaled) for boot-time remote access"
-    as_user "${brew_bin}" install tailscale \
-      || { warn "Tailscale install failed; continuing without it."; return 0; }
-  fi
-  if command -v pgrep >/dev/null 2>&1 && pgrep -qx Tailscale 2>/dev/null; then
-    warn "The Tailscale menu-bar app is running. It only connects after GUI login"
-    warn "and conflicts with the boot service. Quit it and remove its Login Item."
-  fi
-  local ts_bin
-  ts_bin="$(command -v tailscale)" || { warn "tailscale CLI not found; skipping."; return 0; }
-  # `brew services start` without sudo installs a login-only agent that leaves
-  # the Mac unreachable at the login window; replace it with the boot service.
-  if [[ -e "${REAL_HOME}/Library/LaunchAgents/homebrew.mxcl.tailscale.plist" ]]; then
-    warn "Replacing the login-only Tailscale service with the boot service."
-    as_user "${brew_bin}" services stop tailscale >/dev/null 2>&1 || true
-    sudo launchctl asuser "${REAL_UID}" launchctl bootout \
-      "gui/${REAL_UID}/homebrew.mxcl.tailscale" 2>/dev/null || true
-    as_user rm -f "${REAL_HOME}/Library/LaunchAgents/homebrew.mxcl.tailscale.plist" || true
-  fi
-  if sudo launchctl print system/homebrew.mxcl.tailscale >/dev/null 2>&1; then
-    step "Tailscale system service is already loaded"
-  else
-    log "Starting tailscaled as a system service (reachable at the login window)"
-    sudo "${brew_bin}" services start tailscale \
-      || { warn "Could not start the Tailscale system service."; return 0; }
-  fi
-  # A plain `tailscale status` can be answered by the menu-bar app's daemon
-  # for the logged-in user, which made setup skip authentication while the
-  # BOOT daemon stayed logged out (and the Mac vanished from the tailnet at
-  # the login window). Pin every query to the system daemon's socket.
-  local ts_socket=/var/run/tailscaled.socket _i
-  for _i in 1 2 3 4 5 6 7 8 9 10; do
-    [[ ! -S "${ts_socket}" ]] || break
-    sleep 1
-  done
-  if sudo "${ts_bin}" --socket="${ts_socket}" status >/dev/null 2>&1; then
-    step "Tailscale boot service is connected"
-    return 0
-  fi
-  if [[ -t 0 ]]; then
-    log "Authenticating the Tailscale boot service (follow the login URL it prints)"
-    if sudo "${ts_bin}" --socket="${ts_socket}" up \
-        && sudo "${ts_bin}" --socket="${ts_socket}" status >/dev/null 2>&1; then
-      step "Tailscale boot service is connected"
-    else
-      warn "Tailscale boot service is still not logged in; run:"
-      warn "  sudo tailscale --socket=${ts_socket} up"
-    fi
-  else
-    warn "Tailscale boot service is not logged in; run: sudo tailscale --socket=${ts_socket} up"
-  fi
-  return 0
-}
-
-# macOS leaks a kernel ifnet reference per UDP packet tailscaled sends; the
-# 32-bit refcount wraps at 2^32 and the kernel PANICS, taking every runner
-# down mid-job (tailscale/tailscale#18953 — confirmed on Apple Silicon minis
-# with the Homebrew tailscaled this fleet runs). Restarting tailscaled does
-# not reset the kernel count; only a reboot does. Install runner-tailscale-guard
-# as a root LaunchDaemon that tracks the daemon's send counters and reboots the
-# host — idle-first — long before the wrap. Like configure_tailscale, failures
-# here warn instead of stopping setup.
-configure_tailscale_guard() {
-  if [[ "${CONFIGURE_TAILSCALE}" -eq 0 ]]; then
-    step "Keeping Tailscale guard settings (--skip-tailscale)"
-    return 0
-  fi
-  local self_dir guard_bin label="com.github.runner-tailscale-guard" plist staged
-  self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  guard_bin="${self_dir}/runner-tailscale-guard"
-  [[ -x "${guard_bin}" ]] || guard_bin="$(command -v runner-tailscale-guard)" \
-    || { warn "runner-tailscale-guard not found; skipping the panic guard."; return 0; }
-  local log_dir="${RUNNER_TS_GUARD_LOGS:-/Library/Logs/runner-tailscale-guard}"
-  plist="${LAUNCH_DAEMON_DIR}/${label}.plist"
-  staged="$(mktemp "${TMPDIR:-/tmp}/${label}.XXXXXX")" || return 0
-  sudo mkdir -p "${log_dir}" 2>/dev/null || true
-  python3 - "${staged}" "${guard_bin}" "${log_dir}" <<'PYGUARD'
-import plistlib, sys
-path, guard, logs = sys.argv[1:]
-with open(path, "wb") as f:
-    plistlib.dump({
-        "Label": "com.github.runner-tailscale-guard",
-        "ProgramArguments": [guard, "check"],
-        "EnvironmentVariables": {
-            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-        },
-        "RunAtLoad": True, "StartInterval": 1800,
-        "StandardOutPath": logs + "/stdout.log",
-        "StandardErrorPath": logs + "/stderr.log",
-    }, f)
-PYGUARD
-  [[ $? -eq 0 ]] || { rm -f "${staged}"; warn "Could not stage the Tailscale guard plist."; return 0; }
-  plutil -lint "${staged}" >/dev/null \
-    || { rm -f "${staged}"; warn "Staged Tailscale guard plist failed lint."; return 0; }
-  if ! cmp -s "${staged}" "${plist}"; then
-    bootout_system "${label}" || true
-    { sudo cp "${staged}" "${plist}" && sudo chown root:wheel "${plist}" \
-      && sudo chmod 644 "${plist}"; } \
-      || { rm -f "${staged}"; warn "Could not install the Tailscale guard plist."; return 0; }
-  fi
-  rm -f "${staged}"
-  sudo launchctl enable "system/${label}" 2>/dev/null || true
-  if ! sudo launchctl print "system/${label}" >/dev/null 2>&1; then
-    sudo launchctl bootstrap system "${plist}" \
-      || { warn "Could not start the Tailscale guard daemon."; return 0; }
-  fi
-  step "Tailscale panic guard installed (reboots before tailscale/tailscale#18953 wraps)"
 }
 
 # An installer receipt can outlive Rosetta across macOS upgrades, so check that
@@ -1659,11 +1408,6 @@ main() {
     done
   fi
   ensure_sudo
-  configure_power || return 1
-  configure_filevault || return 1
-  configure_remote_access
-  configure_tailscale
-  configure_tailscale_guard
   ensure_host_rosetta || return 1
   local staging_root="${TMPDIR:-/tmp}"
   [[ "${EUID}" -ne 0 ]] || staging_root=/tmp

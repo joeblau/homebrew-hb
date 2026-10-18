@@ -16,8 +16,15 @@ brew tap joeblau/hb
 ## Runner tooling
 
 `runner-setup` installs these commands; each has a guide in [`docs/`](docs).
+Prepare a new Mac, then add its runners:
 
-- `runner-setup` / `runner-cleanup` — provision and tear down runners ([docs](docs/boot-startup.md))
+```sh
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/joeblau/homebrew-hb/main/bin/runner-bootstrap)"
+runner-setup --org ORG --token TOKEN --runners 2 --colima
+```
+
+- `runner-bootstrap` — host setup: Homebrew, Brewfile, power, FileVault, SSH, Tailscale, auto-login, Dock ([docs](docs/boot-startup.md))
+- `runner-setup` / `runner-cleanup` — provision and tear down the runners themselves ([docs](docs/boot-startup.md))
 - `runner-ephemeral` — one-job runners ([docs](docs/ephemeral-runners.md))
 - `runner-prune` — checkout cleanup that keeps warm caches ([docs](docs/disk-cleanup.md))
 - `runner-health` — liveness watchdog and alerts ([docs](docs/health-checks.md))
