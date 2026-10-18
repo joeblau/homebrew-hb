@@ -4,8 +4,8 @@
 class RunnerSetup < Formula
   desc "Provision and tear down GitHub Actions self-hosted runners on macOS"
   homepage "https://github.com/joeblau/homebrew-hb"
-  url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/v1.16.0.tar.gz"
-  sha256 "392172e28bf90b7c248cb8a379dd080f6a707bd07ffbbf2bb5f79d2efa170c80"
+  url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/v1.16.1.tar.gz"
+  sha256 "f93c00841ab64bb6902ca30751dda3e9720428a8309906033d621c01a0664875"
   license "MIT"
 
   depends_on "docker"
@@ -35,7 +35,7 @@ class RunnerSetup < Formula
       runner-tailscale-guard
       runner-mcp
       runner-agent
-    ]
+    ].map { |tool| "bin/#{tool}" }
   end
 
   def caveats

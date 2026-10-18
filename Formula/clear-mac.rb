@@ -4,14 +4,14 @@
 class ClearMac < Formula
   desc "Clear Dock items and hide desktop widgets with preference backups"
   homepage "https://github.com/joeblau/homebrew-hb"
-  url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/clear-mac-v0.2.0.tar.gz"
-  sha256 "b495a0c6e76ef3c7e99604257e8d1c0d2690d0d843fdca05e8bc923ca8ccea7c"
+  url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/clear-mac-v0.2.1.tar.gz"
+  sha256 "65ee47284e6408669a02353ef4ebe40eea42650f87929ce121f3abd016ffcf78"
   license "MIT"
 
   depends_on macos: :sonoma
 
   def install
-    bin.install "clear-mac"
+    bin.install "bin/clear-mac"
   end
 
   def caveats

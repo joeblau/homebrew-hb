@@ -8,9 +8,9 @@ class Sr < Formula
 
   desc "Local AI image super-resolution with Real-ESRGAN"
   homepage "https://github.com/joeblau/homebrew-hb"
-  url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/sr-v0.2.0.tar.gz"
-  version "0.2.0"
-  sha256 "15fe33e3ae18f2eaf811d210c0cc558b39269dd469258778b13f4ec89cd3aeed"
+  url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/sr-v0.2.1.tar.gz"
+  version "0.2.1"
+  sha256 "7489449c778c2fc25cf109c43f73d2d7344250de05e156da57b623dc698c6aec"
   license "MIT"
   head "https://github.com/joeblau/homebrew-hb.git", branch: "main"
 
@@ -24,7 +24,7 @@ class Sr < Formula
   end
 
   def install
-    libexec.install "sr"
+    libexec.install "bin/sr"
     rewrite_shebang detected_python_shebang, libexec/"sr"
     resource("realesrgan").stage do
       (libexec/"realesrgan").install "realesrgan-ncnn-vulkan", "models"
@@ -46,7 +46,7 @@ class Sr < Formula
   end
 
   test do
-    assert_match "sr 0.2.0", shell_output("#{bin}/sr --version")
+    assert_match "sr 0.2.1", shell_output("#{bin}/sr --version")
     assert_match "super-resolution", shell_output("#{bin}/sr --help")
     assert_match "Input image does not exist", shell_output("#{bin}/sr missing.png 2>&1", 2)
 
