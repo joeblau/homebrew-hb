@@ -859,9 +859,15 @@ PYMIGRATE
   fi
   # Do not transition service ownership while any local CI worker is active.
   refuse_active_jobs "--colima setup" || return 1
-  if [[ -e "${REAL_HOME}/Library/LaunchAgents/homebrew.mxcl.colima.plist"      || -e "${LAUNCH_DAEMON_DIR}/homebrew.mxcl.colima.plist" ]]; then
-    err "Colima already has a Homebrew service. Stop that service between jobs before using --colima."; return 1
-  fi
+  # Homebrew labels services sh.brew.<formula> since September 2026 and
+  # homebrew.mxcl.<formula> before that.
+  local brew_label
+  for brew_label in sh.brew.colima homebrew.mxcl.colima; do
+    if [[ -e "${REAL_HOME}/Library/LaunchAgents/${brew_label}.plist" \
+        || -e "${LAUNCH_DAEMON_DIR}/${brew_label}.plist" ]]; then
+      err "Colima already has a Homebrew service. Stop that service between jobs before using --colima."; return 1
+    fi
+  done
   COLIMA_CONFIG_HOME="${COLIMA_HOME:-${REAL_HOME}/.colima}"
   COLIMA_DOCKER_CONFIG="${DOCKER_CONFIG:-${REAL_HOME}/.docker}"
   [[ "${COLIMA_CONFIG_HOME}" == /* && "${COLIMA_DOCKER_CONFIG}" == /* ]] || {

@@ -37,6 +37,9 @@ PROG_NAME="$(basename "${BASH_SOURCE[0]:-runner-bootstrap}")"
 TAP="joeblau/hb"
 LAUNCH_DAEMON_DIR="/Library/LaunchDaemons"
 HOMEBREW_INSTALLER="https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh"
+# Homebrew labels services sh.brew.<formula> since September 2026 and
+# homebrew.mxcl.<formula> before that; a Mac can carry either.
+TAILSCALE_LABELS="sh.brew.tailscale homebrew.mxcl.tailscale"
 KCPASSWORD="${RUNNER_BOOTSTRAP_KCPASSWORD:-/etc/kcpassword}"   # written by macOS for automatic login
 
 CHECK_ONLY=0
@@ -346,6 +349,18 @@ configure_remote_access() {
   return 0
 }
 
+# Prints the label of the loaded Homebrew tailscaled system service.
+tailscale_system_label() {
+  local label
+  for label in ${TAILSCALE_LABELS}; do
+    if sudo launchctl print "system/${label}" >/dev/null 2>&1; then
+      printf '%s\n' "${label}"
+      return 0
+    fi
+  done
+  return 1
+}
+
 # The Tailscale menu-bar app only connects after GUI login, so a rebooted Mini
 # disappears from the tailnet until someone types a password — and current
 # releases don't even persist their "Launch Tailscale at Login" setting across
@@ -373,15 +388,18 @@ configure_tailscale() {
   ts_bin="$(command -v tailscale)" || { warn "tailscale CLI not found; skipping."; return 0; }
   # `brew services start` without sudo installs a login-only agent that leaves
   # the Mac unreachable at the login window; replace it with the boot service.
-  if [[ -e "${REAL_HOME}/Library/LaunchAgents/homebrew.mxcl.tailscale.plist" ]]; then
+  local label agent
+  for label in ${TAILSCALE_LABELS}; do
+    agent="${REAL_HOME}/Library/LaunchAgents/${label}.plist"
+    [[ -e "${agent}" ]] || continue
     warn "Replacing the login-only Tailscale service with the boot service."
     as_user "${brew_bin}" services stop tailscale >/dev/null 2>&1 || true
     sudo launchctl asuser "${REAL_UID}" launchctl bootout \
-      "gui/${REAL_UID}/homebrew.mxcl.tailscale" 2>/dev/null || true
-    as_user rm -f "${REAL_HOME}/Library/LaunchAgents/homebrew.mxcl.tailscale.plist" || true
-  fi
-  if sudo launchctl print system/homebrew.mxcl.tailscale >/dev/null 2>&1; then
-    step "Tailscale system service is already loaded"
+      "gui/${REAL_UID}/${label}" 2>/dev/null || true
+    as_user rm -f "${agent}" || true
+  done
+  if label="$(tailscale_system_label)"; then
+    step "Tailscale system service is already loaded (${label})"
   else
     log "Starting tailscaled as a system service (reachable at the login window)"
     sudo "${brew_bin}" services start tailscale \
@@ -647,7 +665,7 @@ check_tailscale() {
   local ts_bin ts_socket=/var/run/tailscaled.socket
   if ! ts_bin="$(command -v tailscale)"; then
     record "Tailscale boot service" FAIL "tailscale CLI not installed"
-  elif ! sudo launchctl print system/homebrew.mxcl.tailscale >/dev/null 2>&1; then
+  elif ! tailscale_system_label >/dev/null; then
     record "Tailscale boot service" FAIL "tailscaled is not a loaded system service"
   elif ! sudo "${ts_bin}" --socket="${ts_socket}" status >/dev/null 2>&1; then
     record "Tailscale boot service" FAIL "not logged in; run: sudo tailscale --socket=${ts_socket} up"

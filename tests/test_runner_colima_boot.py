@@ -422,6 +422,18 @@ rm -f "$TEST_ROOT/login-session-vm"
         self.assertEqual((self.root/'vm-events').read_text().splitlines(),['provision','stop','bootstrap'])
         self.assertTrue((self.root/'loaded-com.github.runner-colima').exists())
 
+    def test_existing_homebrew_colima_service_blocks_handoff_under_either_label(self):
+        self.colima_binary('echo unexpected >> "$TEST_ROOT/vm-events"')
+        agents = self.root/'home/Library/LaunchAgents'
+        agents.mkdir(parents=True)
+        for path in (self.plists/'sh.brew.colima.plist', agents/'homebrew.mxcl.colima.plist'):
+            path.write_text('brew service')
+            result = self.shell(self.COLIMA_SETUP_FIXTURE + 'prepare_colima_boot')
+            self.assertNotEqual(result.returncode, 0, path)
+            self.assertIn('Colima already has a Homebrew service', result.stderr)
+            self.assertFalse((self.root/'vm-events').exists())
+            path.unlink()
+
     def test_colima_handoff_stop_failure_never_bootstraps_a_supervisor(self):
         self.colima_binary('exit 42')
         result = self.shell(self.COLIMA_SETUP_FIXTURE + 'prepare_colima_boot')

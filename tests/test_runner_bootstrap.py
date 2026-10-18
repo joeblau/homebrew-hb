@@ -150,6 +150,32 @@ class BootstrapTests(unittest.TestCase):
         self.assertIn('Tailscale boot service is connected', result.stderr)
         self.assertEqual(self.lines('brew-calls'), [])
 
+    # Homebrew has labelled services sh.brew.<formula> since September 2026.
+    def test_current_homebrew_label_counts_as_loaded(self):
+        (self.root/'ts-connected').touch()
+        (self.root/'loaded-sh.brew.tailscale').touch()
+        result = self.shell(self.TAILSCALE_BREW + 'configure_tailscale')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('already loaded (sh.brew.tailscale)', result.stderr)
+        self.assertEqual(self.lines('brew-calls'), [])
+
+    def test_current_homebrew_login_agent_is_replaced(self):
+        agent = self.root/'home/Library/LaunchAgents/sh.brew.tailscale.plist'
+        agent.parent.mkdir(parents=True)
+        agent.write_text('login-only')
+        result = self.shell(self.TAILSCALE_BREW + 'configure_tailscale')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(agent.exists())
+        self.assertIn('services start tailscale', self.lines('brew-calls'))
+
+    def test_check_passes_for_a_current_homebrew_boot_service(self):
+        (self.root/'ts-connected').touch()
+        for label in ('sh.brew.tailscale', 'com.github.runner-tailscale-guard'):
+            (self.root/f'loaded-{label}').touch()
+        result = self.shell('pgrep() { return 1; }; check_tailscale; print_checks')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stderr, r'Tailscale boot service\s+ok')
+
     def test_running_menu_bar_app_is_called_out(self):
         result = self.shell(self.TAILSCALE_BREW + 'pgrep() { [[ "$2" == Tailscale ]]; }\nconfigure_tailscale')
         self.assertEqual(result.returncode, 0, result.stderr)
