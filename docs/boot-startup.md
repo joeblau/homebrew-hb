@@ -19,7 +19,8 @@ required item is wrong.
   `~/.zprofile` so SSH sessions find it. `--skip-brew` skips this and the next
   step.
 - **Installs the tap's [Brewfile](../Brewfile):** `runner-setup` (and with it
-  every `runner-*` tool), `clear-mac`, Colima, Docker Buildx and Tailscale. A
+  every `runner-*` tool), `clear-mac`, GNU tar (`gtar`), GitHub CLI (`gh`),
+  Colima, Docker Buildx and Tailscale. A
   copy run from curl or a checkout then re-runs as the installed release, so
   host settings always come from a released `runner-bootstrap`.
 - **Applies the power policy below.**
@@ -76,6 +77,21 @@ required item is wrong.
 - **Verifies everything** and prints one table: Homebrew, Brewfile, power,
   FileVault, Remote Login, the Tailscale boot service and guard, automatic
   login, the Dock, and Rosetta.
+
+To install newly added tools on an existing Mini, update the tap and apply its
+Brewfile:
+
+```sh
+brew update
+brew bundle --file="$(brew --repository joeblau/hb)/Brewfile"
+gtar --version
+gh --version
+```
+
+The [GNU tar formula](https://formulae.brew.sh/formula/gnu-tar) provides `gtar`
+on macOS; the [GitHub CLI formula](https://formulae.brew.sh/formula/gh) provides
+`gh`. Bootstrap reads the Brewfile from the tap, so Brewfile additions take
+effect after `brew update` without a new `runner-setup` release.
 
 ### Power policy
 
