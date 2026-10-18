@@ -4,8 +4,8 @@
 class RunnerSetup < Formula
   desc "Provision and tear down GitHub Actions self-hosted runners on macOS"
   homepage "https://github.com/joeblau/homebrew-hb"
-  url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/v1.17.0.tar.gz"
-  sha256 "dcef227109e2d8c28b6190a9c59e600cf39ae0395b3c2a7394f31b8ca2d5d4aa"
+  url "https://github.com/joeblau/homebrew-hb/archive/refs/tags/v1.17.1.tar.gz"
+  sha256 "48d80d2ec85d84fea835db78c3e1268950d4f90d48569dbe73503eff3c24c297"
   license "MIT"
 
   depends_on "docker"
@@ -64,7 +64,7 @@ class RunnerSetup < Formula
 
       Prepare the Mac itself first — Homebrew, the tap's Brewfile, power
       settings, FileVault off, Remote Login, tailscaled at boot with its
-      kernel-panic reboot guard, optional automatic login, a cleared Dock:
+      kernel-panic reboot guard, automatic login, a cleared Dock:
         runner-bootstrap               # --check verifies without changing
       runner-setup only provisions runners. It upgrades itself through
       Homebrew first (--skip-self-upgrade to skip), resumes runners left in
