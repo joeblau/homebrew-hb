@@ -1,116 +1,46 @@
 # Homebrew Tap
 
-```
-brew tap joeblau/hb
-```
-
-| Path | Contents |
-| --- | --- |
-| `Formula/` | Homebrew formulas (`formula_renames.json` maps renamed ones) |
-| `bin/` | Every installable script; formulas install from here |
-| `agent-mcp/` | Rust source for the `agent-mcp` formula |
-| `docs/` | Per-tool guides |
-| `tests/` | Isolated regression tests (`python3 -m unittest discover -s tests`) |
-| `Brewfile` | Bootstrap bundle for a fresh runner Mac |
-
-## Image super-resolution (`sr` formula)
-
-Upscale images locally with Real-ESRGAN on Apple Silicon or Intel Macs:
-
-```sh
-brew install joeblau/hb/sr
-sr photo.jpg                         # writes photo-sr4x.png
-sr image.heic --scale 2 -o bigger.png
-sr photo.jpg --scale 8 --sharpen      # AI restoration, then resize and sharpen
-sr photo.jpg --scale 2 --ai-strength 0.5  # gentler restoration
-sr illustration.png result.webp --model anime
-```
-
-Models are bundled and processing runs offline on a Vulkan/Metal-capable GPU.
-Inputs can use any format ImageMagick can decode, including HEIC, TIFF, and BMP.
-Use `--force` to replace an existing output; the original is always preserved.
-Scales above 4× resize a single AI result by default. `--ai-passes 2` enables
-repeated AI restoration; `--ai-strength` reduces its effect, and `--sharpen`
-adds optional edge sharpening.
-See [usage, format details, and running from a checkout](docs/super-resolution.md).
-
-## Clear Dock items and desktop widgets (`clear-mac` formula)
-
-```sh
-brew update
-brew install joeblau/hb/clear-mac
-clear-mac
-```
-
-Run as the user whose desktop you want to clear, without `sudo`. The command
-clears pinned apps, files and folders from the Dock, hides recent apps, and
-hides all desktop widgets in both the standard desktop and Stage Manager.
-Widget layouts are retained; Notification Center widgets are preserved.
-These are the [Show Widgets settings](https://support.apple.com/guide/mac-help/add-and-customize-widgets-mchl52be5da5/mac)
-in System Settings > Desktop & Dock. Requires macOS Sonoma or later.
-
-Both preference domains are backed up before any changes under
-`~/Library/Application Support/clear-mac/backups/`. The command prints restore
-commands and refreshes that user's Dock and Notification Center. Finder, Trash,
-running apps and minimized windows can still appear.
-
-Previously installed `clear-dock` users can run `brew upgrade clear-mac` after
-`brew update`; Homebrew's rename mapping migrates the old formula. Existing
-`clear-dock` backups are retained in their original directory.
-
-## Runner tooling (`runner-setup` formula)
-
-Provision and operate GitHub Actions self-hosted runners on macOS:
-
-Installing `runner-setup` with Homebrew also installs the Docker CLI and `jq`.
-For Docker builds, configure [Colima or a remote Linux builder](docs/docker-builds.md).
-Use `runner-setup --colima` to start Docker at boot and gate runner startup on Docker readiness.
-On Apple Silicon, Colima setup also installs missing Rosetta 2 for `linux/amd64` containers.
-Runner setup also enables restart after power failure and disables system sleep,
-disk sleep and Power Nap where supported. Use `--skip-power-config` to retain
-existing settings. It upgrades itself through Homebrew, turns off FileVault so
-restarts need no login (`--keep-filevault` opts out), enables Remote Login,
-runs tailscaled as a boot-time system service (`--skip-remote-login` /
-`--skip-tailscale` opt out), supervises the Colima VM so it never keeps
-running without Rosetta, and finishes only when every runner is listening for
-jobs. See [power settings and boot verification](docs/boot-startup.md).
-
-Bootstrap a fresh Mini with the tap's [Brewfile](Brewfile):
-
 ```sh
 brew tap joeblau/hb
-brew bundle --file="$(brew --repository joeblau/hb)/Brewfile"
 ```
-Runner services restart after any exit. Re-running setup repairs existing
-startup settings; explicit `--colima` setup transfers the idle VM to system
-launchd so it runs independently of the owner's GUI session.
 
-- `runner-setup` / `runner-cleanup` — provision and tear down runners as system LaunchDaemons
-- `runner-ephemeral` — one-job runners, re-registered fresh after every job, with opt-in sandbox-exec confinement and APFS snapshot rollback ([docs](docs/ephemeral-runners.md))
-- `runner-prune` — scoped checkout cleanup that preserves warm caches, with a free-space floor ([docs](docs/disk-cleanup.md))
-- `runner-health` — liveness watchdog with stuck/offline detection and alerts ([docs](docs/health-checks.md))
-- `runner-tailscale-guard` — reboots the host, idle-first, before tailscaled's kernel refcount leak panics macOS; installed by setup ([docs](docs/boot-startup.md))
-- `runner-cache` — local S3-compatible (MinIO) storage for an S3-aware cache action, plus an optional GitHub Actions cache-protocol gateway for stock `actions/cache` ([docs](docs/cache-backend.md))
-- `runner-bazel-cache` — per-scope Bazel remote cache service (bazel-remote) as LaunchDaemons ([docs](docs/bazel-cache.md))
-- `runner-sccache` — opt-in per-scope sccache compiler caches on persistent SSD storage ([docs](docs/compiler-cache.md))
-- `runner-ramscratch` — opt-in bounded RAM-backed build scratch space with SSD fallback ([docs](docs/ram-scratch.md))
-- `runner-bench` — repeatable CI benchmark harness: phase timings, resources, cache stats, median/p95 comparisons ([docs](docs/runner-performance.md))
-- `runner-git-mirror` — local bare Git mirrors with per-runner checkout rewiring for fast clones ([docs](docs/git-mirror.md))
-- `runner-logs` — ship runner logs, emit JSON-lines metrics, step-level CPU/memory timelines, JUnit flake history, and a static HTML dashboard ([docs](docs/log-aggregation.md))
-- `runner-upgrade` — shutdown, canary upgrades, restart, registration repair, and rollback ([docs](docs/auto-upgrades.md))
-- `runner-autoscale` — queue-aware scaling between min/max runner counts ([docs](docs/autoscaling.md))
-- `runner-token` — mint short-lived registration/removal tokens on demand ([docs](docs/token-management.md))
-- `runner-netisolate` — pf egress policy and VPN kill-switch for runners ([docs](docs/network-isolation.md))
-- `runner-docker-builder` — fast Docker builds via a remote Linux builder or colima, with BuildKit GC tuning and a registry pull-through mirror ([docs](docs/docker-builds.md))
-- `runner-mcp` — read-only MCP server so Claude Code/Codex can diagnose runners, jobs, caches, and failed CI runs on this Mac ([docs](docs/agent-tools.md))
-- `runner-agent` — Claude Code as a CI-fixing agent on your runners: failed runs become PRs, `@runner-agent` mentions get done, with optional Slack notifications, via a reusable workflow ([docs](docs/runner-agent.md))
+| Formula | What it does | Docs |
+| --- | --- | --- |
+| `sr` | Local AI image super-resolution with Real-ESRGAN | [super-resolution](docs/super-resolution.md) |
+| `clear-mac` | Clear Dock items and hide desktop widgets, with backups | [clear-mac](docs/clear-mac.md) |
+| `runner-setup` | Provision and operate GitHub Actions self-hosted runners on macOS | [boot-startup](docs/boot-startup.md) |
+| `agent-mcp` | MCP server that wraps any agent CLI (codex, claude, gemini, grok, kimi) | [agent-mcp](agent-mcp/README.md) |
+| `appicon` | App icon generator | [joeblau/appicon](https://github.com/joeblau/appicon) |
+| `simrecord` | iPhone Simulator recorder | [joeblau/simrecord](https://github.com/joeblau/simrecord) |
 
-See the [performance review and Blacksmith capability map](docs/runner-performance.md)
-for corrected integrations, remaining platform gaps, sizing guidance, and a
-repeatable benchmark procedure.
+## Runner tooling
 
-Run isolated runner regression checks from this checkout:
+`runner-setup` installs these commands; each has a guide in [`docs/`](docs).
+
+- `runner-setup` / `runner-cleanup` — provision and tear down runners ([docs](docs/boot-startup.md))
+- `runner-ephemeral` — one-job runners ([docs](docs/ephemeral-runners.md))
+- `runner-prune` — checkout cleanup that keeps warm caches ([docs](docs/disk-cleanup.md))
+- `runner-health` — liveness watchdog and alerts ([docs](docs/health-checks.md))
+- `runner-tailscale-guard` — reboots before the tailscaled kernel panic ([docs](docs/boot-startup.md))
+- `runner-cache` — local S3 cache and Actions cache gateway ([docs](docs/cache-backend.md))
+- `runner-bazel-cache` — Bazel remote cache ([docs](docs/bazel-cache.md))
+- `runner-sccache` — compiler caches ([docs](docs/compiler-cache.md))
+- `runner-ramscratch` — RAM-backed build scratch ([docs](docs/ram-scratch.md))
+- `runner-bench` — CI benchmark harness ([docs](docs/runner-performance.md))
+- `runner-git-mirror` — local Git mirrors ([docs](docs/git-mirror.md))
+- `runner-logs` — logs, metrics and dashboard ([docs](docs/log-aggregation.md))
+- `runner-upgrade` — canary upgrades and rollback ([docs](docs/auto-upgrades.md))
+- `runner-autoscale` — queue-aware scaling ([docs](docs/autoscaling.md))
+- `runner-token` — short-lived registration tokens ([docs](docs/token-management.md))
+- `runner-netisolate` — egress policy and VPN kill-switch ([docs](docs/network-isolation.md))
+- `runner-docker-builder` — fast Docker builds ([docs](docs/docker-builds.md))
+- `runner-mcp` — read-only MCP server for runner diagnostics ([docs](docs/agent-tools.md))
+- `runner-agent` — Claude Code as a CI-fixing agent ([docs](docs/runner-agent.md))
+
+## Development
+
+Scripts live in `bin/`. Run the tests with:
 
 ```sh
-python3 -m unittest discover -s tests -p 'test_runner_*.py' -v
+python3 -m unittest discover -s tests
 ```
