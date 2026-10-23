@@ -1,7 +1,7 @@
 """runner-bootstrap host setup with fake commands; never alters real host settings.
 
 Covers the host steps moved out of runner-setup (FileVault, Remote Login,
-Tailscale and its panic guard) and bootstrap's own steps: automatic login,
+Tailscale and its panic guard) and bootstrap's own steps: unattended preferences, automatic login,
 clearing the Dock and desktop, the Homebrew/Brewfile install, the hand-off
 to the installed release, and the verification table.
 """
@@ -20,10 +20,24 @@ BOOTSTRAP_FAKES = dict(FAKES, **{
     'defaults': '''echo "$*" >> "$TEST_ROOT/defaults-calls"
 case "$1" in
   read) cat "$TEST_ROOT/defaults/${2##*/}/$3" 2>/dev/null ;;
+  write)
+    [[ ! -f "$TEST_ROOT/defaults-fail-$3" ]] || exit 1
+    [[ ! -f "$TEST_ROOT/defaults-ignore-writes" ]] || exit 0
+    mkdir -p "$TEST_ROOT/defaults/${2##*/}"
+    value="$5"
+    [[ "$4" != -bool || "$value" != false ]] || value=0
+    echo "$value" > "$TEST_ROOT/defaults/${2##*/}/$3"
+    ;;
   *) exit 0 ;;
 esac''',
     'clear-mac': 'echo cleared >> "$TEST_ROOT/clear-mac-calls"',
     'sysadminctl': 'echo "$*" >> "$TEST_ROOT/sysadminctl-calls"',
+    # gui/<uid> exists only while that user is logged in at the console.
+    'launchctl': '''echo "$*" >> "$TEST_ROOT/launchctl-calls"
+case "$1 $2" in
+  "print gui/501") [[ -f "$TEST_ROOT/gui-session" ]] ;;
+  *) exit 0 ;;
+esac''',
 })
 
 CLEAR = {
@@ -243,6 +257,123 @@ class BootstrapTests(unittest.TestCase):
         self.assertIn('continued', result.stdout)
 
     # --- bootstrap-only behavior ------------------------------------------
+
+    def test_unattended_preferences_are_written_and_verified(self):
+        self.set_pref('.GlobalPreferences', 'com.apple.autologout.AutoLogOutDelay', '300')
+        self.set_pref('com.apple.SoftwareUpdate', 'AutomaticallyInstallMacOSUpdates', '1')
+        result = self.shell('configure_unattended_preferences; check_unattended_preferences; print_checks')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.lines('sudo-calls'), [
+            'defaults write /Library/Preferences/.GlobalPreferences '
+            'com.apple.autologout.AutoLogOutDelay -int 0',
+            'defaults write /Library/Preferences/com.apple.SoftwareUpdate '
+            'AutomaticallyInstallMacOSUpdates -bool false',
+        ])
+        self.assertRegex(result.stderr, r'Automatic logout\s+ok')
+        self.assertRegex(result.stderr, r'Automatic macOS updates\s+ok')
+
+    def test_unattended_preference_write_failures_stop_setup(self):
+        for key in ('com.apple.autologout.AutoLogOutDelay', 'AutomaticallyInstallMacOSUpdates'):
+            with self.subTest(key=key):
+                marker = self.root / f'defaults-fail-{key}'
+                marker.touch()
+                result = self.shell('configure_unattended_preferences')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('bootstrap stopped', result.stderr)
+                marker.unlink()
+
+    def test_unattended_preferences_must_read_back_correctly(self):
+        (self.root / 'defaults-ignore-writes').touch()
+        result = self.shell('configure_unattended_preferences; check_unattended_preferences; print_checks')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertRegex(result.stderr, r'Automatic logout\s+FAIL')
+        self.assertRegex(result.stderr, r'Automatic macOS updates\s+FAIL')
+
+    def test_missing_or_enabled_unattended_preferences_fail_without_writes(self):
+        for value in (None, '1'):
+            with self.subTest(value=value):
+                if value is not None:
+                    self.set_pref('.GlobalPreferences', 'com.apple.autologout.AutoLogOutDelay', value)
+                    self.set_pref('com.apple.SoftwareUpdate', 'AutomaticallyInstallMacOSUpdates', value)
+                result = self.shell('check_unattended_preferences; print_checks')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertRegex(result.stderr, r'Automatic logout\s+FAIL')
+                self.assertRegex(result.stderr, r'Automatic macOS updates\s+FAIL')
+        self.assertFalse(any(call.startswith('write ') for call in self.lines('defaults-calls')))
+        self.assertEqual(self.lines('sudo-calls'), [])
+
+    HOST_STUBS = '''
+detect_user() { :; }
+ensure_sudo() { :; }
+load_brew_env() { :; }
+configure_power() { :; }
+configure_filevault() { :; }
+configure_remote_access() { :; }
+configure_tailscale() { :; }
+configure_tailscale_guard() { :; }
+configure_auto_login() { :; }
+configure_desktop() { :; }
+check_brew() { :; }
+check_power() { :; }
+check_filevault() { :; }
+check_remote_login() { :; }
+check_tailscale() { :; }
+check_auto_login() { :; }
+check_console_session() { :; }
+check_desktop() { :; }
+check_rosetta() { :; }
+'''
+
+    def test_main_applies_unattended_preferences(self):
+        result = self.shell(self.HOST_STUBS + 'main --skip-brew')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stderr, r'Automatic logout\s+ok')
+        self.assertRegex(result.stderr, r'Automatic macOS updates\s+ok')
+        self.assertEqual(len(self.lines('sudo-calls')), 2)
+
+    def test_main_check_reports_missing_preferences_without_changing_them(self):
+        result = self.shell(self.HOST_STUBS + 'main --check')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertRegex(result.stderr, r'Automatic logout\s+FAIL')
+        self.assertRegex(result.stderr, r'Automatic macOS updates\s+FAIL')
+        self.assertFalse(any(call.startswith('write ') for call in self.lines('defaults-calls')))
+        self.assertEqual(self.lines('sudo-calls'), [])
+
+    def test_console_session_present_passes(self):
+        (self.root / 'gui-session').touch()
+        result = self.shell('check_console_session; print_checks')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stderr, r'Console session\s+ok\s+gui/501 \(fixture\)')
+        self.assertEqual(self.lines('launchctl-calls'), ['print gui/501'])
+
+    def test_missing_console_session_fails_and_names_the_fix(self):
+        # Automatic login already on: a restart creates the session.
+        self.set_pref('com.apple.loginwindow', 'autoLoginUser', 'fixture')
+        result = self.shell('check_console_session; print_checks')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertRegex(result.stderr, r'Console session\s+FAIL\s+none; restart this Mac')
+        # Automatic login off (or for another user): turn it on first.
+        for user in (None, 'someone-else'):
+            with self.subTest(user=user):
+                path = self.root / 'defaults/com.apple.loginwindow/autoLoginUser'
+                path.unlink(missing_ok=True)
+                if user:
+                    self.set_pref('com.apple.loginwindow', 'autoLoginUser', user)
+                result = self.shell('check_console_session; print_checks')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertRegex(result.stderr, r'Console session\s+FAIL\s+none; turn on automatic login')
+
+    def test_console_session_is_skipped_without_auto_login(self):
+        result = self.shell('AUTO_LOGIN=0; check_console_session; print_checks')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stderr, r'Console session\s+skip\s+none \(--skip-auto-login\)')
+
+    def test_verify_host_reports_the_console_session(self):
+        stubs = self.HOST_STUBS.replace('check_console_session() { :; }\n', '')
+        (self.root / 'gui-session').touch()
+        result = self.shell(stubs + 'check_unattended_preferences() { :; }\nverify_host; print_checks')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stderr, r'Console session\s+ok')
 
     def test_runner_options_are_rejected(self):
         result = self.shell('parse_args --org acme')

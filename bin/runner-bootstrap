@@ -20,9 +20,10 @@
 #      so host settings always come from a released runner-bootstrap.
 #   3. Host settings — power policy for always-on use, FileVault off (it holds
 #      every restart at a password screen), Remote Login, tailscaled as a boot
-#      service plus its kernel-panic reboot guard, automatic login,
-#      and a cleared Dock and desktop.
-#   4. Verification — every item is re-read and reported; the exit status is
+#      service plus its kernel-panic reboot guard, automatic login, automatic
+#      logout and macOS update installation off, and a cleared Dock and desktop.
+#   4. Verification — every item is re-read and reported, including whether
+#      the owner's console (GUI) session exists right now; the exit status is
 #      non-zero when anything required is wrong.
 #
 # Run as the admin user who will own the runners, not as root: Homebrew
@@ -507,6 +508,21 @@ bootout_system() {
 }
 
 
+# Keep unattended GUI sessions logged in and leave macOS upgrades to maintenance.
+configure_unattended_preferences() {
+  log "Disabling automatic logout and automatic macOS update installation"
+  if ! sudo defaults write /Library/Preferences/.GlobalPreferences \
+    com.apple.autologout.AutoLogOutDelay -int 0; then
+    err "Could not disable automatic logout; bootstrap stopped."
+    return 1
+  fi
+  if ! sudo defaults write /Library/Preferences/com.apple.SoftwareUpdate \
+    AutomaticallyInstallMacOSUpdates -bool false; then
+    err "Could not disable automatic macOS update installation; bootstrap stopped."
+    return 1
+  fi
+}
+
 auto_login_user() {
   defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser 2>/dev/null || true
 }
@@ -632,6 +648,24 @@ check_power() {
   fi
 }
 
+check_unattended_preferences() {
+  local value
+  value="$(defaults read /Library/Preferences/.GlobalPreferences \
+    com.apple.autologout.AutoLogOutDelay 2>/dev/null)" || value=""
+  if [[ "${value}" == 0 ]]; then
+    record "Automatic logout" ok "disabled"
+  else
+    record "Automatic logout" FAIL "AutoLogOutDelay must be 0; re-run bootstrap"
+  fi
+  value="$(defaults read /Library/Preferences/com.apple.SoftwareUpdate \
+    AutomaticallyInstallMacOSUpdates 2>/dev/null)" || value=""
+  if [[ "${value}" == 0 ]]; then
+    record "Automatic macOS updates" ok "automatic installation disabled"
+  else
+    record "Automatic macOS updates" FAIL "AutomaticallyInstallMacOSUpdates must be false; re-run bootstrap"
+  fi
+}
+
 check_filevault() {
   local status
   status="$(fdesetup status 2>/dev/null)" || { record "FileVault" FAIL "could not read status"; return 0; }
@@ -697,6 +731,26 @@ check_auto_login() {
   fi
 }
 
+# GUI jobs (WebKit, simulators) hang without the runner owner's console
+# session, which only a login creates: a Mac sitting at the login window has
+# no gui/<uid> domain. Automatic login creates it at boot; nothing else does
+# unattended, so the fix for a missing session is a restart (or a login).
+console_session_present() {
+  launchctl print "gui/${REAL_UID}" >/dev/null 2>&1
+}
+
+check_console_session() {
+  if console_session_present; then
+    record "Console session" ok "gui/${REAL_UID} (${REAL_USER})"
+  elif [[ "${AUTO_LOGIN}" -eq 0 ]]; then
+    record "Console session" skip "none (--skip-auto-login); GUI jobs cannot run here"
+  elif [[ "$(auto_login_user)" == "${REAL_USER}" ]]; then
+    record "Console session" FAIL "none; restart this Mac so automatic login starts it"
+  else
+    record "Console session" FAIL "none; turn on automatic login, then restart"
+  fi
+}
+
 check_desktop() {
   if desktop_is_clear; then
     record "Dock and desktop" ok "cleared"
@@ -720,10 +774,12 @@ verify_host() {
   log "Verifying host setup"
   check_brew
   check_power
+  check_unattended_preferences
   check_filevault
   check_remote_login
   check_tailscale
   check_auto_login
+  check_console_session
   check_desktop
   check_rosetta
 }
@@ -766,6 +822,7 @@ main() {
     load_brew_env || true
   fi
   configure_power || return 1
+  configure_unattended_preferences || return 1
   configure_filevault || return 1
   configure_remote_access
   configure_tailscale

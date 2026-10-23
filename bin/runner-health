@@ -17,12 +17,21 @@
 #   3. GitHub API (optional, needs --org/--repo + GITHUB_PAT) — the runner's
 #      status/busy fields; a runner busy longer than --busy-timeout-minutes
 #      (default 120) is flagged as stuck.
+#   4. Console session (optional, --require-gui) — the runner owner must have a
+#      gui/<uid> launchd session: WebKit, Chromium and the iOS simulators hang
+#      without one, and a Mac sitting at the login window has none. Reported
+#      as the pseudo-runner "host". With --reboot-for-gui the host is
+#      restarted — idle first, never during a job or maintenance — when
+#      automatic login is set for that user, since only a login creates the
+#      session and automatic login does so at boot.
 #
 # Remediation:
 #   - stuck busy / stale diag while running  -> launchctl kickstart -k
 #   - offline / unregistered / not running   -> bootout + bootstrap
 #   - daemon AND plist both missing          -> no local fix; runner-setup must
 #                                               be re-run (alert only)
+#   - console session missing (--require-gui) -> shutdown -r (--reboot-for-gui,
+#                                               idle host, automatic login on)
 #
 # Alerting: a structured log line is written to stdout for EVERY runner on
 # EVERY pass, and when ALERT_WEBHOOK_URL is set a Slack-compatible JSON payload
@@ -58,6 +67,9 @@ JSON_RUNNERS=""       # accumulated per-runner JSON objects for the pass
 
 ORG=""
 REPO=""
+REQUIRE_GUI=0         # --require-gui: the runner owner needs a console (gui) session
+REBOOT_FOR_GUI=0      # --reboot-for-gui: restart an idle host so automatic login restores it
+LOGINWINDOW_PLIST="${RUNNER_HEALTH_LOGINWINDOW:-/Library/Preferences/com.apple.loginwindow}"
 
 # State persisted across passes: busy-since timestamps and alert-suppression
 # markers. Lives next to the runners so it is shared no matter who invokes us
@@ -118,6 +130,17 @@ OPTIONS:
   --org ORG_NAME            Also query GET /orgs/ORG_NAME/actions/runners for
                             online/offline/busy status of each runner.
   --repo OWNER/REPO         Same, against GET /repos/OWNER/REPO/actions/runners.
+  --require-gui             Also require the runner owner's console session
+                            (launchd gui/<uid> domain). GUI jobs — WebKit,
+                            Chromium, iOS simulators — hang without it, and a
+                            Mac at the login window has none. Reported as the
+                            pseudo-runner "host" (event gui_session_missing).
+  --reboot-for-gui          Implies --require-gui. When the session is missing,
+                            automatic login is set for the runner owner, no job
+                            is running, no runner is in maintenance and nobody
+                            else holds the console, restart the host: automatic
+                            login recreates the session at boot, and nothing
+                            else can create it unattended. Needs root (or sudo).
   -h, --help                Show this help and exit.
 
 ENVIRONMENT:
@@ -137,6 +160,7 @@ EXAMPLES:
   GITHUB_PAT=ghp_... ALERT_WEBHOOK_URL=https://hooks.slack.com/services/... \
     ${PROG_NAME} --once --org acme
   ${PROG_NAME} --repo acme/monorepo --interval 600
+  ${PROG_NAME} --once --reboot-for-gui          # the runner-setup watchdog
 
 SECURITY NOTE:
   Both secrets come from the ENVIRONMENT ONLY and are passed to curl through a
@@ -192,6 +216,8 @@ parse_args() {
         [[ $# -ge 2 ]] || { err "--repo requires a value"; usage; exit 2; }
         REPO="$2"; shift 2 ;;
       --repo=*)    REPO="${1#*=}"; shift ;;
+      --require-gui) REQUIRE_GUI=1; shift ;;
+      --reboot-for-gui) REQUIRE_GUI=1; REBOOT_FOR_GUI=1; shift ;;
       -h|--help)   usage; exit 0 ;;
       *)
         err "Unknown argument: $1"
@@ -713,6 +739,151 @@ check_one() {
 }
 
 # ----------------------------------------------------------------------------
+# Console (GUI) session check — host-wide, opt-in via --require-gui.
+# ----------------------------------------------------------------------------
+
+# The user the runner daemons run as: UserName of the first runner plist, else
+# the owner of the first runner directory. Their jobs need THAT user's session.
+runner_owner() {
+  local name plist user
+  [[ ${#RUNNER_NAMES[@]} -gt 0 ]] || return 1
+  for name in "${RUNNER_NAMES[@]}"; do
+    plist="${LAUNCH_DAEMON_DIR}/com.github.${name}.plist"
+    if [[ -f "${plist}" ]]; then
+      user="$(plutil -extract UserName raw -o - "${plist}" 2>/dev/null || true)"
+      if [[ -n "${user}" && "${user}" != root ]]; then printf '%s' "${user}"; return 0; fi
+    fi
+    if [[ -d "${RUNNER_ROOT}/${name}" ]]; then
+      user="$(stat -f %Su "${RUNNER_ROOT}/${name}" 2>/dev/null || true)"
+      if [[ -n "${user}" && "${user}" != root ]]; then printf '%s' "${user}"; return 0; fi
+    fi
+  done
+  return 1
+}
+
+gui_session_present() {   # <uid>
+  ${SUDO} launchctl print "gui/$1" >/dev/null 2>&1
+}
+
+auto_login_user() {
+  defaults read "${LOGINWINDOW_PLIST}" autoLoginUser 2>/dev/null || true
+}
+
+# root owns /dev/console at the login window; a logged-in user owns it otherwise.
+console_owner() {
+  stat -f %Su /dev/console 2>/dev/null || true
+}
+
+# Changes on every boot; the reboot marker stores it so one missing session
+# causes at most one reboot. If the Mac came back without a session, automatic
+# login is not working and another reboot would just loop.
+current_boot_uuid() {
+  sysctl -n kern.bootsessionuuid 2>/dev/null || echo unknown-boot
+}
+
+# A runner mid-job runs a Runner.Worker process; idle listeners do not.
+host_is_idle() {
+  ! pgrep -f 'Runner\.Worker' >/dev/null 2>&1
+}
+
+# runner-upgrade keeps these while an operator has a runner stopped; a reboot
+# would start every daemon again and undo that.
+any_runner_in_maintenance() {
+  local marker
+  shopt -s nullglob
+  for marker in "${RUNNER_ROOT}"/.maintenance/runner-*; do
+    shopt -u nullglob
+    [[ -f "${marker}" ]] && return 0
+  done
+  shopt -u nullglob
+  return 1
+}
+
+# Returns non-zero when the session is missing and was not restored. Emits one
+# structured record for the pseudo-runner "host" so logs and --json keep a
+# single record shape (svc_state carries "session" / "no-session").
+check_gui_session() {
+  [[ "${REQUIRE_GUI}" -eq 1 ]] || return 0
+  local owner uid holder issue="gui_session_missing" action="none" result="failed" why=""
+  if ! owner="$(runner_owner)"; then
+    warn "host: could not determine the runner owner; skipping the console session check."
+    return 0
+  fi
+  if ! uid="$(id -u "${owner}" 2>/dev/null)"; then
+    warn "host: no such user '${owner}'; skipping the console session check."
+    return 0
+  fi
+
+  local reboot_marker="${STATE_DIR}/host.rebooted_in" rebooted_in boot
+  if gui_session_present "${uid}"; then
+    emit_log host check session -1 n/a false none ok
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+      state_remove "${STATE_DIR}/host.alerted"
+      state_remove "${reboot_marker}"
+    fi
+    record_status host "OK (console session gui/${uid} for ${owner})"
+    return 0
+  fi
+
+  holder="$(console_owner)"
+  rebooted_in="$(state_read "${reboot_marker}")"
+  boot="$(current_boot_uuid)"
+  if [[ "${REBOOT_FOR_GUI}" -eq 0 ]]; then
+    why="no console session for ${owner} (gui/${uid}); GUI jobs will fail here. Log ${owner} in at the console, or run with --reboot-for-gui"
+  elif [[ "$(auto_login_user)" != "${owner}" ]]; then
+    why="no console session for ${owner} and automatic login is not set for that user, so a reboot would not restore it; run runner-bootstrap interactively"
+  elif [[ -n "${holder}" && "${holder}" != root && "${holder}" != "${owner}" ]]; then
+    why="no console session for ${owner}; ${holder} holds the console, so not rebooting"
+  elif [[ -n "${rebooted_in}" && "${rebooted_in}" != "${boot}" ]]; then
+    why="no console session for ${owner} after the watchdog's reboot, so automatic login is not creating one; not rebooting again. Check the login window, then restart manually"
+  elif [[ -n "${rebooted_in}" ]]; then
+    action="reboot"; result="deferred"
+    why="no console session for ${owner}; a reboot is already underway"
+  elif any_runner_in_maintenance; then
+    action="reboot"; result="deferred"
+    why="no console session for ${owner}; a runner is in maintenance, reboot deferred"
+  elif ! host_is_idle; then
+    action="reboot"; result="deferred"
+    why="no console session for ${owner}; a job is running, reboot deferred until idle"
+  else
+    action="reboot"
+    why="no console session for ${owner}; restarting so automatic login recreates it"
+  fi
+
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    result="detected"
+    step "host: ${why} (would ${action})."
+  elif [[ "${action}" == reboot && "${result}" != deferred ]]; then
+    log "host: ${why}"
+    state_write "${reboot_marker}" "${boot}"
+    if ${SUDO} shutdown -r now "${PROG_NAME}: restoring the console session for GUI jobs"; then
+      result="remediated"
+    else
+      result="failed"
+      state_remove "${reboot_marker}"
+      err "host: shutdown -r failed; run: sudo shutdown -r now"
+    fi
+  elif [[ "${result}" == deferred ]]; then
+    warn "host: ${why}."
+  else
+    err "host: ${why}."
+  fi
+
+  emit_log host "${issue}" no-session -1 n/a false "${action}" "${result}"
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    record_status host "DETECTED (${issue}; would ${action})"
+    return 1
+  fi
+  alert host "${PROG_NAME} on ${HOST_LABEL}: host issue=${issue} action=${action} result=${result} - ${why}"
+  if [[ "${result}" == remediated ]]; then
+    record_status host "${issue} -> ${action} (remediated)"
+    return 0
+  fi
+  record_status host "FAILED (${issue}; ${result})"
+  return 1
+}
+
+# ----------------------------------------------------------------------------
 # One check pass over every runner. Returns non-zero if any issue could not
 # be remediated.
 # ----------------------------------------------------------------------------
@@ -749,6 +920,10 @@ run_pass() {
       overall=1
     fi
   done
+  # Last, so every runner's record is written before a reboot is issued.
+  if ! check_gui_session; then
+    overall=1
+  fi
 
   if [[ "${JSON}" -eq 1 ]]; then
     emit_json_pass "$([[ "${overall}" -eq 0 ]] && echo true || echo false)"

@@ -24,6 +24,12 @@ required item is wrong.
   checkout then re-runs as the installed release, so host settings always
   come from a released `runner-bootstrap`.
 - **Applies the power policy below.**
+- **Disables automatic logout and automatic macOS update installation.** Sets
+  `com.apple.autologout.AutoLogOutDelay` to integer `0` in
+  `/Library/Preferences/.GlobalPreferences` and
+  `AutomaticallyInstallMacOSUpdates` to boolean `false` in
+  `/Library/Preferences/com.apple.SoftwareUpdate`. This keeps unattended GUI
+  sessions logged in and leaves macOS upgrades to planned maintenance.
 - **Turns off FileVault.** FileVault holds every restart, including
   `autorestart` after a power failure, at a password screen, so no runner can
   start. Bootstrap runs `sudo fdesetup disable`, which asks for an admin's
@@ -75,8 +81,16 @@ required item is wrong.
   preference domains first ([details](clear-mac.md)). It runs only when
   something is left to clear. `--skip-clear-desktop` opts out.
 - **Verifies everything** and prints one table: Homebrew, Brewfile, power,
-  FileVault, Remote Login, the Tailscale boot service and guard, automatic
-  login, the Dock, and Rosetta.
+  automatic logout and macOS update installation, FileVault, Remote Login,
+  the Tailscale boot service and guard, automatic login, the console session,
+  the Dock, and Rosetta. The console session row checks that the runner
+  owner's `gui/<uid>` launchd domain exists *right now*: WebKit, Chromium and
+  the iOS simulators hang without it, and a Mac sitting at the login window
+  (for example after a reboot before automatic login was on) has none. It
+  reports `FAIL` with the fix — restart the Mac so automatic login creates the
+  session, or turn automatic login on first — and `skip` under
+  `--skip-auto-login`. `runner-setup` installs a watchdog that keeps this true
+  unattended; see "What `runner-setup` does".
 
 To install newly added tools on an existing Mini, update the tap and apply its
 Brewfile:
@@ -137,6 +151,20 @@ pmset -g custom | grep -E 'autorestart|sleep|disksleep|powernap|womp|tcpkeepaliv
   maintenance by an interrupted upgrade, and runners crash-looping on a
   readiness gate, are restarted. Setup fails if any runner does not come
   online, so a successful run means the runners are up.
+- **Installs the health watchdog.** Once the runners listen, setup installs
+  `/Library/LaunchDaemons/com.github.runner-health.plist`, a root daemon that
+  runs `runner-health --once --reboot-for-gui` every 300 seconds. launchd's
+  `KeepAlive` only restarts a listener that exits; the watchdog also restarts
+  one that is loaded but stale or not listening, and watches the runner
+  owner's console session. GUI jobs hang without that session, only a login
+  creates it, and a system daemon cannot log anyone in — so when the session
+  is gone, automatic login is set for the runner owner, no job is running, no
+  runner is in maintenance and nobody else holds the console, the watchdog
+  restarts the host and automatic login recreates the session at boot —
+  at most once per incident, so a broken automatic login alerts instead of
+  reboot-looping. Otherwise it logs and alerts. A plist an operator already wrote (for
+  example with `--org` and a `GITHUB_PAT`) is kept unchanged; `--skip-health`
+  installs nothing. See [health-checks.md](health-checks.md).
 
 GitHub's runner updates its own binary when a new release is required, so a
 running fleet needs no scheduled upgrade job.
@@ -208,11 +236,14 @@ The existing service files are:
 /Library/LaunchDaemons/com.github.runner-1.plist
 /Library/LaunchDaemons/com.github.runner-2.plist
 /Library/LaunchDaemons/com.github.runner-colima.plist
+/Library/LaunchDaemons/com.github.runner-health.plist
 /Library/LaunchDaemons/com.github.runner-tailscale-guard.plist
 ```
 
-`runner-setup --colima` installs the Colima service; `runner-bootstrap`
-installs the Tailscale guard unless `--skip-tailscale` is given. Each plist is owned
+`runner-setup --colima` installs the Colima service and every successful
+`runner-setup` installs the health watchdog unless `--skip-health` is given;
+`runner-bootstrap` installs the Tailscale guard unless `--skip-tailscale` is
+given. Each plist is owned
 by `root:wheel`, has mode `644`, enables `RunAtLoad`, and is loaded into launchd's
 `system` domain. `UserName` selects the non-root runner owner. Explicit home and
 PATH settings avoid depending on an interactive shell. The Colima service

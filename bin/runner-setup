@@ -52,6 +52,8 @@ UPGRADE_BIN=""
 COLIMA_CONFIG_HOME=""
 COLIMA_DOCKER_CONFIG=""
 SELF_UPGRADE=1       # upgrade the Homebrew tools and re-run as the new release
+HEALTH_WATCHDOG=1    # --skip-health: do not install the runner-health LaunchDaemon
+HEALTH_INTERVAL=300  # seconds between watchdog passes
 declare -a ORIGINAL_ARGS=()
 EPHEMERAL=0           # 1 => LaunchDaemon runs runner-ephemeral, not runsvc.sh
 EPHEMERAL_BIN=""      # resolved absolute path of the runner-ephemeral supervisor
@@ -142,6 +144,14 @@ OPTIONS:
   --skip-self-upgrade   Do not upgrade the Homebrew tools first. By default, a
                         Homebrew-installed setup upgrades joeblau/hb/runner-setup
                         and re-runs itself as the new release.
+  --skip-health         Do not install the runner-health watchdog. By default
+                        setup installs a root LaunchDaemon that runs
+                        'runner-health --once --reboot-for-gui' every
+                        ${HEALTH_INTERVAL}s: it restarts dead or stale listeners and, when
+                        the runner owner's console session is gone (GUI jobs
+                        hang without it), restarts an idle host so automatic
+                        login recreates it. An existing operator-written plist
+                        is kept unchanged.
   --ephemeral          Make each runner ephemeral: instead of pointing the
                         LaunchDaemon at bin/runsvc.sh directly, point it at the
                         runner-ephemeral supervisor, which re-registers the
@@ -265,6 +275,7 @@ parse_args() {
       --name-prefix=*) NAME_PREFIX="${1#*=}"; NAME_PREFIX_SET=1; shift ;;
       --colima) COLIMA=1; shift ;;
       --skip-self-upgrade) SELF_UPGRADE=0; shift ;;
+      --skip-health) HEALTH_WATCHDOG=0; shift ;;
       --skip-power-config|--skip-remote-login|--skip-tailscale)
         warn "$1 now belongs to runner-bootstrap; runner-setup ignores it."
         shift ;;
@@ -1372,6 +1383,61 @@ EOF
 }
 
 # ----------------------------------------------------------------------------
+# Health watchdog: a root LaunchDaemon runs `runner-health --once` on a timer.
+# launchd's KeepAlive only restarts a listener that exits; the watchdog also
+# catches one that is loaded but stale or not listening, and — because GUI
+# jobs need the runner owner's console session, which only a login creates —
+# restarts an idle host whose session is gone when automatic login will bring
+# it back. A plist an operator wrote (e.g. with --org and a GITHUB_PAT) is
+# left exactly as it is; only a missing plist is installed.
+# ----------------------------------------------------------------------------
+install_health_watchdog() {
+  if [[ "${HEALTH_WATCHDOG}" -eq 0 ]]; then
+    step "Keeping the health watchdog as it is (--skip-health)"
+    return 0
+  fi
+  local label="com.github.runner-health" plist="${LAUNCH_DAEMON_DIR}/com.github.runner-health.plist"
+  local self_dir health_bin staged log_dir="${RUNNER_HEALTH_LOGS:-/Library/Logs/runner-health}"
+  if [[ -f "${plist}" ]]; then
+    step "Health watchdog plist exists; keeping it (add --reboot-for-gui for GUI jobs)"
+  else
+    self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    health_bin="${self_dir}/runner-health"
+    [[ -x "${health_bin}" ]] || health_bin="$(command -v runner-health)" \
+      || { warn "runner-health not found; skipping the watchdog."; return 0; }
+    staged="${WORK_TMPDIR}/${label}.plist"
+    sudo mkdir -p "${log_dir}" 2>/dev/null || true
+    python3 - "${staged}" "${health_bin}" "${log_dir}" "${HEALTH_INTERVAL}" <<'PYHEALTH'
+import plistlib, sys
+path, health, logs, interval = sys.argv[1:]
+with open(path, "wb") as f:
+    plistlib.dump({
+        "Label": "com.github.runner-health",
+        "ProgramArguments": [health, "--once", "--reboot-for-gui"],
+        "EnvironmentVariables": {
+            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        },
+        "RunAtLoad": True, "StartInterval": int(interval),
+        "StandardOutPath": logs + "/stdout.log",
+        "StandardErrorPath": logs + "/stderr.log",
+    }, f)
+PYHEALTH
+    [[ $? -eq 0 ]] || { warn "Could not stage the health watchdog plist."; return 0; }
+    plutil -lint "${staged}" >/dev/null \
+      || { warn "Staged health watchdog plist failed lint."; return 0; }
+    { sudo cp "${staged}" "${plist}" && sudo chown root:wheel "${plist}" \
+      && sudo chmod 644 "${plist}"; } \
+      || { warn "Could not install the health watchdog plist."; return 0; }
+  fi
+  sudo launchctl enable "system/${label}" 2>/dev/null || true
+  if ! sudo launchctl print "system/${label}" >/dev/null 2>&1; then
+    sudo launchctl bootstrap system "${plist}" \
+      || { warn "Could not start the health watchdog daemon."; return 0; }
+  fi
+  step "Health watchdog: system/${label} runs runner-health every ${HEALTH_INTERVAL}s"
+}
+
+# ----------------------------------------------------------------------------
 # Final summary (printed to stdout — this is the result of the run)
 # ----------------------------------------------------------------------------
 print_summary() {
@@ -1502,6 +1568,9 @@ main() {
     err "One or more runners failed. See the summary above."
   else
     log "All ${RUNNERS} runner(s) are listening for jobs."
+    # Only once the runners listen: a watchdog pass during provisioning could
+    # bootstrap a half-configured daemon.
+    install_health_watchdog
   fi
   return "${overall_rc}"
 }

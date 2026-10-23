@@ -27,7 +27,7 @@ runner-setup --org ORG --token TOKEN --runners 2 --colima
 - `runner-setup` / `runner-cleanup` — provision and tear down the runners themselves ([docs](docs/boot-startup.md))
 - `runner-ephemeral` — one-job runners ([docs](docs/ephemeral-runners.md))
 - `runner-prune` — checkout cleanup that keeps warm caches ([docs](docs/disk-cleanup.md))
-- `runner-health` — liveness watchdog and alerts ([docs](docs/health-checks.md))
+- `runner-health` — liveness and console-session watchdog with alerts, installed by `runner-setup` ([docs](docs/health-checks.md))
 - `runner-tailscale-guard` — reboots before the tailscaled kernel panic ([docs](docs/boot-startup.md))
 - `runner-cache` — local S3 cache and Actions cache gateway ([docs](docs/cache-backend.md))
 - `runner-bazel-cache` — Bazel remote cache ([docs](docs/bazel-cache.md))

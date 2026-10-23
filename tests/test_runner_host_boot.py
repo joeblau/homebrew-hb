@@ -1,6 +1,7 @@
 """Unattended-boot host steps with fake commands; never alter real host settings."""
 import os
 from pathlib import Path
+import plistlib
 import subprocess
 import tempfile
 import unittest
@@ -106,6 +107,54 @@ class HostBootTests(unittest.TestCase):
         self.assertIn('parsed acme', result.stdout)
         self.assertEqual(result.stderr.count('now belongs to runner-bootstrap'), 3)
         self.assertIn('--keep-filevault is gone', result.stderr)
+
+    def test_health_watchdog_daemon_is_installed_after_setup(self):
+        health = self.root / 'bin/runner-health'
+        health.write_text('#!/bin/bash\nexit 0\n')
+        health.chmod(0o755)
+        result = self.shell(f'RUNNER_HEALTH_LOGS="$TEST_ROOT/logs"; '
+                            f'command() {{ [[ "$2" == runner-health ]] && echo "{health}"; }}; '
+                            'install_health_watchdog')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plist = self.root / 'plists/com.github.runner-health.plist'
+        with plist.open('rb') as f:
+            config = plistlib.load(f)
+        self.assertEqual(config['ProgramArguments'], [str(health), '--once', '--reboot-for-gui'])
+        self.assertEqual(config['StartInterval'], 300)
+        self.assertTrue(config['RunAtLoad'])
+        self.assertNotIn('UserName', config)   # root: it reads the system domain and reboots
+        self.assertEqual(config['StandardOutPath'], str(self.root / 'logs/stdout.log'))
+        self.assertIn(f'chown root:wheel {plist}', self.lines('sudo-calls'))
+        self.assertIn(f'chmod 644 {plist}', self.lines('sudo-calls'))
+        self.assertIn('launchctl enable system/com.github.runner-health', self.lines('sudo-calls'))
+        self.assertIn(f'launchctl bootstrap system {plist}', self.lines('sudo-calls'))
+        self.assertIn('runs runner-health every 300s', result.stderr)
+
+    def test_operator_health_plist_is_kept_and_only_loaded(self):
+        plist = self.root / 'plists/com.github.runner-health.plist'
+        with plist.open('wb') as f:
+            plistlib.dump({'Label': 'com.github.runner-health',
+                           'ProgramArguments': ['/opt/homebrew/bin/runner-health', '--once', '--org', 'acme'],
+                           'EnvironmentVariables': {'GITHUB_PAT': 'secret'}}, f)
+        before = plist.read_bytes()
+        result = self.shell('install_health_watchdog')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(plist.read_bytes(), before)
+        self.assertIn('keeping it', result.stderr)
+        self.assertFalse(any(call.startswith('cp ') for call in self.lines('sudo-calls')))
+        self.assertIn(f'launchctl bootstrap system {plist}', self.lines('sudo-calls'))
+        # Already loaded: nothing is bootstrapped twice.
+        (self.root / 'loaded-com.github.runner-health').touch()
+        (self.root / 'sudo-calls').unlink()
+        self.assertEqual(self.shell('install_health_watchdog').returncode, 0)
+        self.assertFalse(any('bootstrap' in call for call in self.lines('sudo-calls')))
+
+    def test_skip_health_installs_nothing(self):
+        result = self.shell('parse_args --org acme --token x --skip-health; install_health_watchdog')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('--skip-health', result.stderr)
+        self.assertFalse((self.root / 'plists/com.github.runner-health.plist').exists())
+        self.assertEqual(self.lines('sudo-calls'), [])
 
     def test_setup_finishes_by_starting_and_verifying_every_runner(self):
         result = self.shell('UPGRADE_BIN="$TEST_ROOT/bin/upgrade"; RUNNERS=2; DOCKER_TIMEOUT=120; start_runners')
