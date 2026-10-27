@@ -30,7 +30,6 @@ case "$1" in
     ;;
   *) exit 0 ;;
 esac''',
-    'clear-mac': 'echo cleared >> "$TEST_ROOT/clear-mac-calls"',
     'sysadminctl': 'echo "$*" >> "$TEST_ROOT/sysadminctl-calls"',
     # gui/<uid> exists only while that user is logged in at the console.
     'launchctl': '''echo "$*" >> "$TEST_ROOT/launchctl-calls"
@@ -60,11 +59,16 @@ class BootstrapTests(unittest.TestCase):
             path = bin_dir / name
             path.write_text('#!/bin/bash\n' + body + '\n')
             path.chmod(0o755)
+        self.clear_mac = self.root / 'prefix/libexec/clear-mac'
+        self.clear_mac.parent.mkdir(parents=True)
+        self.clear_mac.write_text('#!/bin/bash\necho cleared >> "$TEST_ROOT/clear-mac-calls"\n')
+        self.clear_mac.chmod(0o755)
 
     def shell(self, body, **env):
         return subprocess.run(
             ['/bin/bash', '-c', setup_fixture.definitions('runner-bootstrap') + '\n'
-             + setup_fixture.SetupToolCacheTests.HARNESS + '\n' + body, 'runner-bootstrap'],
+             + setup_fixture.SetupToolCacheTests.HARNESS + '\n'
+             + 'CLEAR_MAC_BIN="$TEST_ROOT/prefix/libexec/clear-mac"\n' + body, 'runner-bootstrap'],
             env=dict(os.environ, TEST_ROOT=str(self.root), HOME=str(self.root / 'home'),
                      PATH=f'{self.root/"bin"}:{os.environ["PATH"]}', **env),
             text=True, capture_output=True, timeout=20)
@@ -421,6 +425,39 @@ check_rosetta() { :; }
 
     def test_cluttered_desktop_is_cleared_once(self):
         result = self.shell('configure_desktop')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.lines('clear-mac-calls'), ['cleared'])
+
+    def test_bundled_cleanup_ignores_a_standalone_clear_mac_on_path(self):
+        standalone = self.root / 'bin/clear-mac'
+        standalone.write_text('#!/bin/bash\necho standalone >> "$TEST_ROOT/clear-mac-calls"\n')
+        standalone.chmod(0o755)
+        result = self.shell('configure_desktop')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.lines('clear-mac-calls'), ['cleared'])
+
+    def test_missing_bundle_recommends_repairing_runner_setup(self):
+        self.clear_mac.unlink()
+        result = self.shell('configure_desktop')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('brew reinstall joeblau/hb/runner-setup', result.stderr)
+        self.assertNotIn('brew install joeblau/hb/clear-mac', result.stderr)
+        self.assertEqual(self.lines('clear-mac-calls'), [])
+
+    def test_failed_cleanup_points_to_backup_output(self):
+        self.clear_mac.write_text('#!/bin/bash\nexit 1\n')
+        result = self.shell('configure_desktop')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Desktop cleanup failed', result.stderr)
+        self.assertIn('backups and restore commands', result.stderr)
+        self.assertNotIn('left as they were', result.stderr)
+
+    def test_checkout_uses_its_sibling_helper_without_homebrew(self):
+        checkout = self.root / 'source checkout/bin'
+        checkout.mkdir(parents=True)
+        (checkout / 'runner-bootstrap').write_text(setup_fixture.definitions('runner-bootstrap'))
+        self.clear_mac.rename(checkout / 'clear-mac')
+        result = self.shell('source "$TEST_ROOT/source checkout/bin/runner-bootstrap"; configure_desktop')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.lines('clear-mac-calls'), ['cleared'])
 

@@ -7,7 +7,6 @@ brew tap joeblau/hb
 | Formula | What it does | Docs |
 | --- | --- | --- |
 | `sr` | Local AI image super-resolution with Real-ESRGAN | [super-resolution](docs/super-resolution.md) |
-| `clear-mac` | Clear Dock items and hide desktop widgets, with backups | [clear-mac](docs/clear-mac.md) |
 | `runner-setup` | Provision and operate GitHub Actions self-hosted runners on macOS | [boot-startup](docs/boot-startup.md) |
 | `agent-mcp` | MCP server that wraps any agent CLI (codex, claude, gemini, grok, kimi) | [agent-mcp](agent-mcp/README.md) |
 | `appicon` | App icon generator | [joeblau/appicon](https://github.com/joeblau/appicon) |

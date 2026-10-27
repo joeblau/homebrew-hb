@@ -19,10 +19,10 @@ required item is wrong.
   `~/.zprofile` so SSH sessions find it. `--skip-brew` skips this and the next
   step.
 - **Installs the tap's [Brewfile](../Brewfile):** `runner-setup` (and with it
-  every `runner-*` tool), `clear-mac`, GNU tar (`gtar`), GitHub CLI (`gh`),
-  GnuPG (`gpg`), Colima, Docker Buildx and Tailscale. A copy run from curl or a
-  checkout then re-runs as the installed release, so host settings always
-  come from a released `runner-bootstrap`.
+  every `runner-*` tool and bundled desktop cleanup), GNU tar (`gtar`),
+  GitHub CLI (`gh`), GnuPG (`gpg`), Colima, Docker Buildx and Tailscale. A copy
+  run from curl or a checkout then re-runs as the installed release, so host
+  settings always come from a released `runner-bootstrap`.
 - **Applies the power policy below.**
 - **Disables automatic logout and automatic macOS update installation.** Sets
   `com.apple.autologout.AutoLogOutDelay` to integer `0` in
@@ -77,9 +77,11 @@ required item is wrong.
   allows automatic login only once FileVault is fully off, the first run on a
   Mac that is still decrypting reports a warning; re-run bootstrap after
   decryption finishes. `--skip-auto-login` opts out.
-- **Clears the Dock and desktop widgets** with `clear-mac`, which backs up both
-  preference domains first ([details](clear-mac.md)). It runs only when
-  something is left to clear. `--skip-clear-desktop` opts out.
+- **Clears the Dock and desktop widgets** with the `clear-mac` helper bundled
+  inside `runner-setup`, which backs up both preference domains first
+  ([details](clear-mac.md)). No separate `clear-mac` formula install or trust
+  step is needed for bootstrap. It runs only when something is left to clear.
+  `--skip-clear-desktop` opts out.
 - **Verifies everything** and prints one table: Homebrew, Brewfile, power,
   automatic logout and macOS update installation, FileVault, Remote Login,
   the Tailscale boot service and guard, automatic login, the console session,

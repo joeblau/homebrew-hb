@@ -5,8 +5,7 @@
 #   runner-setup --org ORG_NAME --token REGISTRATION_TOKEN --runners 2 --colima
 #
 tap "joeblau/hb"
-brew "joeblau/hb/runner-setup" # runner-setup, runner-bootstrap and tools; brings docker, jq, python
-brew "joeblau/hb/clear-mac"    # clears the Dock and desktop widgets
+brew "joeblau/hb/runner-setup" # runner tools and bundled desktop cleanup; brings docker, jq, python
 brew "gnu-tar"                 # GNU tar, available as gtar
 brew "gh"                      # GitHub CLI
 brew "gnupg"                   # OpenPGP tools, including gpg

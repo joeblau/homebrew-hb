@@ -1,9 +1,16 @@
 # Clear Dock items and desktop widgets (`clear-mac`)
 
+`clear-mac` is a private helper bundled with `runner-setup`. `runner-bootstrap`
+runs it automatically when the Dock or desktop needs clearing. There is no
+separate `clear-mac` formula to install or trust. Bootstrap's
+`--skip-clear-desktop` flag opts out.
+
+To run just the desktop cleanup manually:
+
 ```sh
 brew update
-brew install joeblau/hb/clear-mac
-clear-mac
+brew install joeblau/hb/runner-setup
+"$(brew --prefix joeblau/hb/runner-setup)/libexec/clear-mac"
 ```
 
 Run as the user whose desktop you want to clear, without `sudo`. The command
@@ -18,6 +25,5 @@ Both preference domains are backed up before any changes under
 commands and refreshes that user's Dock and Notification Center. Finder, Trash,
 running apps and minimized windows can still appear.
 
-Previously installed `clear-dock` users can run `brew upgrade clear-mac` after
-`brew update`; Homebrew's rename mapping migrates the old formula. Existing
-`clear-dock` backups are retained in their original directory.
+The standalone `clear-mac` formula and the legacy `clear-dock` rename have
+been removed. Backups from either command remain in their original directories.

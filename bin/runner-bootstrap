@@ -14,7 +14,7 @@
 #
 #   1. Homebrew — installed if missing, and its shellenv added to ~/.zprofile.
 #   2. Brewfile — taps joeblau/hb and runs `brew bundle` on the tap's Brewfile
-#      (runner-setup, colima, docker-buildx, tailscale, clear-mac, gnu-tar, gh,
+#      (runner-setup, colima, docker-buildx, tailscale, gnu-tar, gh,
 #      gnupg).
 #      A copy run from curl or a checkout then re-runs as the installed release,
 #      so host settings always come from a released runner-bootstrap.
@@ -43,6 +43,7 @@ HOMEBREW_INSTALLER="https://raw.githubusercontent.com/Homebrew/install/HEAD/inst
 # homebrew.mxcl.<formula> before that; a Mac can carry either.
 TAILSCALE_LABELS="sh.brew.tailscale homebrew.mxcl.tailscale"
 KCPASSWORD="${RUNNER_BOOTSTRAP_KCPASSWORD:-/etc/kcpassword}"   # written by macOS for automatic login
+CLEAR_MAC_BIN=""          # Homebrew sets this to runner-setup's private helper.
 
 CHECK_ONLY=0
 INSTALL_BREW=1            # --skip-brew: skip Homebrew install and brew bundle
@@ -108,8 +109,8 @@ OPTIONS:
                         prompts once for the account password (macOS stores it
                         for the login window).
   --skip-clear-desktop  Leave the Dock and desktop widgets as they are. By
-                        default they are cleared once with clear-mac, which
-                        backs up both preference domains first.
+                        default they are cleared once with bundled clear-mac.
+                        Both preference domains are backed up first.
   -h, --help            Show this help and exit.
 EOF
 }
@@ -585,13 +586,19 @@ configure_desktop() {
     step "Dock and desktop widgets are already clear"
     return 0
   fi
-  if ! command -v clear-mac >/dev/null 2>&1; then
-    warn "clear-mac is not installed; skipping the Dock and desktop. Install it"
-    warn "with: brew install ${TAP}/clear-mac"
+  local helper="${CLEAR_MAC_BIN}" self="${BASH_SOURCE[0]:-}"
+  # An installed bootstrap uses its own release's private helper, even when
+  # invoked through Homebrew's bin symlink. A checkout uses the sibling file.
+  if [[ -z "${helper}" && "${self}" == */* ]]; then
+    helper="${self%/*}/clear-mac"
+  fi
+  if [[ -z "${helper}" || ! -x "${helper}" ]]; then
+    warn "Bundled clear-mac is missing; skipping the Dock and desktop. Repair with:"
+    warn "brew reinstall ${TAP}/runner-setup"
     return 0
   fi
   log "Clearing the Dock and desktop widgets (preferences are backed up first)"
-  clear-mac >&2 || warn "clear-mac failed; the Dock and desktop were left as they were."
+  "${helper}" >&2 || warn "Desktop cleanup failed; check the output above for backups and restore commands."
 }
 
 # ----------------------------------------------------------------------------
@@ -757,7 +764,7 @@ check_desktop() {
   elif [[ "${CLEAR_DESKTOP}" -eq 0 ]]; then
     record "Dock and desktop" skip "--skip-clear-desktop"
   else
-    record "Dock and desktop" warn "not cleared; run: clear-mac"
+    record "Dock and desktop" warn "not cleared; re-run runner-bootstrap"
   fi
 }
 
