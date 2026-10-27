@@ -1,19 +1,17 @@
-# Clear Dock items and desktop widgets (`clear-mac`)
+# Clear Dock items and desktop widgets
 
-`clear-mac` is a private helper bundled with `runner-setup`. `runner-bootstrap`
-runs it automatically when the Dock or desktop needs clearing. There is no
-separate `clear-mac` formula to install or trust. Bootstrap's
-`--skip-clear-desktop` flag opts out.
-
-To run just the desktop cleanup manually:
+`runner-bootstrap` contains the desktop cleanup commands and runs them directly
+when the Dock or desktop needs clearing. There is no `clear-mac` script or
+formula to install or approve. `--skip-clear-desktop` opts out.
 
 ```sh
 brew update
 brew install joeblau/hb/runner-setup
-"$(brew --prefix joeblau/hb/runner-setup)/libexec/clear-mac"
+runner-bootstrap
 ```
 
-Run as the user whose desktop you want to clear, without `sudo`. The command
+Bootstrap also configures the host as described in [boot-startup.md](boot-startup.md).
+Run it as the user whose desktop you want to clear, without `sudo`. The cleanup
 clears pinned apps, files and folders from the Dock, hides recent apps, and
 hides all desktop widgets in both the standard desktop and Stage Manager.
 Widget layouts are retained; Notification Center widgets are preserved.
@@ -23,7 +21,8 @@ in System Settings > Desktop & Dock. Requires macOS Sonoma or later.
 Both preference domains are backed up before any changes under
 `~/Library/Application Support/clear-mac/backups/`. The command prints restore
 commands and refreshes that user's Dock and Notification Center. Finder, Trash,
-running apps and minimized windows can still appear.
+running apps and minimized windows can still appear. Bootstrap stops if a
+backup or preference write fails; completed backups remain available to restore.
 
 The standalone `clear-mac` formula and the legacy `clear-dock` rename have
 been removed. Backups from either command remain in their original directories.

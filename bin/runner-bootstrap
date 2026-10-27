@@ -43,7 +43,6 @@ HOMEBREW_INSTALLER="https://raw.githubusercontent.com/Homebrew/install/HEAD/inst
 # homebrew.mxcl.<formula> before that; a Mac can carry either.
 TAILSCALE_LABELS="sh.brew.tailscale homebrew.mxcl.tailscale"
 KCPASSWORD="${RUNNER_BOOTSTRAP_KCPASSWORD:-/etc/kcpassword}"   # written by macOS for automatic login
-CLEAR_MAC_BIN=""          # Homebrew sets this to runner-setup's private helper.
 
 CHECK_ONLY=0
 INSTALL_BREW=1            # --skip-brew: skip Homebrew install and brew bundle
@@ -109,7 +108,7 @@ OPTIONS:
                         prompts once for the account password (macOS stores it
                         for the login window).
   --skip-clear-desktop  Leave the Dock and desktop widgets as they are. By
-                        default they are cleared once with bundled clear-mac.
+                        default bootstrap clears them directly when needed.
                         Both preference domains are backed up first.
   -h, --help            Show this help and exit.
 EOF
@@ -559,8 +558,8 @@ configure_auto_login() {
   fi
 }
 
-# clear-mac backs up and restarts the Dock on every run, so only call it when
-# something is left to clear.
+# Only back up preferences and refresh the desktop when something is left
+# to clear.
 desktop_is_clear() {
   local key value
   for key in persistent-apps persistent-others; do
@@ -577,7 +576,9 @@ desktop_is_clear() {
   done
 }
 
-configure_desktop() {
+# Keep the private backup umask local to this step. All preference commands
+# run here as the invoking user, without a separate helper script.
+configure_desktop() (
   if [[ "${CLEAR_DESKTOP}" -eq 0 ]]; then
     step "Keeping the Dock and desktop as they are (--skip-clear-desktop)"
     return 0
@@ -586,20 +587,52 @@ configure_desktop() {
     step "Dock and desktop widgets are already clear"
     return 0
   fi
-  local helper="${CLEAR_MAC_BIN}" self="${BASH_SOURCE[0]:-}"
-  # An installed bootstrap uses its own release's private helper, even when
-  # invoked through Homebrew's bin symlink. A checkout uses the sibling file.
-  if [[ -z "${helper}" && "${self}" == */* ]]; then
-    helper="${self%/*}/clear-mac"
-  fi
-  if [[ -z "${helper}" || ! -x "${helper}" ]]; then
-    warn "Bundled clear-mac is missing; skipping the Dock and desktop. Repair with:"
-    warn "brew reinstall ${TAP}/runner-setup"
-    return 0
-  fi
   log "Clearing the Dock and desktop widgets (preferences are backed up first)"
-  "${helper}" >&2 || warn "Desktop cleanup failed; check the output above for backups and restore commands."
-}
+  umask 077
+  # Retain the original backup location so existing restore paths still work.
+  local backup_root="${REAL_HOME}/Library/Application Support/clear-mac/backups"
+  local backup_dir domain backup_file key
+  mkdir -p "${backup_root}" || { err "Could not create desktop backup directory."; return 1; }
+  backup_dir="$(mktemp -d "${backup_root}/mac-$(date +%Y%m%d-%H%M%S).XXXXXX")" \
+    || { err "Could not create desktop preference backup."; return 1; }
+
+  # Complete both backups before changing either domain. An absent domain
+  # exports as an empty dictionary, which defaults import can also restore.
+  for domain in com.apple.dock com.apple.WindowManager; do
+    backup_file="${backup_dir}/${domain}.plist"
+    if ! defaults export "${domain}" - > "${backup_file}" ||
+       ! plutil -lint "${backup_file}" >/dev/null; then
+      err "Could not back up ${domain}; stopping before changing preferences."
+      printf 'Backup directory: %s\n' "${backup_dir}" >&2
+      return 1
+    fi
+  done
+
+  # Print recovery commands before writes, including when a later write fails.
+  printf 'Backup directory: %s\n' "${backup_dir}" >&2
+  for domain in com.apple.dock com.apple.WindowManager; do
+    printf 'Restore with: defaults import %s %q\n' "${domain}" "${backup_dir}/${domain}.plist" >&2
+  done
+
+  for key in persistent-apps persistent-others static-apps static-others; do
+    defaults write com.apple.dock "${key}" -array \
+      || { err "Could not clear Dock setting ${key}; use the restore commands above."; return 1; }
+  done
+  defaults write com.apple.dock show-recents -bool false \
+    || { err "Could not hide recent apps; use the restore commands above."; return 1; }
+
+  # Show Widgets switches in System Settings > Desktop & Dock.
+  for key in StandardHideWidgets StageManagerHideWidgets; do
+    defaults write com.apple.WindowManager "${key}" -bool true \
+      || { err "Could not hide widgets (${key}); use the restore commands above."; return 1; }
+  done
+
+  # Refresh only this user's UI; when logged out, changes apply next login.
+  killall -u "${REAL_USER}" Dock NotificationCenter 2>/dev/null || true
+  step "Cleared removable Dock items. Finder, Trash, and running apps can remain."
+  step "Hidden desktop and Stage Manager widgets; saved layouts are preserved."
+  step "After restoring, log out and back in to refresh the desktop."
+)
 
 # ----------------------------------------------------------------------------
 # 4. Verification
@@ -835,7 +868,7 @@ main() {
   configure_tailscale
   configure_tailscale_guard
   configure_auto_login
-  configure_desktop
+  configure_desktop || return 1
   verify_host
   print_checks
 }

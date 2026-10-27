@@ -1,4 +1,4 @@
-"""Exercise real macOS defaults against temporary plists, never the user's UI."""
+"""Bootstrap's inline desktop cleanup against temporary plists, never the user's UI."""
 
 import os
 from pathlib import Path
@@ -11,11 +11,25 @@ import tempfile
 import unittest
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "clear-mac"
+SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "runner-bootstrap"
+# Exercise main(), stubbing only unrelated host changes. The real cleanup and
+# verification run with macOS defaults redirected to temporary preference files.
+HOST_STUBS = '''
+ensure_sudo() { :; }
+load_brew_env() { :; }
+configure_power() { :; }
+configure_unattended_preferences() { :; }
+configure_filevault() { :; }
+configure_remote_access() { :; }
+configure_tailscale() { :; }
+configure_tailscale_guard() { :; }
+configure_auto_login() { :; }
+verify_host() { check_desktop; }
+'''
 DOMAINS = ("com.apple.dock", "com.apple.WindowManager")
 MOCK = r'''
 import json, os, pathlib, subprocess, sys
-root = pathlib.Path(os.environ['CLEAR_MAC_TEST_ROOT'])
+root = pathlib.Path(os.environ['DESKTOP_TEST_ROOT'])
 name, args = pathlib.Path(sys.argv[0]).name, sys.argv[1:]
 with (root / 'calls.jsonl').open('a') as stream:
     stream.write(json.dumps([name] + args) + '\n')
@@ -38,9 +52,9 @@ sys.exit(subprocess.run(['/usr/bin/defaults'] + args).returncode)
 
 @unittest.skipUnless(sys.platform == "darwin" and os.geteuid() != 0,
                      "Requires macOS defaults and a non-root user")
-class ClearMacTests(unittest.TestCase):
+class BootstrapDesktopTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="clear-mac-test-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="runner-desktop-test-")
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         (self.root / "bin").mkdir()
@@ -65,12 +79,13 @@ class ClearMacTests(unittest.TestCase):
             (self.root / f"{domain}.plist").write_bytes(plistlib.dumps(prefs))
         self.env = dict(os.environ, HOME=str(self.root / "home"),
                         PATH=f"{self.root}/bin:/usr/bin:/bin",
-                        CLEAR_MAC_TEST_ROOT=str(self.root))
+                        DESKTOP_TEST_ROOT=str(self.root))
         self.backups = (self.root / "home/Library/Application Support/clear-mac/backups")
 
-    def run_script(self, *args, **env):
-        return subprocess.run([str(SCRIPT), *args], env=dict(self.env, **env),
-                              capture_output=True, text=True, timeout=15)
+    def run_script(self, *args, postscript="", **env):
+        body = SCRIPT.read_text().rsplit('main "$@"', 1)[0] + HOST_STUBS + '\nmain "$@"\n' + postscript
+        return subprocess.run(['/bin/bash', '-c', body, 'runner-bootstrap', '--skip-brew', *args],
+                              env=dict(self.env, **env), capture_output=True, text=True, timeout=15)
 
     def read_prefs(self, domain):
         result = subprocess.run(["/usr/bin/defaults", "export", str(self.root / domain), "-"],
@@ -109,9 +124,11 @@ class ClearMacTests(unittest.TestCase):
         first_write = next(i for i, call in enumerate(calls) if call[1] == "write")
         self.assertEqual(len(exports), 2)
         self.assertLess(max(exports), first_write)
-        self.assertEqual(calls[-1], ["killall", "-u", pwd.getpwuid(os.geteuid()).pw_name,
-                                     "Dock", "NotificationCenter"])
-        self.assertIn("saved layouts are preserved", result.stdout)
+        self.assertEqual([call for call in calls if call[0] == "killall"],
+                         [["killall", "-u", pwd.getpwuid(os.geteuid()).pw_name,
+                           "Dock", "NotificationCenter"]])
+        self.assertIn("saved layouts are preserved", result.stderr)
+        self.assertRegex(result.stderr, r'Dock and desktop\s+ok')
 
     def test_widget_backup_failure_leaves_both_domains_unchanged(self):
         result = self.run_script(FAIL_EXPORT=DOMAINS[1])
@@ -136,7 +153,7 @@ class ClearMacTests(unittest.TestCase):
     def test_printed_restore_commands_restore_original_preferences(self):
         result = self.run_script()
         self.assertEqual(result.returncode, 0, result.stderr)
-        commands = [line.removeprefix("Restore with: ") for line in result.stdout.splitlines()
+        commands = [line.removeprefix("Restore with: ") for line in result.stderr.splitlines()
                     if line.startswith("Restore with: ")]
         self.assertEqual(len(commands), 2)
         for command in commands:
@@ -148,8 +165,9 @@ class ClearMacTests(unittest.TestCase):
     def test_write_failure_retains_backups_and_reports_no_success(self):
         result = self.run_script(FAIL_WRITE="StandardHideWidgets")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Restore with:", result.stdout)
-        self.assertNotIn("Cleared removable", result.stdout)
+        self.assertIn("Restore with:", result.stderr)
+        self.assertNotIn("Cleared removable", result.stderr)
+        self.assertNotIn("This Mac is ready", result.stderr)
         backup, = self.backups.iterdir()
         for domain in DOMAINS:
             self.assertEqual(plistlib.loads((backup / f"{domain}.plist").read_bytes()),
@@ -158,11 +176,42 @@ class ClearMacTests(unittest.TestCase):
     def test_help_and_invalid_arguments_do_not_change_preferences(self):
         result = self.run_script("--help")
         self.assertEqual(result.returncode, 0)
-        self.assertIn("Usage: clear-mac", result.stdout)
-        for args in (("unknown",), ("--help", "extra")):
-            self.assertEqual(self.run_script(*args).returncode, 2)
+        self.assertIn("USAGE:", result.stderr)
+        self.assertEqual(self.run_script("unknown").returncode, 2)
         self.assert_no_changes()
         self.assertFalse(self.backups.exists())
+
+    def test_skip_and_check_never_change_preferences(self):
+        for flag in ("--skip-clear-desktop", "--check"):
+            with self.subTest(flag=flag):
+                result = self.run_script(flag)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assert_no_changes()
+                self.assertFalse(self.backups.exists())
+
+    def test_repeated_bootstrap_does_not_backup_or_refresh_again(self):
+        first = self.run_script()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        second = self.run_script()
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn("already clear", second.stderr)
+        self.assertEqual(len(list(self.backups.iterdir())), 1)
+        self.assertEqual(sum(call[0] == "killall" for call in self.calls()), 1)
+
+    def test_cleanup_never_invokes_a_legacy_clear_mac_executable(self):
+        legacy = self.root / "bin/clear-mac"
+        legacy.write_text('#!/bin/bash\necho LEGACY_HELPER_CALLED >&2\nexit 99\n')
+        legacy.chmod(0o755)
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("LEGACY_HELPER_CALLED", result.stderr)
+        self.assertEqual(self.read_prefs(DOMAINS[0])["persistent-apps"], [])
+
+    def test_backup_permissions_do_not_change_bootstraps_umask(self):
+        expected = subprocess.check_output(['/bin/bash', '-c', 'umask'], text=True)
+        result = self.run_script(postscript='umask')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, expected)
 
 
 if __name__ == "__main__":

@@ -14,10 +14,6 @@ class RunnerSetup < Formula
   depends_on "python@3.14"
 
   def install
-    # Install desktop cleanup as a private bootstrap helper.
-    libexec.install "bin/clear-mac"
-    inreplace "bin/runner-bootstrap", 'CLEAR_MAC_BIN=""', "CLEAR_MAC_BIN=\"#{libexec}/clear-mac\""
-
     bin.install %w[
       runner-setup
       runner-bootstrap
@@ -70,8 +66,8 @@ class RunnerSetup < Formula
       settings, FileVault off, Remote Login, tailscaled at boot with its
       kernel-panic reboot guard, automatic login, a cleared Dock:
         runner-bootstrap               # --check verifies without changing
-      Dock and desktop cleanup is bundled; no separate clear-mac install
-      is needed. Use --skip-clear-desktop to keep the existing desktop.
+      runner-bootstrap clears the Dock and desktop directly. Use
+      --skip-clear-desktop to keep the existing desktop.
       runner-setup only provisions runners. It upgrades itself through
       Homebrew first (--skip-self-upgrade to skip), resumes runners left in
       maintenance, and finishes only when every runner is listening. The
@@ -120,8 +116,6 @@ class RunnerSetup < Formula
   end
 
   test do
-    assert_match "Usage: clear-mac", shell_output("#{libexec}/clear-mac --help")
-
     %w[
       runner-setup
       runner-bootstrap
