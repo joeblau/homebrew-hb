@@ -113,6 +113,9 @@ brew upgrade joeblau/hb/runner-setup
 runner-bootstrap
 ```
 
+For a fleet update from Mosyle, use the [Mosyle Custom Command](mosyle.md),
+which runs these steps as the runner owner from Mosyle's root context.
+
 If FileVault is still decrypting, wait until `fdesetup status` reports Off,
 then re-run bootstrap interactively to enable automatic login. If no GUI
 session exists after automatic login is configured, reboot when the runners

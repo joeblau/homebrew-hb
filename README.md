@@ -22,6 +22,10 @@ Prepare a new Mac, then add its runners:
 runner-setup --org ORG --token TOKEN --runners 2 --colima
 ```
 
+To update existing runner Macs through Mosyle, use the
+[root Custom Command script](docs/mosyle.md). It updates Homebrew and the runner
+package, reruns bootstrap, and checks local runner health.
+
 - `runner-bootstrap` — host setup: Homebrew, Brewfile, power, FileVault, SSH, Tailscale, auto-login, GUI readiness, keyboard navigation, Dock ([docs](docs/boot-startup.md))
 - `runner-setup` / `runner-cleanup` — provision and tear down the runners themselves ([docs](docs/boot-startup.md))
 - `runner-ephemeral` — one-job runners ([docs](docs/ephemeral-runners.md))
