@@ -22,7 +22,7 @@ Prepare a new Mac, then add its runners:
 runner-setup --org ORG --token TOKEN --runners 2 --colima
 ```
 
-- `runner-bootstrap` — host setup: Homebrew, Brewfile, power, FileVault, SSH, Tailscale, auto-login, Dock ([docs](docs/boot-startup.md))
+- `runner-bootstrap` — host setup: Homebrew, Brewfile, power, FileVault, SSH, Tailscale, auto-login, GUI readiness, keyboard navigation, Dock ([docs](docs/boot-startup.md))
 - `runner-setup` / `runner-cleanup` — provision and tear down the runners themselves ([docs](docs/boot-startup.md))
 - `runner-ephemeral` — one-job runners ([docs](docs/ephemeral-runners.md))
 - `runner-prune` — checkout cleanup that keeps warm caches ([docs](docs/disk-cleanup.md))

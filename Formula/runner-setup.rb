@@ -64,7 +64,7 @@ class RunnerSetup < Formula
 
       Prepare the Mac itself first — Homebrew, the tap's Brewfile, power
       settings, FileVault off, Remote Login, tailscaled at boot with its
-      kernel-panic reboot guard, automatic login, a cleared Dock:
+      kernel-panic reboot guard, automatic login, keyboard navigation, a cleared Dock:
         runner-bootstrap               # --check verifies without changing
       runner-bootstrap clears the Dock and desktop directly. Use
       --skip-clear-desktop to keep the existing desktop.

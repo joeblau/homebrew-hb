@@ -74,9 +74,18 @@ required item is wrong.
   jobs can open GUI windows; the runner services themselves start without
   any login. macOS stores the account password for the login window, so
   `sysadminctl` prompts for it once — the script never sees it. Because macOS
-  allows automatic login only once FileVault is fully off, the first run on a
-  Mac that is still decrypting reports a warning; re-run bootstrap after
-  decryption finishes. `--skip-auto-login` opts out.
+  allows automatic login only once FileVault is fully off, setup continues on
+  a Mac that is still decrypting but verification reports `FAIL`; re-run
+  bootstrap after decryption finishes. Verification requires automatic login
+  for the invoking runner owner, `/etc/kcpassword` to exist, and FileVault to
+  report Off. A different account or a missing password file fails the check.
+  `--skip-auto-login` opts out of automatic login and console readiness.
+- **Enables keyboard navigation for the runner owner.** Sets
+  `defaults write -g AppleKeyboardUIMode -int 2` as that user, without sudo,
+  so WebKit includes buttons in the Tab order. Existing enabled values `2`
+  and `3` are preserved. A failed write or readback stops setup; `--check`
+  only reads the preference and reports `FAIL` if it is missing or disabled.
+  Newly launched WebKit processes pick up the setting.
 - **Clears the Dock and desktop widgets directly** using commands inside
   `runner-bootstrap`, backing up both preference domains first
   ([details](clear-mac.md)). It runs only when something is left to clear.
@@ -85,14 +94,33 @@ required item is wrong.
 - **Verifies everything** and prints one table: Homebrew, Brewfile, power,
   automatic logout and macOS update installation, FileVault, Remote Login,
   the Tailscale boot service and guard, automatic login, the console session,
-  the Dock, and Rosetta. The console session row checks that the runner
-  owner's `gui/<uid>` launchd domain exists *right now*: WebKit, Chromium and
-  the iOS simulators hang without it, and a Mac sitting at the login window
+  keyboard navigation, the Dock, and Rosetta. The console session row checks
+  that the runner owner's `gui/<uid>` launchd domain exists *right now* and
+  that the same user owns `/dev/console`. WebKit, Chromium and the iOS
+  simulators hang without a GUI session, and a Mac sitting at the login window
   (for example after a reboot before automatic login was on) has none. It
   reports `FAIL` with the fix — restart the Mac so automatic login creates the
   session, or turn automatic login on first — and `skip` under
-  `--skip-auto-login`. `runner-setup` installs a watchdog that keeps this true
-  unattended; see "What `runner-setup` does".
+  `--skip-auto-login`. `runner-setup` installs a watchdog that monitors GUI
+  session presence unattended; see "What `runner-setup` does".
+
+To apply updated bootstrap settings on an existing Mini, run as the account
+that owns the runners (usually `admin`, without prefixing bootstrap with sudo):
+
+```sh
+brew update
+brew upgrade joeblau/hb/runner-setup
+runner-bootstrap
+```
+
+If FileVault is still decrypting, wait until `fdesetup status` reports Off,
+then re-run bootstrap interactively to enable automatic login. If no GUI
+session exists after automatic login is configured, reboot when the runners
+are idle. After reboot, run `runner-bootstrap --check` as the same account.
+Both console ownership and the GUI session must pass, along with keyboard
+navigation. Bootstrap itself does not reboot the Mac. Automatic login applies
+at startup; manually logging out ends the session, while locking the screen
+leaves the user logged in.
 
 To install newly added tools on an existing Mini, update the tap and apply its
 Brewfile:

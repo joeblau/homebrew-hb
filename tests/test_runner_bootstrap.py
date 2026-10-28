@@ -1,9 +1,10 @@
 """runner-bootstrap host setup with fake commands; never alters real host settings.
 
 Covers the host steps moved out of runner-setup (FileVault, Remote Login,
-Tailscale and its panic guard) and bootstrap's own steps: unattended preferences, automatic login,
-clearing the Dock and desktop, the Homebrew/Brewfile install, the hand-off
-to the installed release, and the verification table.
+Tailscale and its panic guard) and bootstrap's own steps: unattended preferences,
+automatic login, console ownership, keyboard navigation, clearing the Dock and
+desktop, the Homebrew/Brewfile install, the hand-off to the installed release,
+and the verification table.
 """
 import os
 from pathlib import Path
@@ -31,7 +32,9 @@ case "$1" in
   *) exit 0 ;;
 esac''',
     'sysadminctl': 'echo "$*" >> "$TEST_ROOT/sysadminctl-calls"',
-    # gui/<uid> exists only while that user is logged in at the console.
+    'stat': '''[[ "$*" == "-f %Su /dev/console" ]] || exit 99
+cat "$TEST_ROOT/console-owner"''',
+    # A GUI domain can exist without that user owning the foreground console.
     'launchctl': '''echo "$*" >> "$TEST_ROOT/launchctl-calls"
 case "$1 $2" in
   "print gui/501") [[ -f "$TEST_ROOT/gui-session" ]] ;;
@@ -53,6 +56,8 @@ class BootstrapTests(unittest.TestCase):
 
     def setUp(self):
         self.setUp_fixture()
+        (self.root / 'filevault').write_text('FileVault is Off.\n')
+        (self.root / 'console-owner').write_text('root\n')
         bin_dir = self.root / 'bin'
         bin_dir.mkdir()
         for name, body in BOOTSTRAP_FAKES.items():
@@ -61,6 +66,7 @@ class BootstrapTests(unittest.TestCase):
             path.chmod(0o755)
 
     def shell(self, body, **env):
+        env.setdefault('RUNNER_BOOTSTRAP_KCPASSWORD', str(self.root / 'kcpassword'))
         return subprocess.run(
             ['/bin/bash', '-c', setup_fixture.definitions('runner-bootstrap') + '\n'
              + setup_fixture.SetupToolCacheTests.HARNESS + '\n' + body, 'runner-bootstrap'],
@@ -80,6 +86,14 @@ class BootstrapTests(unittest.TestCase):
     def clear_desktop(self):
         for (domain, key), value in CLEAR.items():
             self.set_pref(domain, key, value)
+
+    def ready_auto_login(self):
+        self.set_pref('com.apple.loginwindow', 'autoLoginUser', 'fixture')
+        (self.root / 'kcpassword').write_text('fixture-password-file')
+
+    def start_console_session(self):
+        (self.root / 'gui-session').touch()
+        (self.root / 'console-owner').write_text('fixture\n')
 
     def test_filevault_on_is_turned_off(self):
         (self.root/'filevault').write_text('FileVault is On.\n')
@@ -328,6 +342,7 @@ check_rosetta() { :; }
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertRegex(result.stderr, r'Automatic logout\s+ok')
         self.assertRegex(result.stderr, r'Automatic macOS updates\s+ok')
+        self.assertRegex(result.stderr, r'Keyboard navigation\s+ok')
         self.assertEqual(len(self.lines('sudo-calls')), 2)
 
     def test_main_check_reports_missing_preferences_without_changing_them(self):
@@ -335,11 +350,12 @@ check_rosetta() { :; }
         self.assertNotEqual(result.returncode, 0)
         self.assertRegex(result.stderr, r'Automatic logout\s+FAIL')
         self.assertRegex(result.stderr, r'Automatic macOS updates\s+FAIL')
+        self.assertRegex(result.stderr, r'Keyboard navigation\s+FAIL')
         self.assertFalse(any(call.startswith('write ') for call in self.lines('defaults-calls')))
         self.assertEqual(self.lines('sudo-calls'), [])
 
     def test_console_session_present_passes(self):
-        (self.root / 'gui-session').touch()
+        self.start_console_session()
         result = self.shell('check_console_session; print_checks')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertRegex(result.stderr, r'Console session\s+ok\s+gui/501 \(fixture\)')
@@ -347,7 +363,7 @@ check_rosetta() { :; }
 
     def test_missing_console_session_fails_and_names_the_fix(self):
         # Automatic login already on: a restart creates the session.
-        self.set_pref('com.apple.loginwindow', 'autoLoginUser', 'fixture')
+        self.ready_auto_login()
         result = self.shell('check_console_session; print_checks')
         self.assertNotEqual(result.returncode, 0)
         self.assertRegex(result.stderr, r'Console session\s+FAIL\s+none; restart this Mac')
@@ -362,6 +378,38 @@ check_rosetta() { :; }
                 self.assertNotEqual(result.returncode, 0)
                 self.assertRegex(result.stderr, r'Console session\s+FAIL\s+none; turn on automatic login')
 
+    def test_gui_domain_without_runner_console_ownership_fails(self):
+        (self.root / 'gui-session').touch()
+        for owner in ('root', 'someone-else', None):
+            with self.subTest(owner=owner):
+                path = self.root / 'console-owner'
+                path.unlink(missing_ok=True)
+                if owner:
+                    path.write_text(owner + '\n')
+                result = self.shell('check_console_session; print_checks')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f'console owner is {owner or "unknown"}', result.stderr)
+                self.assertIn('log fixture in at the console', result.stderr)
+
+    def test_console_ownership_without_gui_domain_still_fails(self):
+        (self.root / 'console-owner').write_text('fixture\n')
+        result = self.shell('check_console_session; print_checks')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertRegex(result.stderr, r'Console session\s+FAIL')
+
+    def test_missing_session_does_not_recommend_reboot_with_broken_auto_login(self):
+        self.ready_auto_login()
+        for missing in ('kcpassword', 'filevault'):
+            with self.subTest(missing=missing):
+                path = self.root / missing
+                original = path.read_text()
+                path.unlink()
+                result = self.shell('check_console_session; print_checks')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('turn on automatic login, then restart', result.stderr)
+                self.assertNotIn('restart this Mac so automatic login starts it', result.stderr)
+                path.write_text(original)
+
     def test_console_session_is_skipped_without_auto_login(self):
         result = self.shell('AUTO_LOGIN=0; check_console_session; print_checks')
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -369,10 +417,74 @@ check_rosetta() { :; }
 
     def test_verify_host_reports_the_console_session(self):
         stubs = self.HOST_STUBS.replace('check_console_session() { :; }\n', '')
-        (self.root / 'gui-session').touch()
+        self.start_console_session()
+        self.set_pref('-g', 'AppleKeyboardUIMode', '2')
         result = self.shell(stubs + 'check_unattended_preferences() { :; }\nverify_host; print_checks')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertRegex(result.stderr, r'Console session\s+ok')
+
+    def test_keyboard_navigation_is_set_for_runner_user_without_sudo(self):
+        result = self.shell('configure_keyboard_navigation; check_keyboard_navigation; print_checks')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('write -g AppleKeyboardUIMode -int 2', self.lines('defaults-calls'))
+        self.assertEqual(self.lines('sudo-calls'), [])
+        self.assertRegex(result.stderr, r'Keyboard navigation\s+ok')
+
+    def test_enabled_keyboard_navigation_is_preserved(self):
+        for value in ('2', '3'):
+            with self.subTest(value=value):
+                self.set_pref('-g', 'AppleKeyboardUIMode', value)
+                result = self.shell('configure_keyboard_navigation; check_keyboard_navigation; print_checks')
+                self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(call.startswith('write ') for call in self.lines('defaults-calls')))
+
+    def test_disabled_or_invalid_keyboard_navigation_fails_without_writes(self):
+        for value in (None, '0', '1', 'invalid'):
+            with self.subTest(value=value):
+                if value is not None:
+                    self.set_pref('-g', 'AppleKeyboardUIMode', value)
+                result = self.shell('check_keyboard_navigation; print_checks')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertRegex(result.stderr, r'Keyboard navigation\s+FAIL')
+                self.assertIn('defaults write -g AppleKeyboardUIMode -int 2', result.stderr)
+        self.assertFalse(any(call.startswith('write ') for call in self.lines('defaults-calls')))
+
+    def test_keyboard_navigation_write_failure_or_ignored_write_stops_bootstrap(self):
+        for name in ('defaults-fail-AppleKeyboardUIMode', 'defaults-ignore-writes'):
+            with self.subTest(name=name):
+                marker = self.root / name
+                marker.touch()
+                result = self.shell(self.HOST_STUBS + '''
+configure_unattended_preferences() { :; }
+configure_desktop() { touch "$TEST_ROOT/desktop-ran"; }
+main --skip-brew
+''')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('keyboard navigation; bootstrap stopped', result.stderr)
+                self.assertFalse((self.root / 'desktop-ran').exists())
+                marker.unlink()
+
+    def test_main_check_verifies_gui_readiness_without_changes(self):
+        self.ready_auto_login()
+        self.start_console_session()
+        self.set_pref('-g', 'AppleKeyboardUIMode', '2')
+        self.set_pref('.GlobalPreferences', 'com.apple.autologout.AutoLogOutDelay', '0')
+        self.set_pref('com.apple.SoftwareUpdate', 'AutomaticallyInstallMacOSUpdates', '0')
+        stubs = self.HOST_STUBS
+        for check in ('check_filevault', 'check_auto_login', 'check_console_session'):
+            stubs = stubs.replace(f'{check}() {{ :; }}\n', '')
+        result = self.shell(stubs + 'main --check')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for check in ('FileVault', 'Automatic login', 'Console session', 'Keyboard navigation'):
+            self.assertRegex(result.stderr, check + r'\s+ok')
+        self.set_pref('com.apple.loginwindow', 'autoLoginUser', 'someone-else')
+        result = self.shell(stubs + 'main --check')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertRegex(result.stderr, r'Automatic login\s+FAIL')
+        self.assertNotIn('This Mac is ready', result.stderr)
+        self.assertFalse(any(call.startswith('write ') for call in self.lines('defaults-calls')))
+        self.assertEqual(self.lines('sysadminctl-calls'), [])
+        self.assertEqual(self.lines('sudo-calls'), [])
 
     def test_runner_options_are_rejected(self):
         result = self.shell('parse_args --org acme')
@@ -389,11 +501,53 @@ check_rosetta() { :; }
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.lines('sysadminctl-calls'), [])
 
-    def test_pending_decryption_is_a_warning_not_a_failure(self):
+    def test_pending_decryption_is_not_ready_even_with_a_live_gui_session(self):
+        self.ready_auto_login()
+        self.start_console_session()
         (self.root/'filevault').write_text('FileVault is On.\nDecryption in progress\n')
+        result = self.shell('check_filevault; check_auto_login; check_console_session; print_checks')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertRegex(result.stderr, r'FileVault\s+FAIL\s+decrypting')
+        self.assertRegex(result.stderr, r'Automatic login\s+FAIL')
+        self.assertRegex(result.stderr, r'Console session\s+ok')
+        self.assertNotIn('This Mac is ready', result.stderr)
+
+    def test_auto_login_requires_runner_user_and_password_file(self):
+        self.ready_auto_login()
         result = self.shell('check_auto_login; print_checks')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertRegex(result.stderr, r'Automatic login\s+warn')
+        (self.root / 'kcpassword').unlink()
+        result = self.shell('check_auto_login; print_checks')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('password file missing', result.stderr)
+        self.set_pref('com.apple.loginwindow', 'autoLoginUser', 'someone-else')
+        result = self.shell('check_auto_login; print_checks')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('set for someone-else, expected fixture', result.stderr)
+
+    def test_auto_login_requires_confirmed_filevault_off(self):
+        self.ready_auto_login()
+        for status in ('FileVault is On.\n', None):
+            with self.subTest(status=status):
+                path = self.root / 'filevault'
+                path.unlink(missing_ok=True)
+                if status:
+                    path.write_text(status)
+                result = self.shell('check_auto_login; print_checks')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('requires FileVault Off', result.stderr)
+                result = self.shell('configure_auto_login')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn('Automatic login is on', result.stderr)
+                self.assertIn('reports Off', result.stderr)
+
+    def test_skip_auto_login_allows_another_console_owner(self):
+        self.set_pref('com.apple.loginwindow', 'autoLoginUser', 'someone-else')
+        (self.root / 'gui-session').touch()
+        result = self.shell('AUTO_LOGIN=0; check_auto_login; check_console_session; print_checks')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stderr, r'Automatic login\s+skip')
+        self.assertRegex(result.stderr, r'Console session\s+skip')
 
     def test_auto_login_needs_filevault_off(self):
         (self.root/'filevault').write_text('FileVault is On.\nDecryption in progress\n')

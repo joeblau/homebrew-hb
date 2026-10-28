@@ -24,6 +24,7 @@ configure_remote_access() { :; }
 configure_tailscale() { :; }
 configure_tailscale_guard() { :; }
 configure_auto_login() { :; }
+configure_keyboard_navigation() { :; }
 verify_host() { check_desktop; }
 '''
 DOMAINS = ("com.apple.dock", "com.apple.WindowManager")
