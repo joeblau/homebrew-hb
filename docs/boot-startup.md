@@ -303,6 +303,36 @@ Use these existing services when operating this tap. Adding a second generic
 runner service can create competing listeners. A Homebrew user service for
 Colima starts at login; it must not compete with this tap's Colima boot daemon.
 
+## Deregister a Mini from an organization
+
+`runner-cleanup --org ORG --keep-files` takes this Mac's runners out of one
+GitHub organization and stops their LaunchDaemons. Runner directories, tool
+caches, the Colima VM, and the host setup stay on disk, so a later
+`runner-setup` can register a different organization. Without `--keep-files`,
+`runner-cleanup` also deletes those files. `runner-setup --replace` does not
+remove a registration from a different org.
+
+Pause job dispatch and wait until the Mini is idle. Run this as the runner
+owner on every Mini:
+
+```sh
+runner-cleanup --org OLD_ORG --keep-files --yes
+```
+
+The command refuses while any of those runners is running a job, and mints a
+removal token with `runner-token`. A registration token cannot deregister. Then register the new organization with the same runner
+count and the flags this Mac already used:
+
+```sh
+RUNNER_TOKEN="$(runner-token registration --org NEW_ORG)" \
+  runner-setup --org NEW_ORG --runners 2 --colima
+```
+
+Ephemeral runners also need a `GITHUB_PAT` that can mint registration tokens
+for the new org. In the new org, add the runners to a runner group that can
+reach the repositories. If `com.github.runner-health.plist` or the autoscale
+plist still names the old org, update that `--org` before relying on it.
+
 ## Apply the service update to an existing Mini
 
 Pause job dispatch and let active jobs finish. Run as the runner owner on each

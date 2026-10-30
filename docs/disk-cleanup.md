@@ -83,9 +83,10 @@ cache another runner is actively using. Operator-chosen shared
 `--tool-cache-dir` locations outside the fleet root are not discovered; evict
 those manually during the same window. Repeated eviction after every job
 defeats their benefit. `runner-cleanup` deletes a runner's `_toolcache`
-together with the runner directory. Docker pruning removes unused data on
-the currently selected Docker daemon; remote BuildKit cache retention needs
-its own policy on the builder host.
+together with the runner directory; `runner-cleanup --org ORG --keep-files`
+unregisters a Mini from an organization and leaves that cache in place. Docker
+pruning removes unused data on the currently selected Docker daemon; remote
+BuildKit cache retention needs its own policy on the builder host.
 
 The script refuses symlinked runner/work roots and verifies that a hook's
 selected directory matches `RUNNER_TEMP`. Runner user directories still share

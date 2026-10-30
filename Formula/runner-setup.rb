@@ -96,6 +96,9 @@ class RunnerSetup < Formula
       Explicit --colima setup stops the idle VM and restarts it under system
       launchd so it survives logout. Keep your existing scope and runner count.
 
+      Deregister this Mini from an organization and keep the runner install:
+        runner-cleanup --org ORG_NAME --keep-files
+
       Remove runners later (use a *removal* token to also deregister on GitHub):
         runner-cleanup --all --token REMOVE_TOKEN
         runner-cleanup --runner 2

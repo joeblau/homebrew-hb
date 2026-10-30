@@ -7,6 +7,7 @@ which makes it composable:
 
 ```bash
 RUNNER_TOKEN=$(runner-token registration --org acme) runner-setup --org acme
+runner-cleanup --org acme --keep-files --yes
 runner-cleanup --all --yes --token "$(runner-token removal --org acme)"
 runner-token audit
 ```

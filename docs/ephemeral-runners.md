@@ -153,7 +153,10 @@ supervisor fetches its own tokens.)
 
 Everything else works as before: `runner-cleanup` tears the runners down
 (daemon, gui agents, directory — including `.github_pat`), and logs live under
-`/opt/github-runners/runner-N/_diag/`.
+`/opt/github-runners/runner-N/_diag/`. To leave an organization without
+deleting that install, use `runner-cleanup --org ORG --keep-files`; it stops
+the supervisor first so the Mini does not register itself back into the old
+org.
 
 ## Running the supervisor manually
 
