@@ -55,6 +55,7 @@ GITHUB_API="https://api.github.com"
 DEFAULT_STALE_MINUTES=15
 DEFAULT_BUSY_TIMEOUT_MINUTES=120
 DEFAULT_INTERVAL=300
+REMEDIATION_TIMEOUT=30
 
 STALE_MINUTES="${DEFAULT_STALE_MINUTES}"
 BUSY_TIMEOUT_MINUTES="${DEFAULT_BUSY_TIMEOUT_MINUTES}"
@@ -481,6 +482,23 @@ api_lookup() {
 # ----------------------------------------------------------------------------
 # Remediation — sudo only ever wraps launchctl system-domain operations.
 # ----------------------------------------------------------------------------
+service_state() {
+  local label="$1" state
+  state="$(${SUDO} launchctl print "system/${label}" 2>/dev/null \
+    | sed -n 's/^[[:space:]]*state = //p' | head -n1 || true)"
+  printf '%s' "${state:-unknown}"
+}
+
+wait_for_running() {
+  local label="$1" elapsed=0
+  while true; do
+    [[ "$(service_state "${label}")" == "running" ]] && return 0
+    [[ "${elapsed}" -lt "${REMEDIATION_TIMEOUT}" ]] || return 1
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+}
+
 bootout_system() {
   local label="$1"
   local _i
@@ -493,7 +511,7 @@ bootout_system() {
 }
 
 # remediate <label> <plist> <action>: kickstart | bootstrap | rebootstrap.
-# Verifies the daemon is visible afterwards; returns non-zero if it is not.
+# A restart counts as remediated only once launchd reports the service running.
 remediate() {
   local label="$1" plist="$2" action="$3"
   # Recheck immediately before acting: maintenance can start during a pass.
@@ -520,7 +538,7 @@ remediate() {
       ;;
     *) return 1 ;;
   esac
-  ${SUDO} launchctl print "system/${label}" >/dev/null 2>&1
+  wait_for_running "${label}"
 }
 
 # apply_remediation <label> <plist> <action>: prints the resulting status word
@@ -620,10 +638,7 @@ check_one() {
       err "Re-run runner-setup to reprovision ${name}."
     fi
   else
-    # `|| true` is REQUIRED with set -euo pipefail around every parse pipeline.
-    svc_state="$(${SUDO} launchctl print "system/${label}" 2>/dev/null \
-      | sed -n 's/^[[:space:]]*state = //p' | head -n1 || true)"
-    svc_state="${svc_state:-unknown}"
+    svc_state="$(service_state "${label}")"
     if [[ "${svc_state}" != "running" ]]; then
       issue="service_not_running"
       action="rebootstrap"
