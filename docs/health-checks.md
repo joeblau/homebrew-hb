@@ -56,6 +56,11 @@ Every pass, for each `runner-N` under `/opt/github-runners` (plus any orphaned
 | Runner directory gone, daemon/plist remains | No local fix — alert: run `runner-cleanup` or re-run `runner-setup` |
 | Console session missing (`--require-gui`)   | `shutdown -r now` with `--reboot-for-gui` when idle and automatic login is on; otherwise alert |
 
+After a restart, the watchdog waits up to 30 seconds for launchd to report
+`state = running`. A loaded service that remains stopped is **not** counted as
+remediated: the pass alerts and exits unsuccessfully, and the next scheduled
+pass tries the restart again.
+
 A pass exits `0` when every runner is healthy or was successfully remediated,
 and `1` when any issue could not be fixed.
 
