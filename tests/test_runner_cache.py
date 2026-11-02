@@ -69,6 +69,9 @@ brew() { printf 'Unexpected brew invocation\n' >&2; return 91; }
         self.assertIn("tespkg/actions-cache@v1", result.stderr)
         self.assertIn("port: 19000", result.stderr)
         self.assertIn("${{ secrets.RUNNER_CACHE_SECRET_KEY }}", result.stderr)
+        self.assertIn("key: ${{ github.head_ref || github.ref_name }}-brew-", result.stderr)
+        self.assertIn("restore-keys: |", result.stderr)
+        self.assertIn("${{ github.event.repository.default_branch }}-brew-", result.stderr)
         self.assertNotIn("ACTIONS_", result.stdout)
         for secret in ("fixture-root", "fixture-root-secret", "fixture-scope-access", "fixture-scope-secret"):
             self.assertNotIn(secret, result.stdout + result.stderr)
@@ -314,6 +317,9 @@ mc() { printf 'Unexpected mc invocation\n' >&2; return 94; }
         self.assertIn("region: eu-west-1", result.stderr)
         self.assertIn("insecure: false", result.stderr)
         self.assertIn("${{ secrets.RUNNER_CACHE_SECRET_KEY }}", result.stderr)
+        self.assertIn("key: ${{ github.head_ref || github.ref_name }}-brew-", result.stderr)
+        self.assertIn("restore-keys: |", result.stderr)
+        self.assertIn("${{ github.event.repository.default_branch }}-brew-", result.stderr)
         self.assertIn("SCCACHE_BUCKET=" + bucket, result.stderr)
         self.assertIn("SCCACHE_ENDPOINT=cache.internal.lan:9443", result.stderr)
         self.assertIn("ACTIONS_CACHE_URL", result.stderr)  # only as a "never redirect" warning
