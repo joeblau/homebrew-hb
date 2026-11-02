@@ -1288,7 +1288,9 @@ EOF
           bucket: ${BUCKET}
           use-fallback: false
           path: ~/Library/Caches/Homebrew
-          key: brew-\${{ github.repository }}-\${{ runner.os }}-\${{ runner.arch }}-\${{ hashFiles('**/Brewfile.lock.json') }}
+          key: \${{ github.head_ref || github.ref_name }}-brew-\${{ github.repository }}-\${{ runner.os }}-\${{ runner.arch }}-\${{ hashFiles('**/Brewfile.lock.json') }}
+          restore-keys: |
+            \${{ github.event.repository.default_branch }}-brew-\${{ github.repository }}-\${{ runner.os }}-\${{ runner.arch }}-
 
     The action selects addressing automatically; RUNNER_CACHE_PATH_STYLE
     is metadata, not an action input. Verify endpoint compatibility.
@@ -2364,7 +2366,9 @@ EOF
           bucket: ${BUCKET}
           use-fallback: false
           path: ~/Library/Caches/Homebrew
-          key: brew-\${{ github.repository }}-\${{ runner.os }}-\${{ runner.arch }}-\${{ hashFiles('**/Brewfile.lock.json') }}
+          key: \${{ github.head_ref || github.ref_name }}-brew-\${{ github.repository }}-\${{ runner.os }}-\${{ runner.arch }}-\${{ hashFiles('**/Brewfile.lock.json') }}
+          restore-keys: |
+            \${{ github.event.repository.default_branch }}-brew-\${{ github.repository }}-\${{ runner.os }}-\${{ runner.arch }}-
 
     The action selects addressing automatically; RUNNER_CACHE_PATH_STYLE
     is metadata, not an action input. Verify endpoint compatibility.

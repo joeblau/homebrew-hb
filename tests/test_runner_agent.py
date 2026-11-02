@@ -318,6 +318,13 @@ class PublishTests(RunnerAgentBase):
         self.assertNotIn("__pycache__", files)
         self.assertIn("src.txt", files)
 
+    def test_reusable_workflow_uses_full_history_blobless_checkouts(self):
+        workflow = (REPO / ".github/workflows/runner-agent.yml").read_text()
+        self.assertEqual(workflow.count("uses: actions/checkout@v6"), 2)
+        self.assertEqual(workflow.count("fetch-depth: 0"), 2)
+        self.assertEqual(workflow.count("filter: blob:none"), 2)
+        self.assertNotIn("fetch-depth: 1", workflow)
+
     def test_snippet_and_help(self):
         snippet = subprocess.run(["/bin/bash", str(SCRIPT), "snippet"], text=True, capture_output=True, timeout=20)
         self.assertEqual(snippet.returncode, 0)

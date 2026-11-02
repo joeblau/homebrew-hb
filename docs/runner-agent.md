@@ -116,6 +116,10 @@ runner-agent run       build the prompt, mount runner-mcp, `claude -p`
 runner-agent publish   commit, push, PR or comment — the only write step
 ```
 
+Both checkouts retain full commit history and use `filter: blob:none`, so Git
+fetches file contents on demand without the history limitations of a shallow
+clone.
+
 The agent is told not to commit or push and its allowed tools do not need
 to include `gh`; `publish` owns every git and GitHub write, discards any edit
 under `.github/workflows/`, and excludes `__pycache__`, `.DS_Store`, and

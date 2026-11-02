@@ -93,8 +93,16 @@ can use the following template, replacing the bucket with its printed value:
     bucket: actions-cache-repo-acme-monorepo-<digest>
     use-fallback: false
     path: ~/Library/Caches/Homebrew
-    key: brew-${{ github.repository }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Brewfile.lock.json') }}
+    key: ${{ github.head_ref || github.ref_name }}-brew-${{ github.repository }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Brewfile.lock.json') }}
+    restore-keys: |
+      ${{ github.event.repository.default_branch }}-brew-${{ github.repository }}-${{ runner.os }}-${{ runner.arch }}-
 ```
+
+The branch prefix keeps pull-request entries separate. The `restore-keys`
+prefix lets a PR with a changed lockfile restore the newest matching cache
+seeded by the repository's default branch instead of starting cold. Run the
+workflow on that branch to seed it; cache contents and restore policy remain
+workflow-owned, not runner-global.
 
 The third-party [tespkg/actions-cache](https://github.com/tespkg/actions-cache)
 action supports MinIO, separate restore/save actions, `restore-keys`, and
@@ -192,9 +200,11 @@ line, `*` alone allows every key (the default), and restore is never
 restricted — matching `actions/cache` `restore-keys` semantics, where any ref
 may read caches written by permitted keys. `CreateCacheEntry`,
 `FinalizeCacheEntry`, and `DeleteCacheEntry` require a matching prefix;
-`GetCacheEntryDownloadURL` does not. Convention: embed the branch in keys,
-e.g. `key: brew-${{ github.ref_name }}-${{ hashFiles('**/Brewfile.lock.json') }}`,
-and set `--save-prefix main-` so only keys naming the default branch can save.
+`GetCacheEntryDownloadURL` does not. Convention: put the branch first in keys,
+as in the workflow examples above, and set `--save-prefix main-` so only the
+`main` branch can save. Substitute the actual default branch when it has a
+different name. Pull requests can still restore default-branch entries through
+`restore-keys`, but cannot save new entries under that policy.
 
 Be honest about what this cannot enforce:
 
@@ -289,7 +299,9 @@ pointing the explicit S3 action at the remote endpoint:
     bucket: actions-cache-repo-acme-monorepo-<digest>
     use-fallback: false
     path: ~/Library/Caches/Homebrew
-    key: brew-${{ github.repository }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Brewfile.lock.json') }}
+    key: ${{ github.head_ref || github.ref_name }}-brew-${{ github.repository }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Brewfile.lock.json') }}
+    restore-keys: |
+      ${{ github.event.repository.default_branch }}-brew-${{ github.repository }}-${{ runner.os }}-${{ runner.arch }}-
 ```
 
 Distribute the scope's `ACCESS_KEY`/`SECRET_KEY` from the server to each

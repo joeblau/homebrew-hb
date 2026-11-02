@@ -112,12 +112,13 @@ jobs:
             echo "::error::runner-agent is not installed on this runner (brew install joeblau/hb/runner-setup && runner-agent install)"; exit 1; }
           runner-agent check
 
-      # gate needs a git remote for the one-attempt check, but not the tree.
+      # gate needs a git remote for the one-attempt check, but not file blobs.
       - name: Minimal checkout for gate
         uses: actions/checkout@v6
         with:
           token: ${{ secrets.AGENT_GITHUB_TOKEN || github.token }}
-          fetch-depth: 1
+          fetch-depth: 0
+          filter: blob:none
           persist-credentials: true
 
       - name: Gate
@@ -131,6 +132,7 @@ jobs:
           token: ${{ secrets.AGENT_GITHUB_TOKEN || github.token }}
           ref: ${{ steps.gate.outputs.ref }}
           fetch-depth: 0
+          filter: blob:none
           persist-credentials: true
 
       - name: Run Claude Code
